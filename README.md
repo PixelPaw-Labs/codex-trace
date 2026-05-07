@@ -103,6 +103,12 @@ Codex Trace reads session files from this default path:
 
 The sidebar reflects the folder structure exactly. Date groups in `YYYY/MM/DD` format can be collapsed and expanded, with Codex CLI sessions shown underneath.
 
+## Compatibility
+
+Codex Trace is transport-agnostic. It reads session data exclusively from local JSONL files written by the Codex CLI to `~/.codex/sessions/` — it never opens a network or Unix socket connection to the Codex app-server process.
+
+Changes to the Codex CLI's internal transport protocol (for example, the upgrade from raw Unix sockets to WebSocket-over-Unix-socket in Codex v0.128.0, PR #19244) have **no impact** on Codex Trace. As long as the Codex CLI continues writing session JSONL files to `~/.codex/sessions/`, Codex Trace will work correctly regardless of what protocol the Codex CLI uses internally.
+
 ## Configuration
 
 Press `,` to open Settings and change the sessions directory.

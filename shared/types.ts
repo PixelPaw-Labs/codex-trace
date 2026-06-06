@@ -19,6 +19,9 @@ export interface AgentMessage {
   phase: "commentary" | "final_answer" | null;
   timestamp: string;
   is_reasoning: boolean;
+  /** Position in the raw entry stream. `CodexTurn.tool_call_orders` uses the same scale, so
+   * the UI can interleave messages and tool calls chronologically. Absent for old cached data. */
+  order?: number;
 }
 
 /** Codex v0.135.0 (PR #24368): compaction metadata from turn headers. */
@@ -85,6 +88,9 @@ export interface CodexTurn {
   user_message: string | null;
   agent_messages: AgentMessage[];
   tool_calls: CodexToolCall[];
+  /** Display-order index for each tool call, parallel to `tool_calls` (same length/order).
+   * Same scale as `AgentMessage.order`. Absent for old cached data. */
+  tool_call_orders?: number[];
   final_answer: string | null;
   total_tokens: TokenInfo | null;
   model: string | null;

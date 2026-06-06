@@ -1,4 +1,4 @@
-import type { CodexToolCall, CodexTurn } from "../../shared/types";
+import type { AgentMessage, CodexToolCall, CodexTurn } from "../../shared/types";
 import { ToolCallItem } from "./ToolCallItem";
 import { OngoingDots } from "./OngoingDots";
 import { BackIcon, CodexIcon } from "./Icons";
@@ -29,6 +29,23 @@ export function TurnDetail({
   );
   const reasoning = turn.agent_messages.filter((m) => m.is_reasoning);
   const finalAnswer = turn.agent_messages.find((m) => m.phase === "final_answer");
+
+  // Interleave commentary messages with tool calls by their stream order, so each tool call
+  // shows up inline where it actually happened instead of being dumped at the end of the turn.
+  // When order data is missing (old cached sessions), messages keep order 0 and tools sort last,
+  // which reproduces the previous "messages first, tools after" layout.
+  type TimelineItem =
+    | { order: number; kind: "msg"; msg: AgentMessage }
+    | { order: number; kind: "tool"; tool: CodexToolCall; index: number };
+  const timeline: TimelineItem[] = [];
+  commentary.forEach((msg) => {
+    timeline.push({ order: msg.order ?? 0, kind: "msg", msg });
+  });
+  turn.tool_calls.forEach((tool, index) => {
+    const order = turn.tool_call_orders?.[index] ?? Number.MAX_SAFE_INTEGER;
+    timeline.push({ order, kind: "tool", tool, index });
+  });
+  timeline.sort((a, b) => a.order - b.order);
   const model = turn.model ? shortModel(turn.model) : "";
   const modelColor = turn.model ? getModelColor(turn.model) : undefined;
 
@@ -106,23 +123,33 @@ export function TurnDetail({
             </div>
           )}
 
-          {commentary.length > 0 && (
-            <div className="turn-detail__section turn-detail__section--commentary">
-              <div className="turn-detail__section-label">Commentary</div>
-              {commentary.map((msg, i) => (
-                <div key={msg.timestamp ?? i} className="turn-detail__msg">
-                  {msg.timestamp && (
-                    <div className="turn-detail__msg-header">
-                      <span className="turn-detail__msg-time">
-                        {formatExactTime(msg.timestamp)}
-                      </span>
+          {timeline.length > 0 && (
+            <div className="turn-detail__section turn-detail__section--activity">
+              {timeline.map((item, i) =>
+                item.kind === "msg" ? (
+                  <div key={`m-${item.msg.timestamp || i}`} className="turn-detail__msg">
+                    {item.msg.timestamp && (
+                      <div className="turn-detail__msg-header">
+                        <span className="turn-detail__msg-time">
+                          {formatExactTime(item.msg.timestamp)}
+                        </span>
+                      </div>
+                    )}
+                    <div className="turn-detail__markdown">
+                      <MarkdownRenderer content={item.msg.text} />
                     </div>
-                  )}
-                  <div className="turn-detail__markdown">
-                    <MarkdownRenderer content={msg.text} />
                   </div>
-                </div>
-              ))}
+                ) : (
+                  <ToolCallItem
+                    key={`t-${item.tool.call_id || item.index}`}
+                    tool={item.tool}
+                    expanded={expanded.has(item.index)}
+                    onToggle={() => onToggle(item.index)}
+                    isWorkerOpen={item.tool.call_id === openWorkerCallId}
+                    onOpenWorker={onOpenWorkerPanel}
+                  />
+                ),
+              )}
             </div>
           )}
 
@@ -141,24 +168,6 @@ export function TurnDetail({
                   <MarkdownRenderer content={finalAnswer.text} />
                 </div>
               </div>
-            </div>
-          )}
-
-          {turn.tool_calls.length > 0 && (
-            <div className="turn-detail__section turn-detail__section--tools">
-              <div className="turn-detail__section-label">
-                Tool calls ({turn.tool_calls.length})
-              </div>
-              {turn.tool_calls.map((tool, i) => (
-                <ToolCallItem
-                  key={tool.call_id || i}
-                  tool={tool}
-                  expanded={expanded.has(i)}
-                  onToggle={() => onToggle(i)}
-                  isWorkerOpen={tool.call_id === openWorkerCallId}
-                  onOpenWorker={onOpenWorkerPanel}
-                />
-              ))}
             </div>
           )}
 

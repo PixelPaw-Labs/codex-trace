@@ -22,6 +22,12 @@ pub struct AgentMsg {
     pub phase: Option<String>,
     pub timestamp: String,
     pub is_reasoning: bool,
+    /// Position of this message in the raw entry stream. Tool calls carry a parallel index
+    /// (see `CodexTurn::tool_call_orders`) drawn from the same counter, so the frontend can
+    /// interleave messages and tool calls in true chronological order instead of rendering
+    /// them in separate blocks.
+    #[serde(default)]
+    pub order: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +88,12 @@ pub struct CodexTurn {
     pub text_elements: Vec<TextElement>,
     pub agent_messages: Vec<AgentMsg>,
     pub tool_calls: Vec<ToolCall>,
+    /// Display-order index for each tool call, parallel to `tool_calls` (same length, same
+    /// order). The value is the position of the call's first appearance in the raw entry
+    /// stream, matching `AgentMsg::order`, so the frontend can interleave tool calls with
+    /// agent messages instead of dumping all tool calls at the end of the turn.
+    #[serde(default)]
+    pub tool_call_orders: Vec<usize>,
     pub final_answer: Option<String>,
     pub total_tokens: Option<TokenInfo>,
     pub model: Option<String>,
@@ -118,6 +130,7 @@ impl CodexTurn {
             text_elements: Vec::new(),
             agent_messages: Vec::new(),
             tool_calls: Vec::new(),
+            tool_call_orders: Vec::new(),
             final_answer: None,
             total_tokens: None,
             model: None,
@@ -150,8 +163,15 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     });
 
     let mut synthetic_turn_counter = 0u32;
+    // Position of each tool call's first appearance in the raw stream, keyed by call_id.
+    // Gives tool calls the same kind of order index as agent messages so the two can be
+    // interleaved chronologically in the UI.
+    let mut call_order: HashMap<String, usize> = HashMap::new();
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(call_id) = call_id_of(entry) {
+            call_order.entry(call_id).or_insert(index);
+        }
         match entry.entry_type.as_str() {
             "event_msg" => {
                 handle_event_msg(
@@ -161,6 +181,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     &mut tool_builders,
                     has_task_started,
                     &mut synthetic_turn_counter,
+                    index,
                 );
             }
             "response_item"
@@ -188,6 +209,12 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     for (turn_id, mut builder) in tool_builders {
         builder.drain_pending();
         if let Some(turn) = turns.get_mut(&turn_id) {
+            // Record each call's stream position, parallel to tool_calls. Calls with no
+            // recorded position (should not happen for well-formed sessions) sort last.
+            for tc in &builder.finalized {
+                let order = call_order.get(&tc.call_id).copied().unwrap_or(usize::MAX);
+                turn.tool_call_orders.push(order);
+            }
             turn.tool_calls.extend(builder.finalized);
         }
     }
@@ -197,6 +224,22 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     result
 }
 
+/// Extract a tool call's `call_id` from a raw entry, checking both the parsed payload and the
+/// raw line (different entry shapes carry it in different places). Returns None for entries not
+/// associated with a tool call.
+fn call_id_of(entry: &RawEntry) -> Option<String> {
+    for v in [&entry.payload, &entry.raw] {
+        if let Some(cid) = v
+            .get("call_id")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(cid.to_string());
+        }
+    }
+    None
+}
+
 fn handle_event_msg(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
@@ -204,6 +247,7 @@ fn handle_event_msg(
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
     has_task_started: bool,
     synthetic_counter: &mut u32,
+    index: usize,
 ) {
     let payload = &entry.payload;
     let msg_type = match payload.get("type").and_then(|t| t.as_str()) {
@@ -311,6 +355,7 @@ fn handle_event_msg(
                             phase,
                             timestamp: ts.to_string(),
                             is_reasoning: false,
+                            order: index,
                         });
                     }
                 }
@@ -331,6 +376,7 @@ fn handle_event_msg(
                             phase: None,
                             timestamp: ts.to_string(),
                             is_reasoning: true,
+                            order: index,
                         });
                     }
                 }
@@ -1009,6 +1055,40 @@ mod tests {
             .iter()
             .filter_map(|line| RawEntry::parse(line))
             .collect()
+    }
+
+    #[test]
+    fn orders_messages_and_tool_calls_by_stream_position() {
+        // A tool call that happens between two agent messages must sort between them, so the
+        // UI can render it inline instead of dumping all tool calls at the end of the turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-04-27T04:53:00Z","type":"session_meta","payload":{"id":"s","timestamp":"2026-04-27T04:53:00Z"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:02Z","type":"event_msg","payload":{"type":"agent_message","message":"FIRST"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"Output:\nhi\nProcess exited with code 0\n"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:05Z","type":"event_msg","payload":{"type":"agent_message","message":"SECOND"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279986.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 2);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_call_orders.len(), turn.tool_calls.len());
+
+        let first_msg_order = turn.agent_messages[0].order;
+        let second_msg_order = turn.agent_messages[1].order;
+        let tool_order = turn.tool_call_orders[0];
+        assert!(
+            first_msg_order < tool_order,
+            "tool call ({tool_order}) should sort after the first message ({first_msg_order})"
+        );
+        assert!(
+            tool_order < second_msg_order,
+            "tool call ({tool_order}) should sort before the second message ({second_msg_order})"
+        );
     }
 
     #[test]

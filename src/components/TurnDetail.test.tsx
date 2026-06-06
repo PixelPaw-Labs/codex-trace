@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { AgentMessage, CodexTurn, TokenInfo } from "../../shared/types";
+import type { AgentMessage, CodexToolCall, CodexTurn, TokenInfo } from "../../shared/types";
 import { TurnDetail } from "./TurnDetail";
 
 const TOKEN_INFO: TokenInfo = {
@@ -46,6 +46,32 @@ function makeTurn(overrides: Partial<CodexTurn> = {}): CodexTurn {
   };
 }
 
+function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
+  return {
+    call_id: "call-1",
+    kind: "exec_command",
+    name: "shell",
+    arguments: {},
+    input_text: null,
+    output: "out",
+    exit_code: 0,
+    command: ["echo", "hi"],
+    cwd: "/tmp",
+    duration_secs: 0.1,
+    mcp_server: null,
+    mcp_tool: null,
+    plugin_id: null,
+    patch_success: null,
+    patch_changes: null,
+    web_query: null,
+    web_url: null,
+    image_prompt: null,
+    worker_session: null,
+    status: "completed",
+    ...overrides,
+  };
+}
+
 function renderTurnDetail(turn: CodexTurn) {
   render(<TurnDetail turn={turn} expanded={new Set()} onToggle={vi.fn()} onBack={vi.fn()} />);
 }
@@ -71,5 +97,46 @@ describe("TurnDetail", () => {
 
     expect(screen.queryByText(/ctx .* left/)).not.toBeInTheDocument();
     expect(screen.getByText("40.0k tok · 1m")).toBeInTheDocument();
+  });
+
+  it("interleaves tool calls with commentary by stream order", () => {
+    const first: AgentMessage = {
+      text: "FIRST_MESSAGE",
+      phase: "commentary",
+      timestamp: "2026-04-26T10:00:00Z",
+      is_reasoning: false,
+      order: 0,
+    };
+    const second: AgentMessage = {
+      text: "SECOND_MESSAGE",
+      phase: "commentary",
+      timestamp: "2026-04-26T10:00:02Z",
+      is_reasoning: false,
+      order: 2,
+    };
+    // Tool call's stream order (1) sits between the two messages (0 and 2), so it must render
+    // between them — not after both.
+    const tool = makeTool({ call_id: "c1", command: ["TOOL_MARKER_CMD"] });
+    const { container } = render(
+      <TurnDetail
+        turn={makeTurn({
+          agent_messages: [first, second],
+          tool_calls: [tool],
+          tool_call_orders: [1],
+          final_answer: null,
+        })}
+        expanded={new Set([0])}
+        onToggle={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    const text = container.textContent ?? "";
+    const iFirst = text.indexOf("FIRST_MESSAGE");
+    const iTool = text.indexOf("TOOL_MARKER_CMD");
+    const iSecond = text.indexOf("SECOND_MESSAGE");
+    expect(iFirst).toBeGreaterThanOrEqual(0);
+    expect(iTool).toBeGreaterThan(iFirst);
+    expect(iSecond).toBeGreaterThan(iTool);
   });
 });

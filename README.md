@@ -58,10 +58,12 @@ Use this option if you want to build Codex Trace locally on macOS, Linux, or Win
 ```bash
 git clone https://github.com/PixelPaw-Labs/codex-trace.git
 cd codex-trace
-./script/install.sh       # builds frontend + installs Rust binary
+./script/install.sh       # macOS → Codex Trace.app in /Applications; Linux → cargo binary
 
-codex-trace              # desktop app (default)
-codex-trace --web        # web mode (opens browser)
+# Launch the desktop app:
+#   macOS:  open -a "Codex Trace"   (or from Launchpad/Applications)
+#   Linux:  codex-trace
+codex-trace --web         # web mode (opens browser)
 ```
 
 ### Run from source without installing

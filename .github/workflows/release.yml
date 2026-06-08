@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to dry-run, e.g. 0.1.0 (no v prefix). Only the notes job runs; nothing is built or published."
+        description: "Version to release, e.g. 0.1.0 (no v prefix). Creates the tag and a published GitHub release from the matching CHANGELOG section. No desktop artifacts are built — use a v* tag push for a full multi-platform build."
         required: true
         type: string
 
@@ -226,3 +226,39 @@ jobs:
             --repo "${{ github.repository }}" \
             --draft=false \
             --latest
+
+  manual-release:
+    name: Create release without artifacts (manual)
+    needs: notes
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create published release (tag + notes, no build artifacts)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.notes.outputs.version }}
+          BODY: ${{ needs.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          # Refuse to clobber an existing release/tag — the manual path is for
+          # bootstrapping a version that hasn't shipped yet. To re-release,
+          # delete the existing one first: gh release delete $TAG --yes --cleanup-tag
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=Duplicate release::A release for $TAG already exists. Refusing to overwrite."
+            exit 1
+          fi
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/notes.md"
+          # Creates the tag at this commit (the dispatched ref) and a published,
+          # latest release with the CHANGELOG section as the body. No artifacts.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest
+          echo "Created release $TAG at $GITHUB_SHA with no build artifacts."

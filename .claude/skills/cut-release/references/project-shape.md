@@ -63,8 +63,12 @@ pushes:
    each creating / updating a draft release with platform artifacts.
 4. `publish` — flips the draft to public and marks it latest.
 
-`workflow_dispatch` mode is a dry-run for the notes job only; nothing is built or
-published. Use it to verify a CHANGELOG section parses correctly before tagging.
+`workflow_dispatch` mode (manual run, with a `version` input) is the artifact-free
+path: the `manual-release` job runs `notes` then creates the `vX.Y.Z` tag and a
+published, latest GitHub release whose body is the CHANGELOG section — but it builds
+**no** desktop binaries. It refuses to overwrite an existing release for the version.
+Use it to bootstrap a release (e.g. the first tag) or to publish a notes-only release;
+use a `v*` tag push when you want the full macOS / Linux / Windows artifact build.
 
 If the pipeline changes, edit the workflow and update Phase 7's narrative, not this
 file.

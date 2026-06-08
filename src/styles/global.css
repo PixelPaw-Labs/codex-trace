@@ -2338,7 +2338,7 @@ body {
   flex-shrink: 0;
 }
 .app__sidebar-title {
-  font-size: 0.72rem;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--text-dim);
@@ -2349,7 +2349,7 @@ body {
   border: none;
   cursor: pointer;
   color: var(--text-dim);
-  font-size: 1rem;
+  font-size: 16px;
   padding: 2px 4px;
 }
 .app__settings-btn:hover {
@@ -2396,7 +2396,7 @@ body {
 }
 .sidebar-tree__empty {
   color: var(--text-dim);
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 .sidebar-tree__group {
   margin-bottom: 2px;
@@ -2409,7 +2409,7 @@ body {
   cursor: pointer;
   user-select: none;
   color: var(--text-dim);
-  font-size: 0.75rem;
+  font-size: 12px;
   font-weight: 600;
 }
 .sidebar-tree__date-header:hover {
@@ -2417,7 +2417,7 @@ body {
   color: var(--text-bright);
 }
 .sidebar-tree__chevron {
-  font-size: 0.6rem;
+  font-size: 10px;
 }
 .sidebar-tree__date {
   flex: 1;
@@ -2426,7 +2426,7 @@ body {
   background: var(--bg-hover);
   border-radius: 8px;
   padding: 0 5px;
-  font-size: 0.7rem;
+  font-size: 11px;
 }
 .sidebar-tree__session {
   display: flex;
@@ -2449,7 +2449,7 @@ body {
   min-width: 0;
 }
 .sidebar-tree__session-label {
-  font-size: 0.8rem;
+  font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2467,13 +2467,13 @@ body {
   margin-top: 2px;
 }
 .sidebar-tree__time {
-  font-size: 0.7rem;
+  font-size: 11px;
   color: var(--text-dim);
   white-space: nowrap;
   flex-shrink: 0;
 }
 .sidebar-tree__badge {
-  font-size: 0.65rem;
+  font-size: 10px;
   padding: 0 4px;
   border-radius: 4px;
 }
@@ -2495,7 +2495,7 @@ body {
   border: none;
   padding: 0;
   cursor: pointer;
-  font-size: 0.65rem;
+  font-size: 10px;
   color: var(--collab-badge);
   display: flex;
   align-items: center;
@@ -2509,7 +2509,7 @@ body {
   opacity: 0.85;
 }
 .sidebar-tree__session--child .sidebar-tree__session-label {
-  font-size: 0.75rem;
+  font-size: 12px;
 }
 
 /* Session picker */
@@ -2755,7 +2755,7 @@ body {
   min-width: 0;
 }
 .turn-list__row-status {
-  font-size: 0.8rem;
+  font-size: 13px;
   flex-shrink: 0;
 }
 .turn-list__row-status--complete {
@@ -2768,12 +2768,12 @@ body {
   color: var(--status-error);
 }
 .turn-list__row-duration {
-  font-size: 0.7rem;
+  font-size: 11px;
   color: var(--text-dim);
   flex-shrink: 0;
 }
 .turn-list__row-tools {
-  font-size: 0.7rem;
+  font-size: 11px;
   color: var(--icon-mcp);
   flex-shrink: 0;
 }
@@ -2813,7 +2813,7 @@ body {
   border-left: 3px solid var(--accent);
 }
 .turn-list__badge {
-  font-size: 0.65rem;
+  font-size: 10px;
   padding: 0 4px;
   border-radius: 3px;
 }
@@ -2858,23 +2858,23 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .turn-detail__status {
-  font-size: 0.85rem;
+  font-size: 14px;
   text-transform: uppercase;
   color: var(--text-dim);
 }
 .turn-detail__model {
-  font-size: 0.8rem;
+  font-size: 13px;
   color: var(--accent);
 }
 .turn-detail__effort {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
 }
 .turn-detail__section {
   margin-bottom: 1.2rem;
 }
 .turn-detail__section-label {
-  font-size: 0.75rem;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -2888,7 +2888,7 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: 14px;
   margin: 0;
   line-height: 1.5;
 }
@@ -2901,10 +2901,10 @@ body {
 .turn-detail__reasoning-note {
   color: var(--reasoning-text);
   font-style: italic;
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 .turn-detail__compaction-note {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
   font-style: italic;
   margin-top: 1rem;
@@ -2925,10 +2925,10 @@ body {
 .turn-detail__collab-nick {
   font-weight: 600;
   color: var(--collab-badge);
-  font-size: 0.85rem;
+  font-size: 14px;
 }
 .turn-detail__collab-model {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
 }
 .turn-detail__collab-btn {
@@ -2937,7 +2937,7 @@ body {
   border: 1px solid var(--collab-badge, #5f87d7);
   border-radius: 3px;
   color: var(--collab-badge, #5f87d7);
-  font-size: 0.75rem;
+  font-size: 12px;
   padding: 1px 6px;
   cursor: pointer;
   font-family: inherit;
@@ -2947,7 +2947,7 @@ body {
 }
 .turn-detail__collab-prompt {
   white-space: pre-wrap;
-  font-size: 0.8rem;
+  font-size: 13px;
   color: var(--text-dim);
   margin: 4px 0 0;
   border-top: 1px solid rgba(95, 135, 215, 0.2);
@@ -2974,7 +2974,7 @@ body {
   background: var(--bg-hover);
 }
 .tool-call__kind {
-  font-size: 0.7rem;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   padding: 1px 5px;
@@ -3006,7 +3006,7 @@ body {
   border-color: var(--status-error);
 }
 .tool-call__name {
-  font-size: 0.85rem;
+  font-size: 14px;
   color: var(--text-bright);
   white-space: nowrap;
 }
@@ -3016,25 +3016,25 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.78rem;
+  font-size: 12px;
   color: var(--text-dim);
 }
 .tool-call__mcp-prefix {
   color: var(--text-dim);
-  font-size: 0.75rem;
+  font-size: 12px;
 }
 .tool-call__exit {
-  font-size: 0.75rem;
+  font-size: 12px;
 }
 .tool-call__exit--fail {
   color: var(--status-error);
 }
 .tool-call__duration {
-  font-size: 0.7rem;
+  font-size: 11px;
   color: var(--text-dim);
 }
 .tool-call__chevron {
-  font-size: 0.65rem;
+  font-size: 10px;
   color: var(--text-dim);
 }
 .tool-call__body {
@@ -3050,18 +3050,18 @@ body {
 .tool-call__cmd {
   white-space: pre-wrap;
   word-break: break-all;
-  font-size: 0.8rem;
+  font-size: 13px;
   margin: 0 0 6px;
 }
 .tool-call__cwd {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 4px;
 }
 .tool-call__output {
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 0.8rem;
+  font-size: 13px;
   max-height: 300px;
   overflow-y: auto;
   margin: 6px 0 0;
@@ -3071,7 +3071,7 @@ body {
   color: var(--error);
 }
 .tool-call__diff {
-  font-size: 0.75rem;
+  font-size: 12px;
   white-space: pre;
   overflow-x: auto;
   overflow-y: auto;
@@ -3083,7 +3083,7 @@ body {
   border: 1px solid var(--collab-badge);
   color: var(--collab-badge);
   cursor: pointer;
-  font-size: 0.7rem;
+  font-size: 11px;
   padding: 1px 6px;
   border-radius: 3px;
   line-height: 1.4;
@@ -3224,7 +3224,7 @@ body {
 .tool-call__icon {
   display: inline-flex;
   align-items: center;
-  font-size: 0.9rem;
+  font-size: 14px;
   flex-shrink: 0;
 }
 .tool-call--exec .tool-call__icon {
@@ -3255,7 +3255,7 @@ body {
   margin-bottom: 0;
 }
 .tool-call__section-title {
-  font-size: 0.7rem;
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -3277,20 +3277,20 @@ body {
   margin: 0;
 }
 .tool-call__json code {
-  font-size: 0.8rem;
+  font-size: 13px;
   white-space: pre;
 }
 .tool-call__mcp-server {
   font-weight: 600;
   color: var(--icon-mcp);
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 .tool-call__mcp-tool {
-  font-size: 0.8rem;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 .tool-call__web-url {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
   word-break: break-all;
   margin-top: 2px;
@@ -3314,7 +3314,7 @@ body {
 
 /* Turn detail markdown */
 .turn-detail__markdown {
-  font-size: 0.85rem;
+  font-size: 13px;
   line-height: 1.6;
   color: var(--text-primary);
   word-break: break-word;
@@ -3404,12 +3404,12 @@ body {
 .token-bar__stats {
   display: flex;
   gap: 8px;
-  font-size: 0.7rem;
+  font-size: 11px;
 }
 
 /* ToolCallItem body sub-elements */
 .tool-call__mcp-info {
-  font-size: 0.8rem;
+  font-size: 13px;
   margin-bottom: 4px;
 }
 .tool-call__patch {
@@ -3418,22 +3418,22 @@ body {
   gap: 6px;
 }
 .tool-call__patch-file {
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 .tool-call__web {
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 .tool-call__image-prompt {
-  font-size: 0.8rem;
+  font-size: 13px;
   font-style: italic;
 }
 .tool-call__collab-info {
-  font-size: 0.8rem;
+  font-size: 13px;
 }
 
 /* Tool call argument display */
 .tool-call__args {
-  font-size: 0.75rem;
+  font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
   margin: 4px 0 0;
@@ -3463,7 +3463,7 @@ body {
 }
 .codex-worker-panel__turn-label,
 .codex-worker-panel__label {
-  font-size: 0.7rem;
+  font-size: 11px;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -3477,4 +3477,31 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Complementary item — assistant commentary as an inline, always-expanded timeline item */
+.complementary-item {
+  margin-bottom: 10px;
+}
+.complementary-item__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.complementary-item__icon {
+  display: inline-flex;
+  align-items: center;
+  font-size: 14px;
+  color: var(--icon-output);
+}
+.complementary-item__name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--icon-output);
+}
+.complementary-item__time {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: auto;
 }

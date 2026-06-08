@@ -1,5 +1,6 @@
 import type { AgentMessage, CodexToolCall, CodexTurn } from "../../shared/types";
 import { ToolCallItem } from "./ToolCallItem";
+import { ComplementaryItem } from "./ComplementaryItem";
 import { OngoingDots } from "./OngoingDots";
 import { BackIcon, CodexIcon } from "./Icons";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -127,18 +128,7 @@ export function TurnDetail({
             <div className="turn-detail__section turn-detail__section--activity">
               {timeline.map((item, i) =>
                 item.kind === "msg" ? (
-                  <div key={`m-${item.msg.timestamp || i}`} className="turn-detail__msg">
-                    {item.msg.timestamp && (
-                      <div className="turn-detail__msg-header">
-                        <span className="turn-detail__msg-time">
-                          {formatExactTime(item.msg.timestamp)}
-                        </span>
-                      </div>
-                    )}
-                    <div className="turn-detail__markdown">
-                      <MarkdownRenderer content={item.msg.text} />
-                    </div>
-                  </div>
+                  <ComplementaryItem key={`m-${item.msg.timestamp || i}`} msg={item.msg} />
                 ) : (
                   <ToolCallItem
                     key={`t-${item.tool.call_id || item.index}`}

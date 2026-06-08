@@ -101,6 +101,31 @@ describe("TurnDetail", () => {
     expect(screen.getByText("40.0k tok · 1m")).toBeInTheDocument();
   });
 
+  it("renders assistant commentary as an inline Complementary item without duplication", () => {
+    const msg: AgentMessage = {
+      text: "COMMENTARY_TEXT",
+      phase: "commentary",
+      timestamp: "2026-04-26T10:00:00Z",
+      is_reasoning: false,
+      order: 0,
+    };
+    const { container } = render(
+      <TurnDetail
+        turn={makeTurn({ agent_messages: [msg], tool_calls: [], final_answer: null })}
+        expanded={new Set()}
+        onToggle={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    // Shown as a labelled Complementary item with its prose inline (no expansion needed)...
+    expect(screen.getByText("Complementary")).toBeInTheDocument();
+    expect(screen.getByText("COMMENTARY_TEXT")).toBeInTheDocument();
+    // ...and exactly once — no duplicated flattened blob above the timeline.
+    const occurrences = (container.textContent ?? "").split("COMMENTARY_TEXT").length - 1;
+    expect(occurrences).toBe(1);
+  });
+
   it("interleaves tool calls with commentary by stream order", () => {
     const first: AgentMessage = {
       text: "FIRST_MESSAGE",

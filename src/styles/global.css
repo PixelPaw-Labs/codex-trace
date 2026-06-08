@@ -2449,7 +2449,7 @@ body {
   min-width: 0;
 }
 .sidebar-tree__session-label {
-  font-size: 13px;
+  font-size: 12px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3006,7 +3006,8 @@ body {
   border-color: var(--status-error);
 }
 .tool-call__name {
-  font-size: 14px;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--text-bright);
   white-space: nowrap;
 }

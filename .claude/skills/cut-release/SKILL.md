@@ -5,9 +5,9 @@ description: |
   any questions. Detects commits since the last ancestral tag, classifies them
   with conventional-commit rules to pick the semver bump, bumps every
   version-bearing file in sync, writes the CHANGELOG entry, commits and tags
-  on a release branch, pushes the tag, publishes the GitHub release from the
-  CHANGELOG section, fast-forwards `main` onto the release commit and pushes
-  it, then cleans up the local branch. Use this skill whenever the user mentions
+  on a release branch, pushes the tag to trigger the GitHub Actions release
+  pipeline, fast-forwards `main` onto the release commit and pushes it, then
+  cleans up the local branch. Use this skill whenever the user mentions
   cutting, tagging, bumping, or shipping a release — including "cut a
   release", "release v1.2.3", "tag and release", "bump version", "publish a
   release", "do a patch release", or "make a new release". Trigger even when
@@ -17,18 +17,13 @@ description: |
 
 # Cut a Release — `codex-trace`
 
-Turns "we should release this" into a tagged, pushed, **publicly published** release with
-a curated CHANGELOG, in a way that survives the project's strict pre-commit hook and stays
-honest about what's actually shipping.
+Turns "we should release this" into a tagged, pushed, pipeline-triggered, **publicly
+published** release with a curated CHANGELOG, in a way that survives the project's strict
+pre-commit hook and stays honest about what's actually shipping.
 
 The skill is project-local because the steps depend on this repo's specific shape (three
-version files, two lockfiles, the test-reflection pre-commit hook).
-
-> **Note:** codex-trace does not yet have a GitHub Actions release pipeline
-> (`.github/workflows/release.yml`). Pushing a tag records the version but does not build
-> or publish artifacts automatically — Phase 7 publishes the GitHub release manually. See
-> `${CLAUDE_SKILL_DIR}/references/project-shape.md` for details and the target shape for a
-> future `release.yml`.
+version files, two lockfiles, GH Actions release on `v*` tag, the test-reflection
+pre-commit hook).
 
 ## Operating mode
 
@@ -36,10 +31,10 @@ The skill is **fully automated end-to-end** and **fully synchronous**. It never 
 `AskUserQuestion`, never waits for "yes", never branches on user preference, and
 **never runs any command in the background**. Every Bash invocation runs in the
 foreground so the session holds continuously from Phase 1 through Phase 9 — no
-`run_in_background: true`, no trailing `&`, no `nohup`, no `disown`. If a release
-pipeline is added later, long-running steps like `gh run watch` in Phase 7 must also run
-in the foreground; set the Bash `timeout` parameter to match the expected duration (e.g.
-1800000 ms for a release pipeline) rather than detaching.
+`run_in_background: true`, no trailing `&`, no `nohup`, no `disown`. This includes
+long-running steps like `gh run watch` in Phase 7; set the Bash `timeout` parameter to
+match the expected duration (e.g. 1800000 ms for the release pipeline) rather than
+detaching.
 
 Defaults are deterministic:
 

@@ -48,30 +48,26 @@ npm install --package-lock-only           # → package-lock.json
 change) and `--offline` skips the registry round-trip — only the local crate's version
 moved.
 
-## Release pipeline (NOT yet wired up)
+## Release pipeline (delegated to CI)
 
-> **Heads-up:** codex-trace does **not** currently have a `.github/workflows/release.yml`.
-> Only `.github/workflows/ci.yml` exists, and it does not build or publish release
-> artifacts. Pushing a `v*` tag therefore does **not** trigger any release automation.
->
-> Until a release workflow is added, Phase 6 still pushes the tag (so the version is
-> recorded on `origin`) but Phase 7 cannot "watch the pipeline" — instead it publishes the
-> GitHub release manually from the CHANGELOG slice (see that phase for the `gh release
-create` fallback). The desktop artifacts are not built automatically.
+`.github/workflows/release.yml` is the source of truth. Its job graph for `v*` tag
+pushes:
 
-If/when a `release.yml` is added, it should follow this shape so the phase files line up
-again:
-
-1. `guard` — refuse to run if a non-draft GitHub release for the tag already exists
-   (defence-in-depth complement to the skill's Phase 1 preflight).
-2. `notes` — slice `CHANGELOG.md` for the version's section and expose it as a workflow
-   output (expects the exact `## [X.Y.Z] — YYYY-MM-DD` heading format).
-3. `build-macos` / `build-linux` / `build-windows` — three parallel `tauri-action` runs,
+1. `guard` — refuses to run if a non-draft GitHub release for the tag already exists.
+   This is the duplicate-release defence-in-depth complement to the skill's Phase 1
+   preflight; if a stale tag was pushed, the CI aborts before any artifact upload.
+2. `notes` — slices `CHANGELOG.md` for the version's section and exposes it as a
+   workflow output. Fails if the heading isn't in the exact `## [X.Y.Z] — YYYY-MM-DD`
+   format.
+3. `build-macos` / `build-linux` / `build-windows` — three parallel `tauri-action` runs
    each creating / updating a draft release with platform artifacts.
-4. `publish` — flip the draft to public and mark it latest.
+4. `publish` — flips the draft to public and marks it latest.
 
-When you add the workflow, update Phase 6 and Phase 7 to re-enable the `gh run watch`
-flow and remove the manual-publish fallback.
+`workflow_dispatch` mode is a dry-run for the notes job only; nothing is built or
+published. Use it to verify a CHANGELOG section parses correctly before tagging.
+
+If the pipeline changes, edit the workflow and update Phase 7's narrative, not this
+file.
 
 ## GitHub repo identity
 

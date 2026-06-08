@@ -1,18 +1,68 @@
-# Phase 7 — Publish the GitHub release
+# Phase 7 — Watch the pipeline and verify the release is public
 
-Goal: confirm the release is published on the repo's releases page with the CHANGELOG
-section as its body.
+Goal: confirm the release is published on the repo's releases page. Mostly automated —
+`.github/workflows/release.yml` does the heavy lifting:
 
-> **codex-trace has no release pipeline yet.** There is no
-> `.github/workflows/release.yml`, so the tag push from Phase 6 did **not** build artifacts
-> or create a release. This phase therefore publishes the release **manually** from the
-> CHANGELOG slice. The desktop binaries (macOS / Linux / Windows) are **not** built
-> automatically — note that in the final report (Phase 9). When a `release.yml` is added,
-> replace this phase with the pipeline-watch flow documented at the bottom.
+1. The tag push triggers a `notes` job that slices `CHANGELOG.md` for the version's
+   section and exposes it as a workflow output.
+2. A `guard` job checks that no published (non-draft) release exists for the tag yet —
+   if one does it fails the entire workflow, preventing duplicate releases (see
+   `release.yml` for the exact check).
+3. Three build jobs (macOS / Linux / Windows) each pass `releaseBody:
+${{ needs.notes.outputs.body }}` to `tauri-apps/tauri-action`, creating / updating
+   the GitHub release as a draft with the CHANGELOG section as the body and the built
+   artifacts attached.
+4. A final `publish` job depends on all three builds and runs:
 
-## Step 7.1 — Slice the CHANGELOG for this version
+   ```bash
+   gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+   ```
 
-Extract just this version's section to use as the release body:
+   That flips the draft public and marks it latest.
+
+## Step 7.1 — Watch the run (foreground, blocking)
+
+Run `gh run watch` **in the foreground** so the session blocks until the pipeline
+finishes. Do not pass `run_in_background: true`, do not append `&`, do not detach. The
+session must hold every phase end-to-end in one continuous flow — there are no
+parallel-work opportunities here, and downstream phases (7.2 verification, 8
+back-to-main, 9 cleanup) all depend on the run conclusion.
+
+```bash
+RUN_ID=$(gh run list --workflow=release.yml --limit=1 --json databaseId --jq '.[0].databaseId')
+gh run watch --exit-status "$RUN_ID"
+```
+
+`gh run watch` polls until the run finishes and exits non-zero on failure. Builds take
+roughly 15–25 minutes depending on cache hits. Set the Bash `timeout` parameter to
+1800000 ms (30 minutes) to cover the full window without surprise timeouts.
+
+Do not call `gh run view` mid-watch to peek at progress — `gh run watch` already prints
+live status as jobs transition.
+
+## Step 7.2 — Confirm the release is public
+
+After the run completes:
+
+```bash
+gh release view "v$NEXT_VERSION" --json isDraft,isPrerelease,url,publishedAt,assets \
+  --jq '{isDraft,isPrerelease,url,publishedAt,assets:[.assets[]|.name]}'
+```
+
+Expect `"isDraft": false`, `"isPrerelease": false`, a published timestamp, and 7 asset
+filenames stamped with `$NEXT_VERSION` (macOS aarch64 dmg + app.tar.gz, Linux rpm /
+AppImage / deb, Windows exe / msi).
+
+## Step 7.3 — Verify the body matches the CHANGELOG
+
+```bash
+gh release view "v$NEXT_VERSION" --json body --jq '.body' | head -20
+```
+
+The first line should be `## [$NEXT_VERSION] — YYYY-MM-DD`. If it's the fallback string
+"Release vX.Y.Z. See the assets below to download the app." the notes-job awk slice
+didn't match — the CHANGELOG heading isn't in the exact `## [X.Y.Z] — YYYY-MM-DD`
+format. Patch the CHANGELOG, re-slice locally, and edit in place:
 
 ```bash
 awk -v ver="$NEXT_VERSION" '
@@ -21,92 +71,29 @@ awk -v ver="$NEXT_VERSION" '
   inside { print }
 ' CHANGELOG.md > /tmp/release-notes.md
 
-cat /tmp/release-notes.md
-```
-
-If the file is empty, the CHANGELOG heading isn't in the exact `## [X.Y.Z] — YYYY-MM-DD`
-format — fix the heading (Phase 4) and re-slice before continuing.
-
-## Step 7.2 — Create the release (foreground, blocking)
-
-Run `gh release create` **in the foreground**. It does not exist yet (the tag was pushed
-but no release object was created), so create it pointing at the tag:
-
-```bash
-gh release create "v$NEXT_VERSION" \
-  --title "v$NEXT_VERSION" \
-  --notes-file /tmp/release-notes.md \
-  --latest
-```
-
-If a draft release somehow already exists for the tag, publish it instead of creating a
-duplicate:
-
-```bash
-gh release edit "v$NEXT_VERSION" --notes-file /tmp/release-notes.md --draft=false --latest
-```
-
-There are no artifacts to attach (nothing was built). If you have locally built bundles
-you want to ship, attach them explicitly with `gh release upload "v$NEXT_VERSION" <files>`
-— but the skill does not build them itself.
-
-## Step 7.3 — Confirm the release is public
-
-```bash
-gh release view "v$NEXT_VERSION" --json isDraft,isPrerelease,url,publishedAt,assets \
-  --jq '{isDraft,isPrerelease,url,publishedAt,assets:[.assets[]|.name]}'
-```
-
-Expect `"isDraft": false`, `"isPrerelease": false`, and a published timestamp. The
-`assets` list will be empty unless you manually uploaded bundles — that's expected while
-there's no build pipeline.
-
-## Step 7.4 — Verify the body matches the CHANGELOG
-
-```bash
-gh release view "v$NEXT_VERSION" --json body --jq '.body' | head -20
-```
-
-The first line should be `## [$NEXT_VERSION] — YYYY-MM-DD`. If it's wrong, re-slice (Step
-7.1) and update in place:
-
-```bash
 gh release edit "v$NEXT_VERSION" --notes-file /tmp/release-notes.md
 ```
 
-## Manual fallback — if `gh` is unavailable
+## Manual fallback — if the workflow failed
 
-If the `gh` CLI isn't available in the session, surface that to the user with the tag
-name, the release URL template (`<repo-url>/releases/tag/v$NEXT_VERSION`), and the
-`/tmp/release-notes.md` contents so they can create the release from the GitHub web UI.
-Do not force-push or re-tag to work around it.
-
-Proceed to Phase 8.
-
----
-
-## Future state — when a `release.yml` exists
-
-Once a GitHub Actions release pipeline is added, this phase becomes a watch-and-verify
-step instead of a manual publish:
-
-1. The tag push triggers a `notes` job that slices `CHANGELOG.md` and exposes it as a
-   workflow output.
-2. A `guard` job fails the workflow if a published (non-draft) release already exists for
-   the tag.
-3. Three build jobs (macOS / Linux / Windows) pass `releaseBody:
-${{ needs.notes.outputs.body }}` to `tauri-apps/tauri-action`, creating a draft release
-   with the CHANGELOG body and built artifacts attached.
-4. A `publish` job flips the draft public and marks it latest.
-
-Watch it in the foreground and verify, e.g.:
+If any job conclusion is not `success`:
 
 ```bash
-RUN_ID=$(gh run list --workflow=release.yml --limit=1 --json databaseId --jq '.[0].databaseId')
-gh run watch --exit-status "$RUN_ID"     # set Bash timeout to ~1800000 ms (30 min)
+gh run view "$RUN_ID" --log-failed
 ```
 
-Then re-check `gh release view` for `isDraft: false` and the expected platform artifacts
-stamped with `$NEXT_VERSION`. If a job conclusion isn't `success`, read
-`gh run view "$RUN_ID" --log-failed` and treat the failure as a real CI bug; if artifacts
-didn't build, fix the cause and cut a new tag (`vX.Y.Z+1`) rather than force-pushing.
+Read the failure verbatim. Treat it as a real CI bug (per the global "CI failures are
+real bugs" rule). If the artifacts built but the `publish` step didn't run, finish
+manually:
+
+```bash
+gh release edit "v$NEXT_VERSION" \
+  --notes-file <changelog-slice> \
+  --draft=false \
+  --latest
+```
+
+If the artifacts didn't build, fix the cause and cut a new tag (`vX.Y.Z+1`) — never
+"rescue" a half-built release by force-pushing the tag.
+
+Proceed to Phase 8.

@@ -86,6 +86,7 @@ function makeWorkerSession(toolCalls: CodexToolCall[]): CodexSession {
     is_archived: false,
     approval_mode: null,
     history_base_thread_id: null,
+    forked_from_thread_id: null,
   };
 }
 
@@ -636,6 +637,82 @@ describe("ToolCallItem", () => {
       expect(
         screen.queryByText(/Output was truncated by the Codex runtime/),
       ).not.toBeInTheDocument();
+    });
+  });
+
+  // Codex v0.148.0 (issue #237): sandbox checks that used to silently allow or
+  // degrade (unreadable Linux globs, Windows deny-read, Windows networking, app
+  // file uploads) now fail closed. There is no dedicated event for this — it
+  // surfaces as a normal failed exec_command or mcp_tool call whose output
+  // happens to contain a sandbox-denial signature.
+  describe("sandbox denial notice (v0.148.0+)", () => {
+    it("shows the sandbox-denied notice for a denied exec command", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({
+            exit_code: 1,
+            output: "touch: /etc/hosts: Permission denied",
+          })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/Blocked by sandbox/)).toBeInTheDocument();
+    });
+
+    it("does not show the sandbox-denied notice for an unrelated failure", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 1, output: "command not found: fooo" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/Blocked by sandbox/)).not.toBeInTheDocument();
+    });
+
+    it("does not show the sandbox-denied notice for a successful command", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 0, output: "permission denied earlier in the log" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/Blocked by sandbox/)).not.toBeInTheDocument();
+    });
+
+    // PR #38416: a denied app file upload has no exit code at all — only the
+    // MCP call's "failed" status and its output text signal the denial.
+    it("shows the sandbox-denied notice for a denied MCP file upload", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({
+            kind: "mcp_tool",
+            exit_code: null,
+            status: "failed",
+            output: "failed to upload `report.txt`: Permission denied",
+          })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/Blocked by sandbox/)).toBeInTheDocument();
+    });
+
+    it("does not show the sandbox-denied notice for a completed MCP call", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({
+            kind: "mcp_tool",
+            exit_code: null,
+            output: "permission denied",
+          })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/Blocked by sandbox/)).not.toBeInTheDocument();
     });
   });
 });

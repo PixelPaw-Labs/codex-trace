@@ -2830,6 +2830,39 @@ mod tests {
         assert!(turns[0].reasoning_effort.is_none());
     }
 
+    // Codex v0.149.0 (PR #39662): "max" and "ultra" were added as valid reasoning-effort
+    // values alongside minimal/low/medium/high. reasoning_effort is stored as a plain
+    // Option<String> with no enum validation, so these new values must pass through
+    // unchanged from both turn_context and thread_settings payloads.
+    #[test]
+    fn turn_context_accepts_max_reasoning_effort() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"s-effort-max","timestamp":"2026-08-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5.4","cwd":"/tmp","effort":"max"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755684003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn thread_settings_accepts_ultra_reasoning_effort() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"s-effort-ultra","timestamp":"2026-08-20T10:00:00Z","cli_version":"0.149.0"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":"Ship the feature"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:03Z","type":"response_item","payload":{"type":"thread_settings","model":"gpt-5.4","cwd":"/workspace","effort":"ultra"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755684004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("ultra"));
+    }
+
     // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event payload field renamed
     // new_thread_id → new_session_id. Verify the parser reads new_session_id as a fallback.
     #[test]
@@ -4391,5 +4424,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["follow-up answer"]
         );
+    }
+
+    // Codex v0.149.0 (PR #39081, upstream openai/codex): the TUI's in-memory
+    // per-thread replay buffer now caps buffered `AgentMessageDelta` bytes at
+    // 256 KiB per thread (`MAX_BUFFERED_AGENT_MESSAGE_DELTA_BYTES`), evicting the
+    // oldest buffered deltas once that total is exceeded, and coalesces
+    // consecutive same-item deltas into merged buffered entries capped at 4 KiB
+    // each (`MAX_COALESCED_AGENT_MESSAGE_DELTA_BYTES`). This bound lives entirely
+    // in `codex-rs/tui/src/app/thread_event_buffer.rs` — it governs only what the
+    // live TUI keeps in memory to replay when a user switches back to an inactive
+    // thread. codex-trace never reads that in-memory buffer; it parses the
+    // on-disk rollout JSONL directly, where Codex core still writes the
+    // fully-assembled `agent_message` event with the complete text once
+    // streaming finishes. Any intermediate `agent_message_delta` events recorded
+    // in the JSONL are already ignored by the wildcard arm in `handle_event_msg`
+    // (same as `outputDelta` in v0.129.0), so they can never truncate the final
+    // message either. Verify a message exceeding the 256 KiB TUI eviction
+    // threshold still parses in full, with no truncation, even when interleaved
+    // with delta events that would have overflowed the TUI's live buffer.
+    #[test]
+    fn v0149_agent_message_delta_replay_buffer_cap_does_not_truncate_full_message() {
+        let full_text = "a".repeat(300 * 1024); // 300 KiB, exceeds the 256 KiB TUI cap
+        let delta_chunk = "b".repeat(8 * 1024); // exceeds the 4 KiB per-entry coalesce cap
+
+        let session_meta = r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"v0149-session","timestamp":"2026-08-20T10:00:00Z","cwd":"/project","cli_version":"0.149.0","model_provider":"openai"}}"#.to_string();
+        let task_started = r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#.to_string();
+        // Oversized delta events, as would have been evicted from the TUI's
+        // in-memory replay buffer once their combined size passed 256 KiB.
+        let delta_lines: Vec<String> = (0..40)
+            .map(|i| {
+                let mut line = String::from(
+                    r#"{"timestamp":"2026-08-20T10:00:02Z","type":"event_msg","payload":{"type":"agent_message_delta","item_id":"item-1","delta":""#,
+                );
+                line.push_str(&delta_chunk);
+                line.push_str(r#"","seq":"#);
+                line.push_str(&i.to_string());
+                line.push_str("}}");
+                line
+            })
+            .collect();
+        let agent_message = {
+            let mut line = String::from(
+                r#"{"timestamp":"2026-08-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":""#,
+            );
+            line.push_str(&full_text);
+            line.push_str(r#"","phase":"final_answer"}}"#);
+            line
+        };
+        let task_complete = r#"{"timestamp":"2026-08-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755683044.0}}"#.to_string();
+
+        let mut lines: Vec<&str> = vec![&session_meta, &task_started];
+        lines.extend(delta_lines.iter().map(|s| s.as_str()));
+        lines.push(&agent_message);
+        lines.push(&task_complete);
+
+        let entries = entries(&lines);
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages.len(),
+            1,
+            "delta events must not produce separate agent messages"
+        );
+        assert_eq!(turns[0].agent_messages[0].text.len(), 300 * 1024);
+        assert_eq!(turns[0].agent_messages[0].text, full_text);
+        assert!(turns[0].agent_messages[0].text.len() > 256 * 1024);
+        assert_eq!(turns[0].final_answer.as_deref(), Some(full_text.as_str()));
     }
 }

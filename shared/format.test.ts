@@ -3,6 +3,7 @@ import {
   contextRemainingPercent,
   formatDuration,
   formatTokens,
+  isLikelySandboxDenied,
   shortPath,
   timeAgo,
   truncate,
@@ -123,6 +124,46 @@ describe("truncate", () => {
 
   it("trims leading/trailing whitespace", () => {
     expect(truncate("  hi  ", 10)).toBe("hi");
+  });
+});
+
+describe("isLikelySandboxDenied", () => {
+  it("returns false when there is no output", () => {
+    expect(isLikelySandboxDenied(null)).toBe(false);
+    expect(isLikelySandboxDenied("")).toBe(false);
+  });
+
+  it("returns false for unrelated output", () => {
+    expect(isLikelySandboxDenied("file not found")).toBe(false);
+  });
+
+  // Codex v0.148.0 (issue #237): unreadable Linux glob patterns now fail the
+  // sandbox construction itself instead of silently allowing the command.
+  it("detects a Linux unreadable-glob denial (PR #38026)", () => {
+    expect(
+      isLikelySandboxDenied(
+        "error building bubblewrap command: unreadable glob `/**/*.env` cannot be safely expanded",
+      ),
+    ).toBe(true);
+  });
+
+  it("detects a permission-denied message case-insensitively", () => {
+    expect(isLikelySandboxDenied("Permission Denied")).toBe(true);
+  });
+
+  it("detects a read-only file system denial", () => {
+    expect(isLikelySandboxDenied("touch: /etc/hosts: Read-only file system")).toBe(true);
+  });
+
+  it("detects a landlock/seccomp denial", () => {
+    expect(isLikelySandboxDenied("process terminated by seccomp policy (landlock)")).toBe(true);
+  });
+
+  // Codex v0.148.0 PR #38416 (issue #237): a denied app file upload surfaces as
+  // an MCP tool error with no exit code at all — only the output text signals
+  // the sandbox denial.
+  it("detects a permission-denied app file upload error", () => {
+    expect(isLikelySandboxDenied("failed to upload `report.txt`: Permission denied")).toBe(true);
   });
 });
 

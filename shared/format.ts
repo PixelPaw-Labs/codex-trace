@@ -141,6 +141,40 @@ export function transformInlineJson(
   return result.join("\n");
 }
 
+/**
+ * Codex v0.148.0 (issue #237) made several previously-silent sandbox checks fail
+ * closed (unreadable Linux globs, Windows deny-read rules, Windows managed
+ * networking, app file uploads): a call that used to run to completion, or to
+ * silently bypass the permission profile, can now fail instead. There is no
+ * dedicated event type for this — it just shows up as a normal failed tool
+ * call whose output happens to contain a denial message. Codex's own runtime
+ * uses this same keyword heuristic (codex-rs/sandboxing/src/denial.rs) to
+ * recognize a denial after the fact; mirror it here so a failed call can be
+ * labeled "blocked by sandbox" instead of a generic failure. Callers decide
+ * whether the tool call failed at all (exec exit code, MCP status, ...) —
+ * this only judges whether the output text looks like a sandbox denial.
+ */
+const SANDBOX_DENIED_KEYWORDS = [
+  "operation not permitted",
+  "permission denied",
+  "read-only file system",
+  "seccomp",
+  "sandbox",
+  "landlock",
+  "failed to write file",
+  // Codex v0.148.0 PR #38026: an unreadable Linux glob now fails sandbox
+  // construction itself (`error building bubblewrap command: unreadable glob
+  // ... cannot be safely expanded`), which doesn't contain any of the generic
+  // keywords above.
+  "cannot be safely expanded",
+];
+
+export function isLikelySandboxDenied(output: string | null): boolean {
+  if (!output) return false;
+  const lower = output.toLowerCase();
+  return SANDBOX_DENIED_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
 /** Relative time: "3m ago", "2h ago", "5d ago" */
 export function timeAgo(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime();

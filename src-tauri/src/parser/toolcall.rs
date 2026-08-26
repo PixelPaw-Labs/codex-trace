@@ -745,8 +745,11 @@ impl ToolCallBuilder {
             parse_mcp_name(&pending.name)
         };
 
-        // Extract output text from result.Ok.content[].text
-        let output = extract_mcp_output(payload);
+        // Extract output text from result.Ok.content[].text, or result.Err/is_error
+        // when the call failed (Codex v0.148.0 PR #38416 started returning fail-closed
+        // permission errors here for app file uploads that previously bypassed the
+        // sandbox silently).
+        let (output, mcp_failed) = extract_mcp_result(payload);
         let duration_secs = parse_duration(payload);
         let plugin_id = pending.plugin_id;
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
@@ -773,7 +776,11 @@ impl ToolCallBuilder {
             image_prompt: None,
             image_file_path: None,
             worker_session: None,
-            status: "completed".to_string(),
+            status: if mcp_failed {
+                "failed".to_string()
+            } else {
+                "completed".to_string()
+            },
             subagent_id,
             subagent_name,
             output_truncated: None,
@@ -1539,24 +1546,45 @@ fn parse_namespaced_tool_name(name: &str) -> Option<(String, String, String)> {
     Some((tool_type.to_string(), server.to_string(), tool.to_string()))
 }
 
-fn extract_mcp_output(payload: &Value) -> Option<String> {
-    let content = payload
-        .get("result")
-        .and_then(|r| r.get("Ok"))
-        .and_then(|ok| ok.get("content"))
-        .and_then(|c| c.as_array())?;
+/// Extract an MCP tool call's output text and whether it failed.
+///
+/// `mcp_tool_call_end.result` is `Result<CallToolResult, String>` on the wire:
+/// `{"Ok": {"content": [...], "is_error": bool}}` on a normal response, or
+/// `{"Err": "<message>"}` when the call could not be completed at all (e.g. Codex
+/// v0.148.0 PR #38416 rejecting an app file upload denied by the permission
+/// profile). `is_error: true` inside `Ok` signals a tool-reported failure rather
+/// than a transport error. Both must be treated as failed — previously only the
+/// `Ok` content text was read and the call was always marked "completed",
+/// silently hiding sandbox-denial and other tool errors.
+fn extract_mcp_result(payload: &Value) -> (Option<String>, bool) {
+    let Some(result) = payload.get("result") else {
+        return (None, false);
+    };
 
-    let texts: Vec<&str> = content
-        .iter()
-        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-        .collect();
-
-    if texts.is_empty() {
-        None
-    } else {
-        Some(texts.join("\n"))
+    if let Some(err) = result.get("Err").and_then(|v| v.as_str()) {
+        return (Some(err.to_string()), true);
     }
+
+    let Some(ok) = result.get("Ok") else {
+        return (None, false);
+    };
+    let is_error = ok
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let output = ok
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|content| {
+            content
+                .iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty());
+    (output, is_error)
 }
 
 /// Detect whether an exec_command_end payload signals truncated output.
@@ -1927,6 +1955,69 @@ mod tests {
         assert_eq!(tool.subagent_id.as_deref(), Some("worker-session-xyz"));
         assert_eq!(tool.subagent_name.as_deref(), Some("Noether"));
         assert_eq!(tool.output.as_deref(), Some("PR info"));
+    }
+
+    #[test]
+    fn v0148_mcp_tool_call_end_with_err_result_is_marked_failed() {
+        // Codex v0.148.0 (PR #38416, issue #237): app file uploads through the MCP
+        // layer now honor the configured permission profile instead of bypassing it,
+        // so a denied upload surfaces as `result: {"Err": "<message>"}` on
+        // mcp_tool_call_end. Previously extract_mcp_output only read result.Ok and
+        // finalize_mcp unconditionally set status to "completed", so a denial like
+        // this showed up as a successful call with no output at all.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_mcp_denied".to_string(),
+            "extract_text".to_string(),
+            r#"{}"#,
+            Some("mcp__calendar".to_string()),
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_mcp_denied",
+            "result": {"Err": "failed to upload `report.txt`: Permission denied (os error 13)"},
+        });
+        builder.finalize_mcp("mcp_tool_call_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.status, "failed");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("failed to upload `report.txt`: Permission denied (os error 13)")
+        );
+    }
+
+    #[test]
+    fn v0148_mcp_tool_call_end_with_ok_is_error_is_marked_failed() {
+        // An MCP server can also report a tool-level failure inside a successful
+        // transport response (`result.Ok.is_error: true`). This must be treated the
+        // same as an Err result rather than silently reported as "completed".
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_mcp_tool_err".to_string(),
+            "extract_text".to_string(),
+            r#"{}"#,
+            Some("mcp__calendar".to_string()),
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_mcp_tool_err",
+            "result": {"Ok": {"is_error": true, "content": [{"type": "text", "text": "denied: sandbox blocked read of private.txt"}]}},
+        });
+        builder.finalize_mcp("mcp_tool_call_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.status, "failed");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("denied: sandbox blocked read of private.txt")
+        );
     }
 
     #[test]

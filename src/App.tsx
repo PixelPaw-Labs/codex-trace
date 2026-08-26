@@ -69,20 +69,31 @@ export function App() {
     }
   }, [session.sessionPath, session.session?.is_ongoing, updateSessionOngoing]);
 
+  // Changing view always dismisses the worker panel — it is only meaningful inside
+  // the detail view, for the turn currently selected. Clearing it here, at the event
+  // that causes the change, avoids doing it from an effect (react(set-state-in-effect)).
+  const changeView = useCallback((next: ViewState) => {
+    setView(next);
+    setWorkerPanelCallId(null);
+  }, []);
+
   const handleSelectSession = useCallback(
     (info: CodexSessionInfo) => {
       loadSession(info.path);
-      setView("list");
+      changeView("list");
       setSelectedTurn(0);
       clearTools();
     },
-    [loadSession, clearTools],
+    [loadSession, clearTools, changeView],
   );
 
-  const handleOpenDetail = useCallback((index: number) => {
-    setSelectedTurn(index);
-    setView("detail");
-  }, []);
+  const handleOpenDetail = useCallback(
+    (index: number) => {
+      setSelectedTurn(index);
+      changeView("detail");
+    },
+    [changeView],
+  );
 
   const handleToggleDate = useCallback((dateGroup: string) => {
     setCollapsedDates((prev) => {
@@ -111,7 +122,7 @@ export function App() {
 
   const collapseAll = useCallback(() => clearTools(), [clearTools]);
 
-  const goToSessions = useCallback(() => setView("picker"), []);
+  const goToSessions = useCallback(() => changeView("picker"), [changeView]);
 
   const closeWorkerPanel = useCallback(() => setWorkerPanelCallId(null), []);
 
@@ -120,15 +131,10 @@ export function App() {
     setWorkerPanelCallId((current) => (current === tool.call_id ? null : tool.call_id));
   }, []);
 
-  useEffect(() => {
-    if (view !== "detail") {
-      closeWorkerPanel();
-      return;
-    }
-    if (workerPanelCallId && !workerPanelTool?.worker_session) {
-      closeWorkerPanel();
-    }
-  }, [view, workerPanelCallId, workerPanelTool?.worker_session, closeWorkerPanel]);
+  // A panel whose tool call no longer resolves to a worker session (e.g. the selected
+  // turn changed under it) is simply not shown, derived during render.
+  const activeWorkerPanelTool =
+    view === "detail" && workerPanelTool?.worker_session ? workerPanelTool : null;
 
   // Keyboard navigation
   useKeyboard({
@@ -146,20 +152,20 @@ export function App() {
         handleSelectSession(picker.sessions[pickerSelected]);
     },
     Escape: () => {
-      if (workerPanelCallId) {
+      if (activeWorkerPanelTool) {
         closeWorkerPanel();
         return;
       }
-      if (view === "detail") setView("list");
-      else if (view === "list") setView("picker");
+      if (view === "detail") changeView("list");
+      else if (view === "list") changeView("picker");
     },
     q: () => {
-      if (workerPanelCallId) {
+      if (activeWorkerPanelTool) {
         closeWorkerPanel();
         return;
       }
-      if (view === "detail") setView("list");
-      else if (view === "list") setView("picker");
+      if (view === "detail") changeView("list");
+      else if (view === "list") changeView("picker");
     },
     ",": () => setShowSettings(true),
     "?": () => setShowKeybinds((p) => !p),
@@ -222,7 +228,7 @@ export function App() {
               selectedIndex={selectedTurn}
               onSelectTurn={(i) => {
                 setSelectedTurn(i);
-                setView("detail");
+                changeView("detail");
               }}
             />
           )}
@@ -232,19 +238,19 @@ export function App() {
               turn={turns[selectedTurn]}
               expanded={expandedTools}
               onToggle={toggleTool}
-              onBack={() => setView("list")}
-              openWorkerCallId={workerPanelCallId}
+              onBack={() => changeView("list")}
+              openWorkerCallId={activeWorkerPanelTool ? workerPanelCallId : null}
               onOpenWorkerPanel={handleOpenWorkerPanel}
             />
           )}
         </div>
 
-        {view === "detail" && workerPanelTool?.worker_session && (
+        {activeWorkerPanelTool?.worker_session && (
           <>
             <ResizeHandle onResize={setWorkerPanelWidth} side="right" />
             <WorkerPanel
-              session={workerPanelTool.worker_session}
-              sourceTool={workerPanelTool}
+              session={activeWorkerPanelTool.worker_session}
+              sourceTool={activeWorkerPanelTool}
               activeWorkerCallId={workerPanelCallId}
               style={{ flex: `0 0 ${workerPanelWidth}px`, maxWidth: workerPanelWidth }}
               onClose={closeWorkerPanel}

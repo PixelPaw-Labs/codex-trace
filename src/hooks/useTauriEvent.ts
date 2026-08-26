@@ -7,7 +7,12 @@ import { listen, type UnlistenFn } from "../lib/listen";
  */
 export function useTauriEvent<T>(event: string, handler: (payload: T) => void) {
   const handlerRef = useRef(handler);
-  handlerRef.current = handler;
+  // Sync the latest handler from an effect rather than during render: writing to a
+  // ref while rendering is what react(refs) flags. useRef already seeds the first
+  // handler, so the listener never sees a stale value on mount.
+  useEffect(() => {
+    handlerRef.current = handler;
+  });
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 

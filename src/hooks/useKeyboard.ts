@@ -2,7 +2,11 @@ import { useEffect, useRef } from "react";
 
 export function useKeyboard(keyMap: Record<string, () => void>) {
   const keyMapRef = useRef(keyMap);
-  keyMapRef.current = keyMap;
+  // Sync the latest keyMap from an effect rather than during render: writing to a
+  // ref while rendering is what react(refs) flags.
+  useEffect(() => {
+    keyMapRef.current = keyMap;
+  });
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

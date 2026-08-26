@@ -48,6 +48,16 @@ pub struct CodexSession {
     /// marks the whole rollout file as a continuation of another paginated thread's history.
     /// Null for legacy-history sessions or paginated threads with no inherited prefix.
     pub history_base_thread_id: Option<String>,
+    /// Thread ID this session was forked from, read from `session_meta.payload.forked_from_id`
+    /// — the app-server's `SessionConfiguredEvent.forked_from_id`, persisted verbatim into the
+    /// rollout's `session_meta` line by `codex-rs/rollout/src/recorder.rs`. This field on
+    /// `SessionMeta` predates Codex v0.148.0, but `codex exec fork` (new subcommand) and
+    /// `codex exec resume` (Codex v0.148.0+, PR #37367, issue #238) are the first `codex exec`
+    /// code paths to populate it — it was previously hardcoded to `None` in
+    /// `codex-rs/exec/src/lib.rs`. Session-level signal, distinct from the per-turn
+    /// `forked_from_thread_id` on `CodexTurn` (sourced from `task_started`).
+    /// Null for non-forked sessions.
+    pub forked_from_thread_id: Option<String>,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -94,6 +104,7 @@ fn parse_session_inner(
         is_headless: false,
         has_missing_spawn_metadata: false,
         history_base_thread_id: None,
+        forked_from_thread_id: None,
     };
 
     // Parse session_meta from first matching entry
@@ -316,6 +327,17 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
     session.history_base_thread_id = payload
         .get("history_base")
         .and_then(|b| b.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Codex v0.148.0 (PR #37367, issue #238): session_meta.forked_from_id is the
+    // app-server's SessionConfiguredEvent.forked_from_id, persisted verbatim into the
+    // rollout. Verified against codex-rs/rollout/src/recorder.rs and
+    // codex-rs/protocol/src/protocol.rs's SessionMeta struct — real signal for any forked
+    // or fork-descended thread, including codex exec fork/resume sessions.
+    session.forked_from_thread_id = payload
+        .get("forked_from_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
@@ -1899,6 +1921,60 @@ mod tests {
 
         let session = parse_session(&path).unwrap();
         assert!(session.history_base_thread_id.is_none());
+    }
+
+    // Codex v0.148.0/v0.149.0 (PRs #37367, #38819, issue #238): `codex exec fork` and
+    // `codex exec resume` populate the app-server's SessionConfiguredEvent.forked_from_id
+    // (previously hardcoded to None in codex-rs/exec/src/lib.rs). That value is persisted
+    // verbatim into the rollout's session_meta.forked_from_id field by
+    // codex-rs/rollout/src/recorder.rs for any forked or fork-descended thread — a distinct,
+    // session-level signal from the per-turn task_started.forked_from_thread_id field.
+
+    #[test]
+    fn v0148_parse_session_reads_forked_from_id_for_exec_fork() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-08-20T10-00-00-v0148execfork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"v0148-exec-fork-child","timestamp":"2026-08-20T10:00:00Z","cwd":"/project","cli_version":"0.148.0","model_provider":"openai","originator":"codex_exec","forked_from_id":"v0148-exec-fork-parent"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1787306402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(
+            session.forked_from_thread_id.as_deref(),
+            Some("v0148-exec-fork-parent"),
+            "session_meta.forked_from_id must be surfaced as forked_from_thread_id even with \
+             no task_started.forked_from_thread_id present"
+        );
+    }
+
+    #[test]
+    fn v0148_parse_session_no_forked_from_id_is_none() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-08-20T10-01-00-v0148nofork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T10:01:00Z","type":"session_meta","payload":{"id":"v0148-nofork","timestamp":"2026-08-20T10:01:00Z","cwd":"/project","cli_version":"0.148.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-20T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1787306462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert!(session.forked_from_thread_id.is_none());
     }
 
     // Codex v0.146.0 (issue #211): the new skills subsystem renders the skill catalog into

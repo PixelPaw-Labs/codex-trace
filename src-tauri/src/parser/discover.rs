@@ -57,6 +57,16 @@ pub struct CodexSessionInfo {
     /// marks a whole rollout file as a continuation of another paginated thread's history.
     /// Null for legacy-history sessions or paginated threads with no inherited prefix.
     pub history_base_thread_id: Option<String>,
+    /// Thread ID this session was forked from, read from `session_meta.payload.forked_from_id`
+    /// — the app-server's `SessionConfiguredEvent.forked_from_id`, persisted verbatim into the
+    /// rollout's `session_meta` line by `codex-rs/rollout/src/recorder.rs`. This field on
+    /// `SessionMeta` predates Codex v0.148.0, but `codex exec fork` (new subcommand) and
+    /// `codex exec resume` (Codex v0.148.0+, PR #37367, issue #238) are the first `codex exec`
+    /// code paths to populate it — it was previously hardcoded to `None` in
+    /// `codex-rs/exec/src/lib.rs`. Session-level signal, distinct from the per-turn
+    /// `forked_from_thread_id` on `CodexTurn` (sourced from `task_started`).
+    /// Null for non-forked sessions.
+    pub forked_from_thread_id: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -221,6 +231,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         meta_archived,
         approval_mode,
         history_base_thread_id,
+        forked_from_thread_id,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -279,6 +290,16 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            // Codex v0.148.0 (PR #37367, issue #238): session_meta.forked_from_id is the
+            // app-server's SessionConfiguredEvent.forked_from_id, persisted verbatim into the
+            // rollout. Verified against codex-rs/rollout/src/recorder.rs and
+            // codex-rs/protocol/src/protocol.rs's SessionMeta struct — real signal for any
+            // forked or fork-descended thread, including codex exec fork/resume sessions.
+            let forked_from_thread_id = payload
+                .get("forked_from_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             (
                 id,
                 start_time,
@@ -295,6 +316,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 meta_archived,
                 approval_mode,
                 history_base_thread_id,
+                forked_from_thread_id,
             )
         }
         "session_meta_root" => {
@@ -307,7 +329,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false, None, None,
+                false, None, None, None,
             )
         }
         _ => return None,
@@ -553,6 +575,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         ai_title,
         approval_mode,
         history_base_thread_id,
+        forked_from_thread_id,
     })
 }
 
@@ -1787,6 +1810,91 @@ mod tests {
             .find(|s| s.id == "v0147-section")
             .expect("session must be discovered even with an unrecognized section field");
         assert_eq!(session.cli_version.as_deref(), Some("0.147.0"));
+    }
+
+    // Codex v0.148.0/v0.149.0 (PRs #37367, #38819, issue #238): `codex exec fork` and
+    // `codex exec resume` populate the app-server's SessionConfiguredEvent.forked_from_id
+    // (previously hardcoded to None in codex-rs/exec/src/lib.rs). That value is persisted
+    // verbatim into the rollout's session_meta.forked_from_id field by
+    // codex-rs/rollout/src/recorder.rs for any forked or fork-descended thread — this is a
+    // distinct, session-level signal from the per-turn task_started.forked_from_thread_id
+    // field. discover_sessions must surface it so fork lineage from `codex exec fork` is
+    // detected even when no per-turn signal is present.
+
+    #[test]
+    fn discover_sessions_v0148_reads_forked_from_id_for_exec_fork() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-20T10-00-00-v0148-exec-fork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"v0148-exec-fork-child","timestamp":"2026-08-20T10:00:00Z","cwd":"/project","cli_version":"0.148.0","model_provider":"openai","originator":"codex_exec","forked_from_id":"v0148-exec-fork-parent"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1787306402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0148-exec-fork-child")
+            .expect("codex exec fork session must be discovered");
+        assert_eq!(
+            session.forked_from_thread_id.as_deref(),
+            Some("v0148-exec-fork-parent"),
+            "session_meta.forked_from_id must be surfaced as forked_from_thread_id even with \
+             no task_started.forked_from_thread_id present"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_no_forked_from_id_is_none() {
+        // Non-forked sessions (the vast majority) must not set forked_from_thread_id.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-20T10-01-00-v0148-nofork.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-20T10:01:00Z","type":"session_meta","payload":{"id":"v0148-nofork","timestamp":"2026-08-20T10:01:00Z","cwd":"/project","cli_version":"0.148.0","model_provider":"openai"}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0148-nofork")
+            .expect("session must be discovered");
+        assert!(
+            session.forked_from_thread_id.is_none(),
+            "session without forked_from_id must have forked_from_thread_id == None"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_empty_forked_from_id_is_none() {
+        // Defensive: an empty-string forked_from_id must be treated as absent, not surfaced
+        // as a bogus lineage pointer.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-20T10-02-00-v0148-empty-fork.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-20T10:02:00Z","type":"session_meta","payload":{"id":"v0148-empty-fork","timestamp":"2026-08-20T10:02:00Z","cli_version":"0.148.0","forked_from_id":""}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0148-empty-fork")
+            .expect("session must be discovered even with an empty forked_from_id");
+        assert!(session.forked_from_thread_id.is_none());
     }
 
     // Codex v0.149.0 (PR #39385): the TUI's queue-by-name command resolution now picks

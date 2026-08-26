@@ -252,6 +252,14 @@ export interface CodexSession {
    * the whole rollout file as a continuation of another paginated thread's history.
    * Null for legacy-history sessions or paginated threads with no inherited prefix. */
   history_base_thread_id: string | null;
+  /** Thread ID this session was forked from, read from `session_meta.payload.forked_from_id`
+   * — the app-server's `SessionConfiguredEvent.forked_from_id`, persisted verbatim into the
+   * rollout's `session_meta` line. This field predates Codex v0.148.0, but `codex exec fork`
+   * (new subcommand) and `codex exec resume` (Codex v0.148.0+, PR #37367, issue #238) are the
+   * first `codex exec` code paths to populate it — previously hardcoded to `null` there.
+   * Session-level signal, distinct from the per-turn `forked_from_thread_id` on `CodexTurn`.
+   * Null for non-forked sessions. */
+  forked_from_thread_id: string | null;
 }
 
 export interface CodexSessionInfo {
@@ -296,6 +304,14 @@ export interface CodexSessionInfo {
    * the whole rollout file as a continuation of another paginated thread's history.
    * Null for legacy-history sessions or paginated threads with no inherited prefix. */
   history_base_thread_id: string | null;
+  /** Thread ID this session was forked from, read from `session_meta.payload.forked_from_id`
+   * — the app-server's `SessionConfiguredEvent.forked_from_id`, persisted verbatim into the
+   * rollout's `session_meta` line. This field predates Codex v0.148.0, but `codex exec fork`
+   * (new subcommand) and `codex exec resume` (Codex v0.148.0+, PR #37367, issue #238) are the
+   * first `codex exec` code paths to populate it — previously hardcoded to `null` there.
+   * Session-level signal, distinct from the per-turn `forked_from_thread_id` on `CodexTurn`.
+   * Null for non-forked sessions. */
+  forked_from_thread_id: string | null;
 }
 
 export interface SettingsResponse {

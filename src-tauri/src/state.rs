@@ -180,6 +180,7 @@ mod tests {
                     ai_title: None,
                     approval_mode: None,
                     history_base_thread_id: None,
+                    forked_from_thread_id: None,
                 }],
             });
         }
@@ -227,6 +228,7 @@ mod tests {
                     ai_title: None,
                     approval_mode: None,
                     history_base_thread_id: None,
+                    forked_from_thread_id: None,
                 }],
             });
         }

@@ -86,6 +86,7 @@ function makeWorkerSession(toolCalls: CodexToolCall[]): CodexSession {
     is_archived: false,
     approval_mode: null,
     history_base_thread_id: null,
+    forked_from_thread_id: null,
   };
 }
 

@@ -2830,6 +2830,39 @@ mod tests {
         assert!(turns[0].reasoning_effort.is_none());
     }
 
+    // Codex v0.149.0 (PR #39662): "max" and "ultra" were added as valid reasoning-effort
+    // values alongside minimal/low/medium/high. reasoning_effort is stored as a plain
+    // Option<String> with no enum validation, so these new values must pass through
+    // unchanged from both turn_context and thread_settings payloads.
+    #[test]
+    fn turn_context_accepts_max_reasoning_effort() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"s-effort-max","timestamp":"2026-08-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5.4","cwd":"/tmp","effort":"max"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755684003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn thread_settings_accepts_ultra_reasoning_effort() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"s-effort-ultra","timestamp":"2026-08-20T10:00:00Z","cli_version":"0.149.0"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":"Ship the feature"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:03Z","type":"response_item","payload":{"type":"thread_settings","model":"gpt-5.4","cwd":"/workspace","effort":"ultra"}}"#,
+            r#"{"timestamp":"2026-08-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755684004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("ultra"));
+    }
+
     // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event payload field renamed
     // new_thread_id → new_session_id. Verify the parser reads new_session_id as a fallback.
     #[test]

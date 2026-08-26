@@ -1788,4 +1788,93 @@ mod tests {
             .expect("session must be discovered even with an unrecognized section field");
         assert_eq!(session.cli_version.as_deref(), Some("0.147.0"));
     }
+
+    // Codex v0.149.0 (PR #39385): the TUI's queue-by-name command resolution now picks
+    // the most recently active session when multiple sessions share a queue name,
+    // instead of erroring on the ambiguity. codex-trace never resolves sessions by
+    // name — discovery reads one CodexSessionInfo per rollout file, identified solely
+    // by the `id` extracted from session_meta. `thread_name` (from `thread_name_updated`)
+    // is stored only as a display label and is never used to look up, merge, or
+    // deduplicate sessions. Verify two independent session files sharing the same
+    // thread_name are still discovered as two fully separate sessions, each keeping
+    // its own id — there is no name-based resolution path here for the upstream
+    // TUI behavior change to affect.
+    #[test]
+    fn v0149_duplicate_thread_name_sessions_remain_independent() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let older_path = day_dir.join("rollout-2026-08-20T09-00-00-v0149-older.jsonl");
+        std::fs::write(
+            &older_path,
+            [
+                r#"{"timestamp":"2026-08-20T09:00:00Z","type":"session_meta","payload":{"id":"v0149-older","timestamp":"2026-08-20T09:00:00Z","cwd":"/project","cli_version":"0.149.0"}}"#,
+                r#"{"timestamp":"2026-08-20T09:00:01Z","type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"shared-queue-name"}}"#,
+                r#"{"timestamp":"2026-08-20T09:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T09:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755680403.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let newer_path = day_dir.join("rollout-2026-08-20T10-00-00-v0149-newer.jsonl");
+        std::fs::write(
+            &newer_path,
+            [
+                r#"{"timestamp":"2026-08-20T10:00:00Z","type":"session_meta","payload":{"id":"v0149-newer","timestamp":"2026-08-20T10:00:00Z","cwd":"/project","cli_version":"0.149.0"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:01Z","type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"shared-queue-name"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755684003.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        let older = sessions.iter().find(|s| s.id == "v0149-older").unwrap();
+        let newer = sessions.iter().find(|s| s.id == "v0149-newer").unwrap();
+        assert_eq!(older.thread_name.as_deref(), Some("shared-queue-name"));
+        assert_eq!(newer.thread_name.as_deref(), Some("shared-queue-name"));
+    }
+
+    // Codex v0.149.0 (PR #39034): queued messages written by another process can now
+    // be dispatched into a session's rollout file. Whichever session's file receives
+    // the dispatched message, codex-trace still discovers/attributes it correctly:
+    // discovery is driven purely by the file's own on-disk content (id, turns, thread
+    // name), not by which process authored a given line. Simulate a queued message
+    // landing as an additional turn appended to an already-active session's rollout
+    // and verify it is folded into that same session, not lost or misattributed.
+    #[test]
+    fn v0149_queued_message_appended_to_existing_session_is_attributed_correctly() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let path = day_dir.join("rollout-2026-08-20T11-00-00-v0149-target.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T11:00:00Z","type":"session_meta","payload":{"id":"v0149-target","timestamp":"2026-08-20T11:00:00Z","cwd":"/project","cli_version":"0.149.0"}}"#,
+                r#"{"timestamp":"2026-08-20T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755687602.0}}"#,
+                // Message queued by another process, dispatched once this session picked it up.
+                r#"{"timestamp":"2026-08-20T11:05:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                r#"{"timestamp":"2026-08-20T11:05:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1755687901.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0149-target")
+            .expect("queued-into session must still be discovered by its own id");
+        assert_eq!(session.turn_count, 2);
+        assert!(!session.is_ongoing);
+    }
 }

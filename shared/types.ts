@@ -94,6 +94,13 @@ export interface CollabSpawn {
   prompt_preview: string;
 }
 
+/** Codex v0.150.0 (PRs #40308, #40315): a task `@`-mentioned from the TUI composer, decoded
+ * out of a user message's task-mention encoding. */
+export interface TaskMentionRef {
+  title: string;
+  thread_id: string;
+}
+
 export type ToolKind =
   | "exec_command"
   | "mcp_tool"
@@ -197,6 +204,11 @@ export interface CodexTurn {
    * budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
    * Absent for cached data serialized before this field was added. */
   warnings?: string[];
+  /** Codex v0.150.0 (PRs #40308, #40315): tasks `@`-mentioned in `user_message` via the TUI
+   * composer's task-mention encoding, decoded back to readable `@Title` text in `user_message`.
+   * Empty for turns with no task mentions and for pre-v0.150.0 sessions.
+   * Absent for cached data serialized before this field was added. */
+  task_mentions?: TaskMentionRef[];
 }
 
 /**
@@ -312,6 +324,12 @@ export interface CodexSessionInfo {
    * Session-level signal, distinct from the per-turn `forked_from_thread_id` on `CodexTurn`.
    * Null for non-forked sessions. */
   forked_from_thread_id: string | null;
+  /** Codex v0.150.0 (PRs #40308, #40315): thread IDs of other Codex tasks `@`-mentioned from
+   * the TUI composer in this session's `user_message` events. Distinct from
+   * `spawned_worker_ids` — a task mention is a live reference to an existing, independently
+   * spawned task, not a child spawned by this session. Empty for sessions with no task
+   * mentions and for pre-v0.150.0 sessions. */
+  mentioned_thread_ids: string[];
 }
 
 export interface SettingsResponse {

@@ -120,6 +120,7 @@ function makeSessionInfo(): CodexSessionInfo {
     spawned_worker_ids: [],
     date_group: "2026/08/20",
     ai_title: null,
+    mentioned_thread_ids: [],
   };
 }
 

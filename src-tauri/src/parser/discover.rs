@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use super::compression::open_session_reader;
 use super::entry::{extract_session_id, RawEntry};
+use super::mentions::referenced_thread_ids;
 use super::spawn::parse_spawn_agent_output;
 
 /// Lightweight session info for the picker list.
@@ -67,6 +68,12 @@ pub struct CodexSessionInfo {
     /// `forked_from_thread_id` on `CodexTurn` (sourced from `task_started`).
     /// Null for non-forked sessions.
     pub forked_from_thread_id: Option<String>,
+    /// Codex v0.150.0 (PRs #40308, #40315): thread IDs of other Codex tasks `@`-mentioned from
+    /// the TUI composer in this session's `user_message` events. Distinct from
+    /// `spawned_worker_ids` — a task mention is a live reference to an existing,
+    /// independently spawned task, not a child spawned by this session. Empty for sessions
+    /// with no task mentions and for pre-v0.150.0 sessions.
+    pub mentioned_thread_ids: Vec<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -346,6 +353,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
     let mut total_tokens: Option<u64> = None;
     let mut end_time: Option<String> = None;
     let mut spawned_worker_ids: Vec<String> = Vec::new();
+    let mut mentioned_thread_ids: Vec<String> = Vec::new();
     let mut pending_spawn_call_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut is_ongoing = true;
@@ -384,6 +392,21 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                     .and_then(|p| p.get("type"))
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
+                // Codex v0.150.0 (PRs #40308, #40315): a user_message's task-mention encoding
+                // may reference other tasks regardless of which turn it opens/continues, so
+                // this scan runs unconditionally rather than only on the turn_count == 0 arm
+                // below.
+                if pt == "user_message" {
+                    if let Some(message) = v
+                        .get("payload")
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                    {
+                        for thread_id in referenced_thread_ids(message) {
+                            push_unique(&mut mentioned_thread_ids, thread_id);
+                        }
+                    }
+                }
                 match pt {
                     "task_started" => {
                         turn_count += 1;
@@ -576,6 +599,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         approval_mode,
         history_base_thread_id,
         forked_from_thread_id,
+        mentioned_thread_ids,
     })
 }
 
@@ -681,6 +705,36 @@ mod tests {
         let path = PathBuf::from("/home/user/.codex/sessions/2026/04/25/rollout-abc.jsonl");
         let dg = date_group_from_path(&path);
         assert_eq!(dg, "2026/04/25");
+    }
+
+    #[test]
+    fn discover_sessions_collects_task_mention_thread_ids() {
+        // Codex v0.150.0 (PRs #40308, #40315): a user_message carrying the TUI composer's
+        // task-mention encoding should surface the referenced thread ID in
+        // mentioned_thread_ids, distinct from spawn-based spawned_worker_ids.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-01T00-00-00-mentions.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T00:00:00Z","type":"session_meta","payload":{"id":"mentions-session","timestamp":"2026-08-01T00:00:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Please check [@Review database migration](thread://abc123) before merging."}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1754006403.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "mentions-session")
+            .unwrap();
+        assert_eq!(session.mentioned_thread_ids, vec!["abc123".to_string()]);
+        assert!(session.spawned_worker_ids.is_empty());
     }
 
     #[test]

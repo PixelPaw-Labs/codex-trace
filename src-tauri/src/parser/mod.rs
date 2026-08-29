@@ -2,6 +2,7 @@ pub mod cache;
 pub mod compression;
 pub mod discover;
 pub mod entry;
+pub mod mentions;
 pub mod ongoing;
 pub mod redact;
 pub mod session;

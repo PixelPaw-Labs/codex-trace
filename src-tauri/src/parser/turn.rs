@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::entry::{parse_timestamp_secs, RawEntry};
+use super::mentions::{decode_task_mentions, TaskMentionRef};
 use super::spawn::parse_spawn_agent_output;
 use super::toolcall::{ToolCall, ToolCallBuilder};
 
@@ -154,6 +155,11 @@ pub struct CodexTurn {
     /// catalog budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Codex v0.150.0 (PRs #40308, #40315): tasks `@`-mentioned in `user_message` via the TUI
+    /// composer's task-mention encoding, decoded by `super::mentions::decode_task_mentions`.
+    /// Empty for turns with no task mentions and for pre-v0.150.0 sessions.
+    #[serde(default)]
+    pub task_mentions: Vec<TaskMentionRef>,
 }
 
 impl CodexTurn {
@@ -185,6 +191,7 @@ impl CodexTurn {
             memories: Vec::new(),
             audio_transcript: Vec::new(),
             warnings: Vec::new(),
+            task_mentions: Vec::new(),
         }
     }
 }
@@ -361,11 +368,14 @@ fn handle_event_msg(
         }
 
         "user_message" => {
-            let message = payload
+            let raw_message = payload
                 .get("message")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+            // Codex v0.150.0 (PRs #40308, #40315): task `@`-mentions from the TUI composer are
+            // encoded inline into the message text; decode back to readable `@Title` text and
+            // collect the referenced tasks.
+            let (message, task_mentions) = decode_task_mentions(raw_message);
 
             if !has_task_started {
                 // Old format: each user_message starts a new turn
@@ -374,7 +384,8 @@ fn handle_event_msg(
                 let started_at = entry.timestamp.as_deref().and_then(parse_timestamp_secs);
                 let mut turn = CodexTurn::new(turn_id.clone());
                 turn.started_at = started_at;
-                turn.user_message = Some(message.clone());
+                turn.user_message = Some(message);
+                turn.task_mentions = task_mentions;
                 turns.insert(turn_id.clone(), turn);
                 *current_turn_id = Some(turn_id.clone());
                 tool_builders
@@ -384,6 +395,7 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     if turn.user_message.is_none() {
                         turn.user_message = Some(message);
+                        turn.task_mentions = task_mentions;
                     }
                 }
             }
@@ -2726,6 +2738,47 @@ mod tests {
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_message.as_deref(), Some("Primary message"));
+    }
+
+    // Codex v0.150.0 (PRs #40308, #40315): user_message task-mention encoding is decoded to
+    // readable text and the referenced tasks are captured on the turn.
+
+    #[test]
+    fn user_message_task_mention_is_decoded_and_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"s-tm1","timestamp":"2026-08-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Please check [@Review database migration](thread://abc123) before merging."}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1754042403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Please check @Review database migration before merging.")
+        );
+        assert_eq!(turns[0].task_mentions.len(), 1);
+        assert_eq!(turns[0].task_mentions[0].title, "Review database migration");
+        assert_eq!(turns[0].task_mentions[0].thread_id, "abc123");
+    }
+
+    #[test]
+    fn user_message_without_task_mention_leaves_task_mentions_empty() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"s-tm2","timestamp":"2026-08-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Just a normal message."}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1754042403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Just a normal message.")
+        );
+        assert!(turns[0].task_mentions.is_empty());
     }
 
     #[test]

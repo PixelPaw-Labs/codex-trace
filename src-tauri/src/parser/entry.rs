@@ -885,6 +885,21 @@ mod tests {
         assert!(e.payload.get("stderr").is_none());
     }
 
+    // Codex v0.150.0 (PR #40511): a new `Interrupt` variant was added to the HookEventName
+    // enum — it fires for an active turn just before its interrupted-abort event, flushing
+    // the turn transcript first. codex-trace's shell_hook_output schema carries the hook
+    // event name as a free-form `hook_type` string (see #104, #107), so the new value must
+    // parse the same way existing hook_type values (pre_exec, post_exec, pre_mcp) do.
+
+    #[test]
+    fn v0150_interrupt_hook_output_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-08-01T10:00:00Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-interrupt-1","hook_type":"interrupt","stdout":"turn interrupted\n","exit_code":0}}"#;
+        let e = RawEntry::parse(line).expect("interrupt shell_hook_output event must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("shell_hook_output"));
+        assert_eq!(e.payload["hook_type"], "interrupt");
+    }
+
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
     // JSON output items. A "structured_output" response_item carries a JSON-validated
     // content object as its payload. RawEntry must parse these without panicking.

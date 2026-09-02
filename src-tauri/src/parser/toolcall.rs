@@ -2127,6 +2127,49 @@ mod tests {
         assert_eq!(tc.status, "completed");
     }
 
+    // Codex v0.150.0 (PR #40511): new `Interrupt` variant added to the HookEventName enum.
+    // hook_type is read as a free-form string (no fixed/exhaustive match against known hook
+    // names), so new and future hook event names classify as ShellHook the same way existing
+    // ones do — nothing to special-case.
+
+    #[test]
+    fn shell_hook_output_v0150_interrupt_hook_classified_as_shell_hook() {
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-interrupt-1",
+            "hook_type": "interrupt",
+            "stdout": "turn interrupted\n",
+            "exit_code": 0
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "interrupt");
+        assert_eq!(tc.output.as_deref(), Some("turn interrupted\n"));
+        assert_eq!(tc.status, "completed");
+    }
+
+    #[test]
+    fn shell_hook_output_unrecognized_future_hook_name_still_classified_as_shell_hook() {
+        // No hook_type value is matched exhaustively, so a name codex-trace has never seen
+        // before must still classify as ShellHook rather than being dropped or erroring.
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-future-1",
+            "hook_type": "some_future_hook_name",
+            "stdout": "ran\n",
+            "exit_code": 0
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "some_future_hook_name");
+    }
+
     // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
     // Image content is now emitted bare (e.g. {"type":"image_url",...}) rather than wrapped
     // in {"type":"image_span","content":[...]}. The image_generation function call must be

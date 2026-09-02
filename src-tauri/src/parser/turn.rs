@@ -3415,6 +3415,32 @@ mod tests {
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
     }
 
+    // Codex v0.150.0 (PR #40511): new `Interrupt` HookEventName variant fires for an active
+    // top-level turn just before its interrupted-abort event (turn_aborted), flushing the
+    // turn transcript first. The hook's shell_hook_output event must still be attached to the
+    // turn's tool_calls even though the turn ends as Aborted rather than Complete.
+
+    #[test]
+    fn v0150_interrupt_hook_flushes_transcript_before_turn_aborted() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"v0150-interrupt","timestamp":"2026-08-01T10:00:00Z","cli_version":"0.150.0"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-interrupt-1","hook_type":"interrupt","stdout":"turn interrupted\n","exit_code":0}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:03Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"user_interrupt"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Aborted);
+        assert_eq!(turns[0].aborted_reason.as_deref(), Some("user_interrupt"));
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "interrupt");
+        assert_eq!(tc.output.as_deref(), Some("turn interrupted\n"));
+    }
+
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
     // JSON output items. The final model response is emitted as a "structured_output"
     // response_item with a JSON object in `content`. codex-trace must capture this as the

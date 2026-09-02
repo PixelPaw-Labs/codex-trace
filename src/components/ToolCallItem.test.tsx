@@ -715,4 +715,35 @@ describe("ToolCallItem", () => {
       expect(screen.queryByText(/Blocked by sandbox/)).not.toBeInTheDocument();
     });
   });
+
+  // Codex v0.150.0 (PR #40511): new `Interrupt` HookEventName variant, plus the general
+  // requirement (issue #251) that hook events codex-trace has never seen before still
+  // render through the generic shell_hook path instead of being dropped or shown as raw JSON.
+  describe("hook events (issue #251)", () => {
+    it("renders the interrupt hook event using the generic hook name and icon", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "interrupt", output: "turn interrupted\n" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("interrupt")).toBeInTheDocument();
+      expect(container.querySelector(".tool-call--hook")).toBeInTheDocument();
+      expect(screen.getByText("turn interrupted")).toBeInTheDocument();
+    });
+
+    it("renders an unrecognized future hook name via the same generic hook rendering", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "some_future_hook_name" })}
+          expanded={false}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("some_future_hook_name")).toBeInTheDocument();
+      expect(container.querySelector(".tool-call--hook")).toBeInTheDocument();
+      expect(container.querySelector(".tool-call--unknown")).not.toBeInTheDocument();
+    });
+  });
 });

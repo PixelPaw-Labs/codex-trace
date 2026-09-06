@@ -152,7 +152,7 @@ impl ToolCallBuilder {
         );
     }
 
-    /// Register a custom_tool_call (apply_patch etc).
+    /// Register a custom_tool_call (apply_patch, the desktop `exec` tool, etc.).
     pub fn add_custom_tool_call(&mut self, call_id: String, name: String, input: Option<String>) {
         self.pending.insert(
             call_id,
@@ -167,7 +167,7 @@ impl ToolCallBuilder {
         );
     }
 
-    /// Finalize a custom_tool_call (apply_patch etc) with its output.
+    /// Finalize a custom_tool_call (apply_patch, the desktop `exec` tool, etc.) with its output.
     pub fn finalize_custom_tool_output(
         &mut self,
         call_id: &str,
@@ -175,9 +175,18 @@ impl ToolCallBuilder {
         exit_code: Option<i32>,
     ) {
         if let Some(pending) = self.pending.remove(call_id) {
+            let is_patch = pending.name == "apply_patch";
             self.finalized.push(ToolCall {
                 call_id: call_id.to_string(),
-                kind: ToolKind::PatchApply,
+                // Codex Desktop v0.153+ records its JavaScript/desktop execution
+                // tool as `custom_tool_call` named `exec`. It is not an apply-patch
+                // call; preserve it as Unknown so its input/output remains visible
+                // without presenting arbitrary JavaScript as a patch.
+                kind: if is_patch {
+                    ToolKind::PatchApply
+                } else {
+                    ToolKind::Unknown
+                },
                 name: pending.name,
                 arguments: pending.arguments,
                 input_text: pending.input_text,
@@ -190,17 +199,22 @@ impl ToolCallBuilder {
                 mcp_tool: None,
                 plugin_id: None,
                 script_path: None,
-                patch_success: exit_code.map(|c| c == 0),
+                patch_success: if is_patch {
+                    exit_code.map(|c| c == 0)
+                } else {
+                    None
+                },
                 patch_changes: None,
                 web_query: None,
                 web_url: None,
                 image_prompt: None,
                 image_file_path: None,
                 worker_session: None,
-                status: if exit_code.unwrap_or(1) == 0 {
-                    "completed".to_string()
-                } else {
-                    "failed".to_string()
+                // Structured custom-tool outputs do not carry an exit code.
+                // Missing an exit code means normal completion, not failure.
+                status: match exit_code {
+                    Some(code) if code != 0 => "failed".to_string(),
+                    _ => "completed".to_string(),
                 },
                 subagent_id: None,
                 subagent_name: None,

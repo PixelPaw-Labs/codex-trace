@@ -62,6 +62,10 @@ pub struct CodexSession {
 
 /// Parse a Codex JSONL session file into a CodexSession.
 pub fn parse_session(path: &Path) -> Result<CodexSession, String> {
+    let path_text = path.to_string_lossy();
+    if super::remote::is_remote_spec(&path_text) {
+        return super::remote::parse_remote_session(&path_text);
+    }
     let mut visited = HashSet::new();
     parse_session_inner(path, &mut visited)
 }

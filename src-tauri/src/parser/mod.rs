@@ -5,6 +5,7 @@ pub mod entry;
 pub mod mentions;
 pub mod ongoing;
 pub mod redact;
+pub mod remote;
 pub mod session;
 pub mod spawn;
 pub mod toolcall;

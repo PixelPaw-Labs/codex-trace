@@ -119,6 +119,26 @@ Default sessions directory:
 ~/.codex/sessions
 ```
 
+### View sessions on a remote SSH host
+
+Open Settings (press `,`), choose **SSH Remote**, and enter an SSH host alias from your local
+`~/.ssh/config` (for example `dev`) plus the remote sessions directory (usually
+`~/.codex/sessions`). Codex Trace invokes your local `ssh` client, so your existing SSH keys,
+agent, `ProxyJump`, and host configuration are reused; no daemon or installation is required on
+the remote server.
+
+The connection is stored as an `ssh://` sessions source. Session metadata is scanned on the remote
+host and only the selected rollout is fetched for full parsing. Remote picker updates are polled
+periodically because local filesystem notifications cannot cross an SSH connection. SSH must be
+usable non-interactively (the app cannot answer an interactive password or host-key prompt).
+
+For example:
+
+```text
+SSH Host: dev
+Remote Sessions Directory: ~/.codex/sessions
+```
+
 Environment variables for headless and Docker mode:
 
 | Variable                | Default     | Description                    |

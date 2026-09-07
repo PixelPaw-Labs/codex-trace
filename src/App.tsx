@@ -192,7 +192,14 @@ export function App() {
         {/* Left sidebar */}
         <div className="app__sidebar" style={{ width: sidebarWidth, minWidth: sidebarWidth }}>
           <div className="app__sidebar-header">
-            <span className="app__sidebar-title">SESSIONS</span>
+            <span className="app__sidebar-title">
+              SESSIONS
+              {picker.sessionsDir.startsWith("ssh://") && (
+                <span className="app__sidebar-source">
+                  {picker.sessionsDir.slice("ssh://".length).split("/", 1)[0]}
+                </span>
+              )}
+            </span>
           </div>
           <SidebarTree
             sessions={picker.allSessions}
@@ -213,6 +220,7 @@ export function App() {
               loading={picker.loading}
               searchQuery={picker.searchQuery}
               selectedIndex={pickerSelected}
+              sessionsDir={picker.sessionsDir}
               onSelectSession={handleSelectSession}
               onSearchChange={picker.setSearchQuery}
             />

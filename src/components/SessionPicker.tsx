@@ -14,6 +14,7 @@ interface SessionPickerProps {
   loading: boolean;
   searchQuery: string;
   selectedIndex: number;
+  sessionsDir: string;
   onSelectSession: (info: CodexSessionInfo) => void;
   onSearchChange: (q: string) => void;
 }
@@ -35,6 +36,7 @@ export function SessionPicker({
   loading,
   searchQuery,
   selectedIndex,
+  sessionsDir,
   onSelectSession,
   onSearchChange,
 }: SessionPickerProps) {
@@ -48,6 +50,9 @@ export function SessionPicker({
   );
 
   const dateGroups = groupByDate(sessions);
+  const remoteHost = sessionsDir.startsWith("ssh://")
+    ? sessionsDir.slice("ssh://".length).split("/", 1)[0]
+    : null;
   let flatIndex = 0;
 
   return (
@@ -55,6 +60,7 @@ export function SessionPicker({
       <div className="picker__header">
         <div className="picker__title">
           Sessions
+          {remoteHost && <span className="picker__source-badge">SSH · {remoteHost}</span>}
           {totalTokens > 0 && (
             <span className="picker__total-tokens">
               <TokensIcon /> {formatTokens(totalTokens)} tok

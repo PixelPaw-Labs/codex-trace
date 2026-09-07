@@ -154,18 +154,8 @@ async fn api_set_sessions_dir(
     let app_state = app_state(&state);
 
     if let Some(ref p) = body.path {
-        let pb = std::path::PathBuf::from(p);
-        if !pb.exists() {
-            return err_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("path does not exist: {p}"),
-            );
-        }
-        if !pb.is_dir() {
-            return err_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("path is not a directory: {p}"),
-            );
+        if let Err(error) = crate::commands::settings::validate_sessions_dir(p) {
+            return err_response(axum::http::StatusCode::BAD_REQUEST, error);
         }
     }
 

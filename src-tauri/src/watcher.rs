@@ -86,6 +86,9 @@ pub fn start_session_watcher(
     state: Arc<AppState>,
     app: Option<AppHandle>,
 ) -> WatcherHandle {
+    if crate::parser::remote::is_remote_spec(&path) {
+        return start_remote_session_watcher(path, state, app);
+    }
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let (signal_tx, mut signal_rx) = mpsc::channel::<()>(4);
     let (thread_stop_tx, thread_stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -162,6 +165,55 @@ pub fn start_session_watcher(
     }
 }
 
+/// Poll a remote rollout over SSH. Remote hosts cannot be watched by the local
+/// `notify` backend, so use a modest interval and only emit updates when the
+/// parsed session actually changes.
+fn start_remote_session_watcher(
+    path: String,
+    state: Arc<AppState>,
+    app: Option<AppHandle>,
+) -> WatcherHandle {
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let (thread_stop_tx, _thread_stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let path_for_poll = path.clone();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut previous: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = stop_rx.recv() => break,
+                _ = interval.tick() => {
+                    let snapshot = match crate::parser::remote::remote_file_snapshot(&path_for_poll) {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => continue,
+                    };
+                    if previous.as_deref() == Some(snapshot.as_str()) {
+                        continue;
+                    }
+                    let session = match crate::parser::session::parse_session(Path::new(&path_for_poll)) {
+                        Ok(session) => session,
+                        Err(_) => continue,
+                    };
+                    state.set_watched_ongoing(path_for_poll.clone(), session.is_ongoing);
+                    previous = Some(snapshot);
+                    let payload = SessionUpdatePayload { session };
+                    let Ok(json) = serde_json::to_string(&payload.session) else { continue; };
+                    state.broadcast("session-update", &json);
+                    if let Some(ref app_handle) = app {
+                        let _ = app_handle.emit("session-update", payload);
+                    }
+                }
+            }
+        }
+    });
+
+    WatcherHandle {
+        stop_tx,
+        thread_stop_tx,
+    }
+}
+
 /// Start watching the sessions directory for new/changed files.
 /// When changes are detected the watcher broadcasts a lightweight `picker-refresh`
 /// signal with no payload. Clients are responsible for fetching the updated
@@ -172,6 +224,9 @@ pub fn start_picker_watcher(
     state: Arc<AppState>,
     app: Option<AppHandle>,
 ) -> WatcherHandle {
+    if crate::parser::remote::is_remote_spec(&sessions_dir) {
+        return start_remote_picker_watcher(sessions_dir, state, app);
+    }
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let (signal_tx, mut signal_rx) = mpsc::channel::<()>(4);
     let (thread_stop_tx, thread_stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -214,6 +269,46 @@ pub fn start_picker_watcher(
                     // server-side cache coalesces concurrent requests.
                     state.broadcast("picker-refresh", "{}");
 
+                    if let Some(ref app_handle) = app {
+                        let _ = app_handle.emit("picker-refresh", serde_json::json!({}));
+                    }
+                }
+            }
+        }
+    });
+
+    WatcherHandle {
+        stop_tx,
+        thread_stop_tx,
+    }
+}
+
+/// Poll a remote sessions directory and emit the same lightweight refresh event
+/// used by the local filesystem watcher whenever the session index changes.
+fn start_remote_picker_watcher(
+    sessions_dir: String,
+    state: Arc<AppState>,
+    app: Option<AppHandle>,
+) -> WatcherHandle {
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let (thread_stop_tx, _thread_stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut previous: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = stop_rx.recv() => break,
+                _ = interval.tick() => {
+                    let snapshot = match crate::parser::remote::remote_sessions_snapshot(&sessions_dir) {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => continue,
+                    };
+                    if previous.as_deref() == Some(snapshot.as_str()) {
+                        continue;
+                    }
+                    previous = Some(snapshot);
+                    state.broadcast("picker-refresh", "{}");
                     if let Some(ref app_handle) = app {
                         let _ = app_handle.emit("picker-refresh", serde_json::json!({}));
                     }

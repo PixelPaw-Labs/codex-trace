@@ -104,6 +104,10 @@ pub struct CodexSessionInfo {
 /// touches `codex-rs/rollout` or adds any rollout field — confirmed by diffing both PRs'
 /// changed files — so this scanner needs no changes for it.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
+    let sessions_dir_text = sessions_dir.to_string_lossy();
+    if super::remote::is_remote_spec(&sessions_dir_text) {
+        return super::remote::discover_remote_sessions(&sessions_dir_text);
+    }
     if !sessions_dir.exists() {
         return Ok(Vec::new());
     }

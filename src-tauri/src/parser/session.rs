@@ -215,6 +215,17 @@ fn collect_loaded_skills(entries: &[RawEntry]) -> Vec<String> {
         if !matches!(entry.entry_type.as_str(), "response_item" | "function_call") {
             continue;
         }
+        if entry.entry_type == "response_item"
+            && !matches!(
+                entry.payload.get("type").and_then(Value::as_str),
+                Some("custom_tool_call" | "function_call")
+            )
+        {
+            // The initial developer message contains the complete available-skill
+            // catalog. Only inspect tool inputs so the result means "observed as
+            // loaded", not merely "available to the session".
+            continue;
+        }
         let text = serde_json::to_string(&entry.raw).unwrap_or_default();
         // File-change tool inputs often contain the literal implementation text
         // `SKILL.md` while patching this repository. They are not skill loads.

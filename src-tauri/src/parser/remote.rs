@@ -4,14 +4,26 @@
 //! host is passed to the user's normal `ssh` client, so aliases, identities,
 //! jump-hosts, and agent forwarding continue to come from `~/.ssh/config`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::discover::CodexSessionInfo;
 use super::session::{parse_session, CodexSession};
 
 const PREFIX: &str = "ssh://";
+const REMOTE_TITLE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct RemoteTitleCacheEntry {
+    fetched_at: Instant,
+    titles: HashMap<String, String>,
+}
+
+static REMOTE_TITLE_CACHE: OnceLock<Mutex<HashMap<String, RemoteTitleCacheEntry>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
@@ -66,12 +78,29 @@ pub fn make_spec(host: &str, path: &str) -> Result<String, String> {
 /// Discover remote rollout files by invoking the user's OpenSSH client. Metadata
 /// is computed remotely so large session trees do not have to cross the network.
 pub fn discover_remote_sessions(spec_value: &str) -> Result<Vec<CodexSessionInfo>, String> {
+    discover_remote_sessions_with_script(spec_value, REMOTE_DISCOVERY_FAST_SCRIPT)
+}
+
+/// Perform the legacy full metadata scan. This is intentionally separate from
+/// the fast picker path: the watcher can run it in the background and refresh
+/// the picker after the first lightweight result is already visible.
+pub fn discover_remote_sessions_full(spec_value: &str) -> Result<Vec<CodexSessionInfo>, String> {
+    discover_remote_sessions_with_script(spec_value, REMOTE_DISCOVERY_FULL_SCRIPT)
+}
+
+fn discover_remote_sessions_with_script(
+    spec_value: &str,
+    discovery_script: &str,
+) -> Result<Vec<CodexSessionInfo>, String> {
     let spec = parse_spec(spec_value)?;
     // Do not copy the remote sessions directory: a normal development host can
     // contain gigabytes of rollout history. Instead, run a small metadata-only
     // scanner remotely and transfer one compact JSON record per session. The
     // selected session itself is fetched lazily by `parse_remote_session`.
-    let output = run_ssh(&spec.host, &remote_discovery_command(&spec))?;
+    let output = run_ssh(
+        &spec.host,
+        &remote_discovery_command(&spec, discovery_script),
+    )?;
     let mut sessions = Vec::new();
     for line in output
         .split(|byte| *byte == b'\n')
@@ -149,11 +178,11 @@ pub fn remote_file_snapshot(spec_value: &str) -> Result<String, String> {
     String::from_utf8(output).map_err(|e| format!("invalid remote file snapshot: {e}"))
 }
 
-fn remote_discovery_command(spec: &RemoteSpec) -> String {
+fn remote_discovery_command(spec: &RemoteSpec, discovery_script: &str) -> String {
     format!(
         "python3 - {} <<'PY'\n{}\nPY",
         shell_path(&spec.path),
-        REMOTE_DISCOVERY_SCRIPT
+        discovery_script
     )
 }
 
@@ -183,8 +212,18 @@ fn remote_index_path(root: &str) -> String {
 
 fn remote_session_title(spec: &RemoteSpec, session_id: &str) -> Option<String> {
     let index_path = remote_index_path(&spec.path);
+    let cache_key = format!("{}:{index_path}", spec.host);
+    let cache = REMOTE_TITLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(&cache_key) {
+            if entry.fetched_at.elapsed() < REMOTE_TITLE_CACHE_TTL {
+                return entry.titles.get(session_id).cloned();
+            }
+        }
+    }
+
     let output = read_remote_file(&spec.host, &index_path).ok()?;
-    let mut title = None;
+    let mut titles = HashMap::new();
     for value in output
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -197,20 +236,39 @@ fn remote_session_title(spec: &RemoteSpec, session_id: &str) -> Option<String> {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if id == Some(session_id) {
-            title = next_title.map(str::to_string);
+        if let (Some(id), Some(title)) = (id, next_title) {
+            titles.insert(id.to_string(), title.to_string());
         }
+    }
+    let title = titles.get(session_id).cloned();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            cache_key,
+            RemoteTitleCacheEntry {
+                fetched_at: Instant::now(),
+                titles,
+            },
+        );
     }
     title
 }
 
 fn run_ssh(host: &str, command: &str) -> Result<Vec<u8>, String> {
+    let control_path = ssh_control_path();
     let output = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
+            "-o",
+            "Compression=yes",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            &format!("ControlPath={control_path}"),
             host,
             command,
         ])
@@ -225,6 +283,13 @@ fn run_ssh(host: &str, command: &str) -> Result<Vec<u8>, String> {
         });
     }
     Ok(output.stdout)
+}
+
+fn ssh_control_path() -> String {
+    // OpenSSH limits ControlPath to 104 bytes. macOS temp_dir() can already
+    // contain a long per-process path, so keep the socket prefix deliberately
+    // short while `%C` still isolates hosts/configurations by hash.
+    "/tmp/ct-ssh-%C".to_string()
 }
 
 fn shell_path(path: &str) -> String {
@@ -292,15 +357,42 @@ fn temporary_root(label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-const REMOTE_DISCOVERY_SCRIPT: &str = r#"
-import json, os, subprocess, sys, time
+const REMOTE_DISCOVERY_FULL_SCRIPT: &str = r#"
+import json, os, shutil, subprocess, sys, time
 
 root = os.path.expanduser(sys.argv[1])
 now = time.time()
+zstd_binary = shutil.which('zstd')
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
+class ZstdStream:
+    def __init__(self, path):
+        self.compressed = open(path, 'rb')
+        self.reader = zstandard.ZstdDecompressor().stream_reader(self.compressed)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raw = self.reader.readline()
+        if not raw:
+            raise StopIteration
+        return raw
+
+    def close(self):
+        self.reader.close()
+        self.compressed.close()
 
 def stream(path):
     if path.endswith('.zst'):
-        return subprocess.Popen(['zstd', '-q', '-dc', path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        if zstd_binary:
+            return subprocess.Popen([zstd_binary, '-q', '-dc', path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        if zstandard:
+            return ZstdStream(path)
+        raise RuntimeError('compressed rollout requires zstd or Python zstandard')
     return open(path, 'rb')
 
 def text(value):
@@ -434,6 +526,110 @@ for dirpath, _, names in os.walk(root):
             continue
 "#;
 
+/// Fast remote picker scan. Unlike the legacy scanner above, this reads only
+/// the first JSONL record from each rollout (and never counts every turn or
+/// token). A remote directory can contain gigabytes of history; full parsing
+/// is deferred until the user selects one session.
+const REMOTE_DISCOVERY_FAST_SCRIPT: &str = r#"
+import json, os, shutil, subprocess, sys
+
+root = os.path.expanduser(sys.argv[1])
+zstd_binary = shutil.which('zstd')
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
+def text(value):
+    return value if isinstance(value, str) else None
+
+def first_record(path):
+    try:
+        if path.endswith('.zst'):
+            if zstd_binary:
+                process = subprocess.Popen(
+                    [zstd_binary, '-q', '-dc', path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                raw = process.stdout.readline()
+                process.kill()
+                process.wait()
+            elif zstandard:
+                with open(path, 'rb') as compressed:
+                    reader = zstandard.ZstdDecompressor().stream_reader(compressed)
+                    raw = reader.readline()
+                    reader.close()
+            else:
+                return None
+        else:
+            with open(path, 'rb') as stream:
+                raw = stream.readline()
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+index_titles = {}
+index_path = os.path.join(os.path.dirname(root), 'session_index.jsonl')
+try:
+    with open(index_path, 'r', encoding='utf-8') as index:
+        for raw in index:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                continue
+            session_id = text(value.get('id'))
+            title = text(value.get('thread_name') or value.get('title'))
+            if session_id and title and title.strip():
+                index_titles[session_id] = title.strip()
+except OSError:
+    pass
+
+for dirpath, _, names in os.walk(root):
+    for name in names:
+        if not (name.startswith('rollout-') and (name.endswith('.jsonl') or name.endswith('.jsonl.zst'))):
+            continue
+        path = os.path.join(dirpath, name)
+        first = first_record(path)
+        if not first:
+            continue
+        meta = first.get('payload') or first
+        session_id = text(meta.get('id')) or text(meta.get('session_id')) or text((meta.get('thread') or {}).get('sessionId'))
+        if not session_id:
+            continue
+        source = meta.get('source')
+        source_subagent = source.get('subagent') if isinstance(source, dict) else None
+        relative_dir = os.path.relpath(os.path.dirname(path), root)
+        print(json.dumps({
+            'id': session_id,
+            'path': os.path.relpath(path, root),
+            'cwd': text(meta.get('cwd')),
+            'git_branch': text((meta.get('git') or {}).get('branch')),
+            'originator': text(meta.get('originator')),
+            'model': None,
+            'cli_version': text(meta.get('cli_version')),
+            'thread_name': index_titles.get(session_id),
+            'turn_count': 0,
+            'start_time': text(meta.get('timestamp')) or text(first.get('timestamp')) or '',
+            'end_time': None,
+            'total_tokens': None,
+            'is_ongoing': False,
+            'is_external_worker': bool(source_subagent),
+            'is_inline_worker': False,
+            'worker_nickname': None,
+            'worker_role': None,
+            'spawned_worker_ids': [],
+            'date_group': '/'.join(relative_dir.split(os.sep)[-3:]),
+            'ai_title': text(meta.get('ai-title')),
+            'is_headless': meta.get('originator') == 'remote-control' or source == 'remote-control',
+            'is_archived': bool(meta.get('archived', False)),
+            'approval_mode': text(meta.get('ask_for_approval')),
+            'history_base_thread_id': text((meta.get('history_base') or {}).get('thread_id')),
+            'forked_from_thread_id': text(meta.get('forked_from_id')),
+            'mentioned_thread_ids': [],
+        }, separators=(',', ':')), flush=True)
+"#;
+
 const REMOTE_SNAPSHOT_SCRIPT: &str = r#"
 import os, sys
 root = os.path.expanduser(sys.argv[1])
@@ -498,6 +694,13 @@ mod tests {
     fn shell_path_expands_tilde_without_exposing_shell_input() {
         assert_eq!(shell_path("~/.codex/sessions"), "$HOME/'.codex/sessions'");
         assert_eq!(shell_path("/tmp/my sessions"), "'/tmp/my sessions'");
+    }
+
+    #[test]
+    fn ssh_control_path_is_short_enough_for_openssh() {
+        let path = ssh_control_path();
+        assert_eq!(path, "/tmp/ct-ssh-%C");
+        assert!(path.len() < 104);
     }
 
     #[test]

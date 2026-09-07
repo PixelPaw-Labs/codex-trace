@@ -305,6 +305,27 @@ fn start_remote_picker_watcher(
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let (thread_stop_tx, _thread_stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
+    // The first remote picker response intentionally uses a metadata-only scan
+    // so the UI becomes usable quickly. Fill in the expensive aggregate fields
+    // (turns, model, token totals, ongoing state, and workers) in the background
+    // and publish one refresh when that pass completes.
+    let enrichment_dir = sessions_dir.clone();
+    let enrichment_state = state.clone();
+    let enrichment_app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(sessions) = crate::parser::remote::discover_remote_sessions_full(&enrichment_dir)
+        else {
+            return;
+        };
+        if !enrichment_state.replace_sessions_cache_if_current(&enrichment_dir, sessions) {
+            return;
+        }
+        enrichment_state.broadcast("picker-refresh", "{}");
+        if let Some(ref app_handle) = enrichment_app {
+            let _ = app_handle.emit("picker-refresh", serde_json::json!({}));
+        }
+    });
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut previous: Option<String> = None;

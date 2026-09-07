@@ -134,9 +134,14 @@ agent, `ProxyJump`, and host configuration are reused; no daemon or installation
 the remote server.
 
 The connection is stored as an `ssh://` sessions source. Session metadata is scanned on the remote
-host and only the selected rollout is fetched for full parsing. Remote picker updates are polled
-periodically because local filesystem notifications cannot cross an SSH connection. SSH must be
-usable non-interactively (the app cannot answer an interactive password or host-key prompt).
+host and only the selected rollout is transferred for full parsing. The first picker response uses
+the first JSONL record plus `session_index.jsonl`, so it is fast even when the host has gigabytes of
+history; a background pass then fills in turns, model, token, ongoing, and worker statistics and
+refreshes the picker. SSH connection multiplexing and compression are enabled automatically for
+subsequent requests. Remote picker updates are polled periodically because local filesystem
+notifications cannot cross an SSH connection. SSH must be usable non-interactively (the app cannot
+answer an interactive password or host-key prompt). The remote host needs `python3`; compressed
+rollouts additionally need either the `zstd` command or the Python `zstandard` module.
 
 For example:
 

@@ -20,6 +20,7 @@ struct SessionsCache {
 }
 
 const SESSIONS_CACHE_TTL: Duration = Duration::from_secs(2);
+const REMOTE_SESSIONS_CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub struct AppState {
     pub session_watcher: Mutex<Option<WatcherHandle>>,
@@ -99,8 +100,13 @@ impl AppState {
     /// Multiple concurrent callers within the TTL window share one disk scan.
     pub fn discover_sessions_cached(&self, dir: &str) -> Result<Vec<CodexSessionInfo>, String> {
         let mut cache = self.sessions_cache.lock().map_err(|e| e.to_string())?;
+        let ttl = if crate::parser::remote::is_remote_spec(dir) {
+            REMOTE_SESSIONS_CACHE_TTL
+        } else {
+            SESSIONS_CACHE_TTL
+        };
         if let Some(ref c) = *cache {
-            if c.dir == dir && c.cached_at.elapsed() < SESSIONS_CACHE_TTL {
+            if c.dir == dir && c.cached_at.elapsed() < ttl {
                 return Ok(c.sessions.clone());
             }
         }
@@ -118,6 +124,27 @@ impl AppState {
         if let Ok(mut cache) = self.sessions_cache.lock() {
             *cache = None;
         }
+    }
+
+    /// Replace a cached remote result produced by a background enrichment pass.
+    /// Do not let a slower scan for an old source overwrite a newer source.
+    pub fn replace_sessions_cache_if_current(
+        &self,
+        dir: &str,
+        sessions: Vec<CodexSessionInfo>,
+    ) -> bool {
+        let Ok(mut cache) = self.sessions_cache.lock() else {
+            return false;
+        };
+        if cache.as_ref().is_some_and(|current| current.dir != dir) {
+            return false;
+        }
+        *cache = Some(SessionsCache {
+            dir: dir.to_string(),
+            cached_at: Instant::now(),
+            sessions,
+        });
+        true
     }
 
     pub fn broadcast(&self, event: &str, data: &str) {
@@ -249,5 +276,21 @@ mod tests {
             result.is_empty(),
             "different dir must not return dir_a cached data"
         );
+    }
+
+    #[test]
+    fn background_enrichment_cannot_overwrite_a_newer_source() {
+        let state = make_state();
+        {
+            let mut cache = state.sessions_cache.lock().unwrap();
+            *cache = Some(SessionsCache {
+                dir: "ssh://dev/~/.codex/sessions".to_string(),
+                cached_at: Instant::now(),
+                sessions: Vec::new(),
+            });
+        }
+
+        assert!(!state.replace_sessions_cache_if_current("/local/sessions", Vec::new()));
+        assert!(state.replace_sessions_cache_if_current("ssh://dev/~/.codex/sessions", Vec::new()));
     }
 }

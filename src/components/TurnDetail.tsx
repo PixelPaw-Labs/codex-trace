@@ -30,6 +30,8 @@ export function TurnDetail({
   );
   const reasoning = turn.agent_messages.filter((m) => m.is_reasoning);
   const finalAnswer = turn.agent_messages.find((m) => m.phase === "final_answer");
+  const finalAnswerText = finalAnswer?.text ?? turn.final_answer;
+  const reasoningSummaries = reasoning.filter((m) => m.text.trim().length > 0);
 
   // Interleave commentary messages with tool calls by their stream order, so each tool call
   // shows up inline where it actually happened instead of being dumped at the end of the turn.
@@ -127,11 +129,30 @@ export function TurnDetail({
                 className="turn-detail__section-label"
                 style={{ color: "var(--reasoning-text)" }}
               >
-                Reasoning (encrypted)
+                {reasoningSummaries.length > 0 ? "Reasoning summary" : "Reasoning (encrypted)"}
               </div>
-              <div className="turn-detail__reasoning-note">
-                (reasoning encrypted — cannot display)
-              </div>
+              {reasoningSummaries.length > 0 ? (
+                <div className="turn-detail__reasoning-summary">
+                  {reasoningSummaries.map((msg, index) => (
+                    <div className="turn-detail__reasoning-item" key={`${msg.timestamp}-${index}`}>
+                      {msg.timestamp && (
+                        <div className="turn-detail__msg-header">
+                          <span className="turn-detail__msg-time">
+                            {formatExactTime(msg.timestamp)}
+                          </span>
+                        </div>
+                      )}
+                      <div className="turn-detail__markdown">
+                        <MarkdownRenderer content={msg.text} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="turn-detail__reasoning-note">
+                  (reasoning encrypted — summary unavailable)
+                </div>
+              )}
             </div>
           )}
 
@@ -154,11 +175,11 @@ export function TurnDetail({
             </div>
           )}
 
-          {finalAnswer && (
+          {finalAnswerText && (
             <div className="turn-detail__section turn-detail__section--final">
               <div className="turn-detail__section-label">Final answer</div>
               <div className="turn-detail__msg">
-                {finalAnswer.timestamp && (
+                {finalAnswer?.timestamp && (
                   <div className="turn-detail__msg-header">
                     <span className="turn-detail__msg-time">
                       {formatExactTime(finalAnswer.timestamp)}
@@ -166,7 +187,7 @@ export function TurnDetail({
                   </div>
                 )}
                 <div className="turn-detail__markdown">
-                  <MarkdownRenderer content={finalAnswer.text} />
+                  <MarkdownRenderer content={finalAnswerText} />
                 </div>
               </div>
             </div>

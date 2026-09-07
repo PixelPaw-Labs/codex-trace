@@ -236,7 +236,13 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             | "function_call_output"
             | "message"
             | "reasoning" => {
-                handle_response_item(entry, &mut turns, &current_turn_id, &mut tool_builders);
+                handle_response_item(
+                    entry,
+                    &mut turns,
+                    &current_turn_id,
+                    &mut tool_builders,
+                    index,
+                );
             }
             "turn_context" => {
                 handle_turn_context(entry, &mut turns, &current_turn_id);
@@ -829,12 +835,14 @@ fn handle_response_item(
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    index: usize,
 ) {
     let payload = if entry.entry_type == "response_item" {
         &entry.payload
     } else {
         &entry.raw
     };
+    let ts = entry.timestamp.as_deref().unwrap_or("");
 
     let item_type = match payload.get("type").and_then(|t| t.as_str()) {
         Some(t) => t,
@@ -1174,6 +1182,68 @@ fn handle_response_item(
             }
         }
 
+        // Codex Desktop stores assistant output as response_item/message entries. Keep these
+        // messages in the timeline as well as the legacy final_answer field so commentary and
+        // final output are visible in the detail view even when no event_msg::agent_message was
+        // emitted.
+        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+            if let Some(turn) = turns.get_mut(tid) {
+                let text = extract_item_content(payload);
+                if !text.is_empty() {
+                    let phase = payload
+                        .get("phase")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let is_final = phase.as_deref() == Some("final_answer");
+                    if is_final || turn.final_answer.is_none() {
+                        turn.final_answer = Some(text.clone());
+                    }
+                    // Older response_item/message entries have no phase and are represented by
+                    // the legacy final_answer field only. Codex Desktop adds phase metadata;
+                    // retain those messages in the chronological output timeline.
+                    if phase.is_some() {
+                        turn.agent_messages.push(AgentMsg {
+                            text,
+                            phase,
+                            timestamp: ts.to_string(),
+                            is_reasoning: false,
+                            order: index,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Codex Desktop keeps the readable reasoning summary beside encrypted reasoning
+        // content. The encrypted field is intentionally not rendered, but summary_text blocks
+        // are safe, user-facing output and should be shown in the turn timeline.
+        "reasoning" => {
+            let Some(turn) = turns.get_mut(tid) else {
+                return;
+            };
+            let Some(summary) = payload.get("summary").and_then(|v| v.as_array()) else {
+                return;
+            };
+            for item in summary {
+                let text = item
+                    .get("text")
+                    .or_else(|| item.get("summary_text"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                turn.agent_messages.push(AgentMsg {
+                    text: text.to_string(),
+                    phase: None,
+                    timestamp: ts.to_string(),
+                    is_reasoning: true,
+                    order: index,
+                });
+            }
+        }
+
         // Codex Desktop v0.153 records user prompts as response_item messages with
         // role=user and input_text content blocks (rather than event_msg.user_message).
         // Use the last user message in a turn: the first one is often the injected
@@ -1185,20 +1255,6 @@ fn handle_response_item(
                 if let Some(turn) = turns.get_mut(tid) {
                     turn.user_message = Some(text);
                     turn.task_mentions = task_mentions;
-                }
-            }
-        }
-
-        // Handle assistant message response_items. This includes schema-validated JSON content
-        // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
-        // is a JSON object rather than a plain string.
-        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
-            if let Some(turn) = turns.get_mut(tid) {
-                if turn.final_answer.is_none() {
-                    let text = extract_item_content(payload);
-                    if !text.is_empty() {
-                        turn.final_answer = Some(text);
-                    }
                 }
             }
         }
@@ -2811,6 +2867,37 @@ mod tests {
         );
         assert_eq!(tool.exit_code, None);
         assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0153_desktop_assistant_output_and_reasoning_summary_are_visible() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-07T10:00:00Z","type":"session_meta","payload":{"id":"desktop-output","timestamp":"2026-09-07T10:00:00Z","cli_version":"0.153.4"}}"#,
+            r#"{"timestamp":"2026-09-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-output"}}"#,
+            r#"{"timestamp":"2026-09-07T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Inspect the existing parser."}],"encrypted_content":"encrypted","internal_chat_message_metadata_passthrough":{"turn_id":"turn-output"}}}"#,
+            r#"{"timestamp":"2026-09-07T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I found the issue."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-output"}}}"#,
+            r#"{"timestamp":"2026-09-07T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The parser is fixed."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-output"}}}"#,
+            r#"{"timestamp":"2026-09-07T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-output","completed_at":1788775205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("The parser is fixed.")
+        );
+        assert_eq!(
+            turns[0]
+                .agent_messages
+                .iter()
+                .map(|message| (message.is_reasoning, message.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, "Inspect the existing parser."),
+                (false, "I found the issue."),
+                (false, "The parser is fixed."),
+            ]
+        );
     }
 
     #[test]

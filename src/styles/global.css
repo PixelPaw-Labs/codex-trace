@@ -2965,6 +2965,13 @@ body {
   font-style: italic;
   font-size: 13px;
 }
+.turn-detail__reasoning-summary {
+  border-left: 2px solid var(--reasoning-text);
+  padding-left: 10px;
+}
+.turn-detail__reasoning-item + .turn-detail__reasoning-item {
+  margin-top: 10px;
+}
 .turn-detail__compaction-note {
   font-size: 12px;
   color: var(--text-dim);

@@ -91,6 +91,17 @@ describe("TurnList", () => {
     expect(screen.getByText("Hi there!")).toBeInTheDocument();
   });
 
+  it("renders final_answer as preview when no agent message was emitted", () => {
+    render(
+      <TurnList
+        turns={[makeTurn({ agent_messages: [], final_answer: "Desktop output" })]}
+        selectedIndex={-1}
+        onSelectTurn={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Desktop output")).toBeInTheDocument();
+  });
+
   it("shows tool count for a single tool call", () => {
     render(
       <TurnList

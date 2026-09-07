@@ -80,9 +80,13 @@ export function TurnList({ turns, selectedIndex, onSelectTurn }: TurnListProps) 
         const userExpanded = expandedUsers.has(i);
         const agentPreview =
           turn.agent_messages.find((m) => m.phase === "final_answer")?.text ??
+          turn.final_answer ??
           turn.agent_messages.find((m) => !m.is_reasoning)?.text ??
           null;
-        const hasDetail = turn.agent_messages.length > 0 || turn.tool_calls.length > 0;
+        const hasDetail =
+          turn.agent_messages.length > 0 ||
+          turn.tool_calls.length > 0 ||
+          turn.final_answer !== null;
         const reasoningCount = turn.agent_messages.filter((m) => m.is_reasoning).length;
         const userTs = turn.started_at
           ? formatExactTime(new Date(turn.started_at * 1000).toISOString())

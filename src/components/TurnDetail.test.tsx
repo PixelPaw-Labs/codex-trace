@@ -130,6 +130,32 @@ describe("TurnDetail", () => {
     expect(occurrences).toBe(1);
   });
 
+  it("renders final_answer when Desktop did not emit a legacy agent message", () => {
+    renderTurnDetail(
+      makeTurn({
+        agent_messages: [],
+        final_answer: "DESKTOP_FINAL_OUTPUT",
+      }),
+    );
+
+    expect(screen.getByText("Final answer")).toBeInTheDocument();
+    expect(screen.getByText("DESKTOP_FINAL_OUTPUT")).toBeInTheDocument();
+  });
+
+  it("renders Codex reasoning summaries", () => {
+    const reasoning: AgentMessage = {
+      text: "REASONING_SUMMARY",
+      phase: null,
+      timestamp: "2026-04-26T10:00:00Z",
+      is_reasoning: true,
+    };
+    renderTurnDetail(makeTurn({ agent_messages: [reasoning], final_answer: null }));
+
+    expect(screen.getByText("Reasoning summary")).toBeInTheDocument();
+    expect(screen.getByText("REASONING_SUMMARY")).toBeInTheDocument();
+    expect(screen.queryByText(/reasoning encrypted/)).not.toBeInTheDocument();
+  });
+
   it("interleaves tool calls with commentary by stream order", () => {
     const first: AgentMessage = {
       text: "FIRST_MESSAGE",

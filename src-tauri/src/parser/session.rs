@@ -216,6 +216,11 @@ fn collect_loaded_skills(entries: &[RawEntry]) -> Vec<String> {
             continue;
         }
         let text = serde_json::to_string(&entry.raw).unwrap_or_default();
+        // File-change tool inputs often contain the literal implementation text
+        // `SKILL.md` while patching this repository. They are not skill loads.
+        if text.contains("Begin Patch") || text.contains("*** Update File") {
+            continue;
+        }
         if !text.to_ascii_lowercase().contains("skill") {
             continue;
         }
@@ -229,7 +234,12 @@ fn collect_loaded_skills(entries: &[RawEntry]) -> Vec<String> {
             };
             let path = &prefix[start + "/skills/".len()..];
             let name = path.rsplit('/').next().unwrap_or(path);
-            if !name.is_empty() && !skills.iter().any(|skill| skill == name) {
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+                && !skills.iter().any(|skill| skill == name)
+            {
                 skills.push(name.to_string());
             }
             cursor = end + "/SKILL.md".len();

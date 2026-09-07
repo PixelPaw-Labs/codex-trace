@@ -746,4 +746,24 @@ describe("ToolCallItem", () => {
       expect(container.querySelector(".tool-call--unknown")).not.toBeInTheDocument();
     });
   });
+
+  it("renders input for Desktop custom tools classified as unknown", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "unknown",
+          name: "exec",
+          input_text: "const result = await run();",
+          output: "Script completed",
+          exit_code: null,
+          status: "completed",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".tool-call__section-title")?.textContent).toContain("Input");
+    expect(screen.getByText("const result = await run();")).toBeInTheDocument();
+    expect(screen.getByText("Script completed")).toBeInTheDocument();
+  });
 });

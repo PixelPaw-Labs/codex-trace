@@ -114,6 +114,12 @@ impl AppState {
         Ok(sessions)
     }
 
+    pub fn invalidate_sessions_cache(&self) {
+        if let Ok(mut cache) = self.sessions_cache.lock() {
+            *cache = None;
+        }
+    }
+
     pub fn broadcast(&self, event: &str, data: &str) {
         let _ = self.event_tx.send(SseEvent {
             event: event.to_string(),

@@ -49,8 +49,8 @@ describe("SidebarTree", () => {
     expect(screen.getByText("No sessions")).toBeInTheDocument();
   });
 
-  it("renders the date group header", () => {
-    render(
+  it("renders the project directory group header", () => {
+    const { container } = render(
       <SidebarTree
         sessions={[makeSession()]}
         selectedPath={null}
@@ -59,7 +59,11 @@ describe("SidebarTree", () => {
         onToggleDate={vi.fn()}
       />,
     );
-    expect(screen.getByText("2026/04/26")).toBeInTheDocument();
+    expect(container.querySelector(".sidebar-tree__date")?.textContent).toBe("myproject");
+    expect(container.querySelector(".sidebar-tree__date")).toHaveAttribute(
+      "title",
+      "/Users/user/myproject",
+    );
   });
 
   it("renders session label from cwd basename when no thread_name", () => {
@@ -72,7 +76,7 @@ describe("SidebarTree", () => {
         onToggleDate={vi.fn()}
       />,
     );
-    expect(screen.getByText("myproject")).toBeInTheDocument();
+    expect(screen.getAllByText("myproject")).toHaveLength(2);
   });
 
   it("prefers thread_name over cwd", () => {
@@ -117,12 +121,12 @@ describe("SidebarTree", () => {
     expect(onSelect).toHaveBeenCalledWith(session);
   });
 
-  it("hides sessions when their date group is collapsed", () => {
+  it("hides sessions when their project group is collapsed", () => {
     render(
       <SidebarTree
         sessions={[makeSession({ thread_name: "Hidden" })]}
         selectedPath={null}
-        collapsedDates={new Set(["2026/04/26"])}
+        collapsedDates={new Set(["/Users/user/myproject"])}
         onSelectSession={vi.fn()}
         onToggleDate={vi.fn()}
       />,
@@ -130,9 +134,9 @@ describe("SidebarTree", () => {
     expect(screen.queryByText("Hidden")).not.toBeInTheDocument();
   });
 
-  it("calls onToggleDate when the date header is clicked", () => {
+  it("calls onToggleDate with the project directory when the header is clicked", () => {
     const onToggle = vi.fn();
-    render(
+    const { container } = render(
       <SidebarTree
         sessions={[makeSession()]}
         selectedPath={null}
@@ -141,8 +145,8 @@ describe("SidebarTree", () => {
         onToggleDate={onToggle}
       />,
     );
-    fireEvent.click(screen.getByText("2026/04/26"));
-    expect(onToggle).toHaveBeenCalledWith("2026/04/26");
+    fireEvent.click(container.querySelector(".sidebar-tree__date-header")!);
+    expect(onToggle).toHaveBeenCalledWith("/Users/user/myproject");
   });
 
   it("applies selected class to the active session", () => {
@@ -160,12 +164,28 @@ describe("SidebarTree", () => {
     expect(el).toHaveClass("sidebar-tree__session--selected");
   });
 
-  it("groups sessions from different dates under separate headers", () => {
+  it("groups sessions by project directory instead of date", () => {
     const sessions = [
-      makeSession({ path: "/a.jsonl", thread_name: "Session A", date_group: "2026/04/25" }),
-      makeSession({ path: "/b.jsonl", thread_name: "Session B", date_group: "2026/04/26" }),
+      makeSession({
+        path: "/a.jsonl",
+        cwd: "/work/project-a",
+        thread_name: "Session A",
+        date_group: "2026/04/25",
+      }),
+      makeSession({
+        path: "/b.jsonl",
+        cwd: "/work/project-b",
+        thread_name: "Session B",
+        date_group: "2026/04/25",
+      }),
+      makeSession({
+        path: "/c.jsonl",
+        cwd: "/work/project-a",
+        thread_name: "Session C",
+        date_group: "2026/04/26",
+      }),
     ];
-    render(
+    const { container } = render(
       <SidebarTree
         sessions={sessions}
         selectedPath={null}
@@ -174,10 +194,12 @@ describe("SidebarTree", () => {
         onToggleDate={vi.fn()}
       />,
     );
-    expect(screen.getByText("2026/04/25")).toBeInTheDocument();
-    expect(screen.getByText("2026/04/26")).toBeInTheDocument();
+    expect(
+      Array.from(container.querySelectorAll(".sidebar-tree__date"), (node) => node.textContent),
+    ).toEqual(["project-a", "project-b"]);
     expect(screen.getByText("Session A")).toBeInTheDocument();
     expect(screen.getByText("Session B")).toBeInTheDocument();
+    expect(screen.getByText("Session C")).toBeInTheDocument();
   });
 
   it("hides inline workers from the top-level list", () => {

@@ -67,7 +67,11 @@ pub fn parse_session(path: &Path) -> Result<CodexSession, String> {
         return super::remote::parse_remote_session(&path_text);
     }
     let mut visited = HashSet::new();
-    parse_session_inner(path, &mut visited)
+    let mut session = parse_session_inner(path, &mut visited)?;
+    if let Some(title) = super::discover::session_index_title(path, &session.id) {
+        session.thread_name = Some(title);
+    }
+    Ok(session)
 }
 
 fn parse_session_inner(
@@ -568,6 +572,28 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert_eq!(session.ai_title.as_deref(), Some("Fix the login bug"));
         assert_eq!(session.id, "ext-session");
+    }
+
+    #[test]
+    fn parse_session_merges_codex_desktop_session_index_title() {
+        let tmp = tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let day_dir = sessions_dir.join("2026/09/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("session_index.jsonl"),
+            r#"{"id":"desktop-session","thread_name":"Inspect the trace UI","updated_at":"2026-09-07T10:00:00Z"}"#,
+        )
+        .unwrap();
+        let path = day_dir.join("rollout-2026-09-07T10-00-00-desktop.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-09-07T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","timestamp":"2026-09-07T10:00:00Z","cwd":"/workspace/trace"}}"#,
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.thread_name.as_deref(), Some("Inspect the trace UI"));
     }
 
     #[test]

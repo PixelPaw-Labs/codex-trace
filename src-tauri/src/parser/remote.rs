@@ -105,6 +105,13 @@ pub fn parse_remote_session(spec_value: &str) -> Result<CodexSession, String> {
     let parsed = parse_session(&local_path);
     let _ = fs::remove_dir_all(&temp_root);
     let mut session = parsed?;
+    // The rollout itself does not contain Codex Desktop's user-facing title.
+    // Fetch the matching sibling index entry while the selected session is
+    // already being loaded. Discovery performs the same merge in bulk, and
+    // this keeps the detail view's InfoBar consistent with the picker.
+    if let Some(title) = remote_session_title(&spec, &session.id) {
+        session.thread_name = Some(title);
+    }
     session.path = spec_value.to_string();
     Ok(session)
 }
@@ -152,6 +159,49 @@ fn remote_discovery_command(spec: &RemoteSpec) -> String {
 
 fn read_remote_file(host: &str, path: &str) -> Result<Vec<u8>, String> {
     run_ssh(host, &format!("cat -- {}", shell_path(path)))
+}
+
+fn remote_index_path(root: &str) -> String {
+    let path = Path::new(root);
+    let index_parent = if root.ends_with(".jsonl") || root.ends_with(".jsonl.zst") {
+        // A selected rollout is rooted at sessions/YYYY/MM/DD/file. Walk back
+        // through the date components to the sessions directory.
+        path.parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."))
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    index_parent
+        .join("session_index.jsonl")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn remote_session_title(spec: &RemoteSpec, session_id: &str) -> Option<String> {
+    let index_path = remote_index_path(&spec.path);
+    let output = read_remote_file(&spec.host, &index_path).ok()?;
+    let mut title = None;
+    for value in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+    {
+        let id = value.get("id").and_then(|value| value.as_str());
+        let next_title = value
+            .get("thread_name")
+            .or_else(|| value.get("title"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if id == Some(session_id) {
+            title = next_title.map(str::to_string);
+        }
+    }
+    title
 }
 
 fn run_ssh(host: &str, command: &str) -> Result<Vec<u8>, String> {
@@ -256,6 +306,25 @@ def stream(path):
 def text(value):
     return value if isinstance(value, str) else None
 
+# Codex Desktop keeps user-facing titles in the sibling session_index.jsonl,
+# not in rollout files. Read it once so discovery returns the same names as the
+# local Desktop session picker. Missing/malformed index lines are harmless.
+index_titles = {}
+index_path = os.path.join(os.path.dirname(root), 'session_index.jsonl')
+try:
+    with open(index_path, 'r', encoding='utf-8') as index:
+        for raw in index:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                continue
+            session_id = text(value.get('id'))
+            title = text(value.get('thread_name') or value.get('title'))
+            if session_id and title and title.strip():
+                index_titles[session_id] = title.strip()
+except OSError:
+    pass
+
 for dirpath, _, names in os.walk(root):
     for name in names:
         if not (name.startswith('rollout-') and (name.endswith('.jsonl') or name.endswith('.jsonl.zst'))):
@@ -325,6 +394,7 @@ for dirpath, _, names in os.walk(root):
             session_id = text(meta.get('id')) or text(meta.get('session_id')) or text((meta.get('thread') or {}).get('sessionId'))
             if not session_id:
                 continue
+            thread_name = index_titles.get(session_id) or thread_name
             start_time = text(meta.get('timestamp')) or text(first.get('timestamp')) or ''
             try:
                 ongoing = ongoing and (now - os.path.getmtime(path) <= 60) and not has_end and turns > 0
@@ -377,6 +447,12 @@ for dirpath, _, names in os.walk(root):
                 rows.append(f'{os.path.relpath(path, root)}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}')
             except OSError:
                 pass
+index_path = os.path.join(os.path.dirname(root), 'session_index.jsonl')
+try:
+    stat = os.stat(index_path)
+    rows.append(f'../session_index.jsonl:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}')
+except OSError:
+    pass
 print('\n'.join(sorted(rows)))
 "#;
 
@@ -422,6 +498,22 @@ mod tests {
     fn shell_path_expands_tilde_without_exposing_shell_input() {
         assert_eq!(shell_path("~/.codex/sessions"), "$HOME/'.codex/sessions'");
         assert_eq!(shell_path("/tmp/my sessions"), "'/tmp/my sessions'");
+    }
+
+    #[test]
+    fn derives_remote_session_index_next_to_sessions_directory() {
+        assert_eq!(
+            remote_index_path("~/.codex/sessions"),
+            "~/.codex/session_index.jsonl"
+        );
+        assert_eq!(
+            remote_index_path("/home/user/.codex/sessions"),
+            "/home/user/.codex/session_index.jsonl"
+        );
+        assert_eq!(
+            remote_index_path("~/.codex/sessions/2026/09/07/rollout-a.jsonl"),
+            "~/.codex/session_index.jsonl"
+        );
     }
 
     #[test]

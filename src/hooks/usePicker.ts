@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "../lib/invoke";
 import type { CodexSessionInfo, SettingsResponse } from "../../shared/types";
+import { orderSessionsByProject } from "../lib/sessionGrouping";
 import { useTauriEvent } from "./useTauriEvent";
 
 interface PickerState {
@@ -72,13 +73,15 @@ export function usePicker() {
     ? state.sessions.filter(
         (s) =>
           (s.thread_name ?? "").toLowerCase().includes(state.searchQuery.toLowerCase()) ||
+          (s.ai_title ?? "").toLowerCase().includes(state.searchQuery.toLowerCase()) ||
           s.id.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
           (s.cwd ?? "").toLowerCase().includes(state.searchQuery.toLowerCase()),
       )
     : state.sessions;
+  const orderedSessions = orderSessionsByProject(filteredSessions);
 
   return {
-    sessions: filteredSessions,
+    sessions: orderedSessions,
     allSessions: state.sessions,
     loading: state.loading,
     searchQuery: state.searchQuery,

@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::compression::open_session_reader;
@@ -115,6 +116,17 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     let mut infos: Vec<CodexSessionInfo> = Vec::new();
     collect_jsonl_files(sessions_dir, &mut infos)?;
 
+    // Codex Desktop stores the user-facing session title in the sibling
+    // `session_index.jsonl` file rather than in the rollout itself.  Merge the
+    // index after scanning so current Desktop sessions get the same title as
+    // the native Codex UI.  Older CLI sessions simply have no index entry.
+    let titles = load_session_index_titles(sessions_dir);
+    for info in &mut infos {
+        if let Some(title) = titles.get(&info.id) {
+            info.thread_name = Some(title.clone());
+        }
+    }
+
     // Sort newest first (ISO timestamp in filename is lexicographically sortable)
     infos.sort_by(|a, b| {
         let fa = Path::new(&a.path)
@@ -141,6 +153,69 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     }
 
     Ok(infos)
+}
+
+/// Return the path to Codex's title index for a sessions directory.
+///
+/// Codex keeps `session_index.jsonl` next to the `sessions/` directory (for
+/// example `~/.codex/session_index.jsonl`).  Supporting arbitrary sessions
+/// directories here also makes custom test and CLI locations work naturally.
+pub(crate) fn session_index_path(sessions_dir: &Path) -> PathBuf {
+    sessions_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("session_index.jsonl")
+}
+
+/// Read the latest non-empty title for each session ID from session_index.jsonl.
+/// Malformed lines and missing indexes are intentionally ignored: the rollout
+/// metadata remains a complete fallback for pre-Desktop sessions.
+pub(crate) fn load_session_index_titles(sessions_dir: &Path) -> HashMap<String, String> {
+    let index_path = session_index_path(sessions_dir);
+    let Ok(contents) = fs::read_to_string(index_path) else {
+        return HashMap::new();
+    };
+
+    let mut titles = HashMap::new();
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(title) = value
+            .get("thread_name")
+            .or_else(|| value.get("title"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        else {
+            continue;
+        };
+        titles.insert(id.to_string(), title.to_string());
+    }
+    titles
+}
+
+/// Look up a session's Desktop title using the sessions directory containing
+/// the rollout file. This is also used by the full-session parser so the title
+/// remains available in the detail view's InfoBar.
+pub(crate) fn session_index_title(path: &Path, session_id: &str) -> Option<String> {
+    let mut directory = path.parent()?;
+    loop {
+        if session_index_path(directory).is_file() {
+            return load_session_index_titles(directory).remove(session_id);
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent;
+    }
+    None
 }
 
 fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<(), String> {
@@ -897,6 +972,38 @@ mod tests {
             session.ai_title.as_deref(),
             Some("Refactor the auth module")
         );
+    }
+
+    #[test]
+    fn discover_sessions_merges_codex_desktop_session_index_title() {
+        let tmp = tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let day_dir = sessions_dir.join("2026/09/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("session_index.jsonl"),
+            [
+                r#"{"id":"desktop-session","thread_name":"Inspect the trace UI","updated_at":"2026-09-07T10:00:00Z"}"#,
+                r#"not json (ignored)"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session_path = day_dir.join("rollout-2026-09-07T10-00-00-desktop.jsonl");
+        std::fs::write(
+            &session_path,
+            [
+                r#"{"timestamp":"2026-09-07T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","timestamp":"2026-09-07T10:00:00Z","cwd":"/workspace/trace"}}"#,
+                r#"{"timestamp":"2026-09-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-09-07T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1788775202.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(&sessions_dir).unwrap();
+        let session = sessions.iter().find(|s| s.id == "desktop-session").unwrap();
+        assert_eq!(session.thread_name.as_deref(), Some("Inspect the trace UI"));
     }
 
     #[test]

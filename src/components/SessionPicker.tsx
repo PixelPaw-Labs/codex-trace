@@ -2,6 +2,7 @@ import { useRef, useMemo } from "react";
 import type { CodexSessionInfo } from "../../shared/types";
 import { formatTokens, truncate } from "../../shared/format";
 import { shortModel, formatExactTime } from "../lib/format";
+import { groupSessionsByProject } from "../lib/sessionGrouping";
 import { sessionDisplayName } from "../lib/sessionDisplay";
 import { getModelColor } from "../lib/theme";
 import { OngoingDots } from "./OngoingDots";
@@ -17,18 +18,6 @@ interface SessionPickerProps {
   sessionsDir: string;
   onSelectSession: (info: CodexSessionInfo) => void;
   onSearchChange: (q: string) => void;
-}
-
-function groupByDate(
-  sessions: CodexSessionInfo[],
-): Array<{ category: string; items: CodexSessionInfo[] }> {
-  const map = new Map<string, CodexSessionInfo[]>();
-  for (const s of sessions) {
-    const key = s.date_group || "unknown";
-    if (!map.has(key)) map.set(key, []);
-    map.get(key)!.push(s);
-  }
-  return Array.from(map.entries()).map(([category, items]) => ({ category, items }));
 }
 
 export function SessionPicker({
@@ -49,7 +38,7 @@ export function SessionPicker({
     [sessions],
   );
 
-  const dateGroups = groupByDate(sessions);
+  const projectGroups = groupSessionsByProject(sessions);
   const remoteHost = sessionsDir.startsWith("ssh://")
     ? sessionsDir.slice("ssh://".length).split("/", 1)[0]
     : null;
@@ -87,9 +76,11 @@ export function SessionPicker({
           </div>
         )}
 
-        {dateGroups.map((group) => (
-          <div key={group.category}>
-            <div className="picker__group-header">{group.category}</div>
+        {projectGroups.map((group) => (
+          <div key={group.projectDir || "unknown-project"}>
+            <div className="picker__group-header" title={group.projectDir || undefined}>
+              {group.label}
+            </div>
             {group.items.map((s) => {
               const idx = flatIndex++;
               const isSelected = idx === selectedIndex;

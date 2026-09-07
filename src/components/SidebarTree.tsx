@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import type { CodexSessionInfo } from "../../shared/types";
 import { timeAgo } from "../../shared/format";
+import { groupSessionsByProject } from "../lib/sessionGrouping";
 import { sessionDisplayName } from "../lib/sessionDisplay";
 import { OngoingDots } from "./OngoingDots";
 
@@ -27,18 +28,6 @@ function buildWorkerMap(sessions: CodexSessionInfo[]): Map<string, CodexSessionI
   return map;
 }
 
-/** Group top-level sessions (non-inline-workers) by date_group, preserving order. */
-function groupByDate(sessions: CodexSessionInfo[]): Map<string, CodexSessionInfo[]> {
-  const map = new Map<string, CodexSessionInfo[]>();
-  for (const s of sessions) {
-    if (s.is_inline_worker) continue;
-    const dg = s.date_group || "unknown";
-    if (!map.has(dg)) map.set(dg, []);
-    map.get(dg)!.push(s);
-  }
-  return map;
-}
-
 export function SidebarTree({
   sessions,
   selectedPath,
@@ -49,7 +38,10 @@ export function SidebarTree({
   const [expandedWorkers, setExpandedWorkers] = useState<Set<string>>(new Set());
 
   const workerMap = useMemo(() => buildWorkerMap(sessions), [sessions]);
-  const grouped = useMemo(() => groupByDate(sessions), [sessions]);
+  const grouped = useMemo(
+    () => groupSessionsByProject(sessions.filter((session) => !session.is_inline_worker)),
+    [sessions],
+  );
 
   const handleToggleDate = useCallback(
     (e: React.MouseEvent, dateGroup: string) => {
@@ -79,21 +71,23 @@ export function SidebarTree({
 
   return (
     <div className="sidebar-tree">
-      {Array.from(grouped.entries()).map(([dateGroup, group]) => {
-        const collapsed = collapsedDates.has(dateGroup);
+      {grouped.map(({ projectDir, label: projectLabel, items: group }) => {
+        const collapsed = collapsedDates.has(projectDir);
         return (
-          <div key={dateGroup} className="sidebar-tree__group">
+          <div key={projectDir || "unknown-project"} className="sidebar-tree__group">
             <div
               className="sidebar-tree__date-header"
-              onClick={(e) => handleToggleDate(e, dateGroup)}
+              onClick={(e) => handleToggleDate(e, projectDir)}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") onToggleDate(dateGroup);
+                if (e.key === "Enter" || e.key === " ") onToggleDate(projectDir);
               }}
             >
               <span className="sidebar-tree__chevron">{collapsed ? "▶" : "▼"}</span>
-              <span className="sidebar-tree__date">{dateGroup}</span>
+              <span className="sidebar-tree__date" title={projectDir || undefined}>
+                {projectLabel}
+              </span>
               <span className="sidebar-tree__count">{group.length}</span>
             </div>
 

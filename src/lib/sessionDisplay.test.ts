@@ -41,6 +41,12 @@ describe("sessionDisplayName", () => {
     );
   });
 
+  it("uses ai_title when no indexed thread name is available", () => {
+    expect(sessionDisplayName(makeSession({ ai_title: "Review the auth module" }))).toBe(
+      "Review the auth module",
+    );
+  });
+
   it("does not use inherited thread names for worker sessions", () => {
     expect(
       sessionDisplayName(

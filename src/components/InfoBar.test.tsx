@@ -47,6 +47,11 @@ describe("InfoBar", () => {
     expect(screen.getByText("myproject")).toBeInTheDocument();
   });
 
+  it("renders the session title when available", () => {
+    render(<InfoBar session={makeSession({ thread_name: "Inspect the trace UI" })} />);
+    expect(screen.getByText("Inspect the trace UI")).toBeInTheDocument();
+  });
+
   it("renders originator with 'via' prefix", () => {
     render(<InfoBar session={makeSession()} />);
     expect(screen.getByText("via codex-tui")).toBeInTheDocument();

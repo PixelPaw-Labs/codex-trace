@@ -9,7 +9,11 @@ export function sessionDisplayName(session: CodexSessionInfo): string {
     return `worker ${shortId}`;
   }
 
-  if (session.thread_name) return session.thread_name;
+  // Codex Desktop writes the user-facing title to session_index.jsonl. The
+  // backend merges that value into thread_name; ai_title remains the fallback
+  // for older external-agent rollouts that carry their title in session_meta.
+  if (session.thread_name?.trim()) return session.thread_name.trim();
+  if (session.ai_title?.trim()) return session.ai_title.trim();
   if (session.cwd) return shortPath(session.cwd);
   return session.id.slice(0, 8);
 }

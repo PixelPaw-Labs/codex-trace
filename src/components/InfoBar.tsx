@@ -15,9 +15,15 @@ export function InfoBar({ session }: InfoBarProps) {
   const model = lastTurn?.model ?? null;
   const modelClr = model ? getModelColor(model) : undefined;
   const sessionId = session.path.split("/").pop()?.replace(".jsonl", "") || session.id;
+  const title = session.thread_name?.trim() || session.ai_title?.trim() || null;
 
   return (
     <div className="info-bar">
+      {title && (
+        <span className="info-bar__title" title={title}>
+          {title}
+        </span>
+      )}
       {cwd && <span className="info-bar__project">{cwd}</span>}
       {sessionId && <span className="info-bar__session-id">{sessionId}</span>}
       {session.originator && <span className="info-bar__originator">via {session.originator}</span>}

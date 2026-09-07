@@ -558,6 +558,15 @@ body {
   min-width: 0;
 }
 
+.info-bar__title {
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 .info-bar__session-id {
   font-size: 11px;
   font-family: var(--font-mono, monospace);

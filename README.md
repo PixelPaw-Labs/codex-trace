@@ -35,7 +35,8 @@ Use Codex Trace when you want to:
 ## Features
 
 - **Codex CLI JSONL viewer** — reads local Codex CLI session files from `~/.codex/sessions/`
-- **3-panel layout** — date-grouped session tree → turn list → turn detail
+- **3-panel layout** — project-grouped session tree → turn list → turn detail
+- **Desktop session titles** — displays the Codex title from `session_index.jsonl`
 - **Session and message search** — find Codex CLI sessions and messages faster than reading raw logs
 - **Live tailing** — SSE-based updates for ongoing Codex CLI sessions
 - **Tool call inspection** — inspect exec commands, MCP tools, patch apply events, web searches, image generation events, and collaboration agent activity
@@ -107,7 +108,10 @@ Codex Trace reads session files from this default path:
 ~/.codex/sessions/YYYY/MM/DD/rollout-{ISO_TIMESTAMP}-{UUID}.jsonl
 ```
 
-The sidebar reflects the folder structure exactly. Date groups in `YYYY/MM/DD` format can be collapsed and expanded, with Codex CLI sessions shown underneath.
+Sessions are grouped by their project working directory (`cwd`) in both the sidebar and session
+picker. Each session uses its Codex Desktop title from the sibling
+`~/.codex/session_index.jsonl` when available, then falls back to the title embedded in older
+rollouts, the project name, or the session ID.
 
 ## Configuration
 

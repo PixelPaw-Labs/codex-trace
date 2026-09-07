@@ -80,6 +80,13 @@ fn is_related_session_path(changed_path: &Path, session_file: &Path) -> bool {
         && changed_path.parent() == session_file.parent()
 }
 
+fn is_session_index_path(changed_path: &Path, sessions_dir: &Path) -> bool {
+    sessions_dir
+        .parent()
+        .map(|parent| parent.join("session_index.jsonl") == changed_path)
+        .unwrap_or(false)
+}
+
 /// Start watching a session JSONL file for changes.
 pub fn start_session_watcher(
     path: String,
@@ -245,13 +252,17 @@ pub fn start_picker_watcher(
         if dir.exists() {
             let _ = watcher.watch(dir, RecursiveMode::Recursive);
         }
+        let index_path = crate::parser::discover::session_index_path(dir);
+        if index_path.exists() {
+            let _ = watcher.watch(&index_path, RecursiveMode::NonRecursive);
+        }
 
         run_debounce_loop(
             rx,
-            |event| {
+            move |event| {
                 event.paths.iter().any(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    is_rollout_jsonl_name(name)
+                    is_rollout_jsonl_name(name) || is_session_index_path(p, dir)
                 })
             },
             signal_tx_clone,
@@ -267,6 +278,7 @@ pub fn start_picker_watcher(
                     // Send a lightweight signal — no session data embedded.
                     // Clients call list_sessions to fetch fresh data; the
                     // server-side cache coalesces concurrent requests.
+                    state.invalidate_sessions_cache();
                     state.broadcast("picker-refresh", "{}");
 
                     if let Some(ref app_handle) = app {
@@ -308,6 +320,7 @@ fn start_remote_picker_watcher(
                         continue;
                     }
                     previous = Some(snapshot);
+                    state.invalidate_sessions_cache();
                     state.broadcast("picker-refresh", "{}");
                     if let Some(ref app_handle) = app {
                         let _ = app_handle.emit("picker-refresh", serde_json::json!({}));
@@ -391,6 +404,19 @@ mod tests {
         assert!(!is_related_session_path(
             Path::new("/tmp/sessions/codex.pid"),
             session_file
+        ));
+    }
+
+    #[test]
+    fn session_index_path_matches_sibling_index() {
+        let sessions_dir = Path::new("/tmp/.codex/sessions");
+        assert!(is_session_index_path(
+            Path::new("/tmp/.codex/session_index.jsonl"),
+            sessions_dir
+        ));
+        assert!(!is_session_index_path(
+            Path::new("/tmp/.codex/sessions/session_index.jsonl"),
+            sessions_dir
         ));
     }
 }

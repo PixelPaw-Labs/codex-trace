@@ -58,6 +58,11 @@ pub struct CodexSession {
     /// `forked_from_thread_id` on `CodexTurn` (sourced from `task_started`).
     /// Null for non-forked sessions.
     pub forked_from_thread_id: Option<String>,
+    /// Skill instruction files referenced by tool calls in this session.
+    /// This is an observed list; a session may have skills available in its
+    /// system prompt without explicitly reading their SKILL.md file.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -113,6 +118,7 @@ fn parse_session_inner(
         has_missing_spawn_metadata: false,
         history_base_thread_id: None,
         forked_from_thread_id: None,
+        skills: Vec::new(),
     };
 
     // Parse session_meta from first matching entry
@@ -136,6 +142,7 @@ fn parse_session_inner(
 
     // Build turns from remaining entries
     let mut turns = build_turns(&entries);
+    session.skills = collect_loaded_skills(&entries);
 
     // Extract thread_name from last thread_name_updated
     let thread_name = turns.iter().rev().find_map(|t| t.thread_name.clone());
@@ -200,6 +207,36 @@ fn parse_session_inner(
 
     visited.remove(&canonical_path);
     Ok(session)
+}
+
+fn collect_loaded_skills(entries: &[RawEntry]) -> Vec<String> {
+    let mut skills = Vec::new();
+    for entry in entries {
+        if !matches!(entry.entry_type.as_str(), "response_item" | "function_call") {
+            continue;
+        }
+        let text = serde_json::to_string(&entry.raw).unwrap_or_default();
+        if !text.to_ascii_lowercase().contains("skill") {
+            continue;
+        }
+        let mut cursor = 0;
+        while let Some(relative) = text[cursor..].find("/SKILL.md") {
+            let end = cursor + relative;
+            let prefix = &text[..end];
+            let Some(start) = prefix.rfind("/skills/") else {
+                cursor = end + "/SKILL.md".len();
+                continue;
+            };
+            let path = &prefix[start + "/skills/".len()..];
+            let name = path.rsplit('/').next().unwrap_or(path);
+            if !name.is_empty() && !skills.iter().any(|skill| skill == name) {
+                skills.push(name.to_string());
+            }
+            cursor = end + "/SKILL.md".len();
+        }
+    }
+    skills.sort();
+    skills
 }
 
 fn embed_worker_sessions(
@@ -594,6 +631,26 @@ mod tests {
 
         let session = parse_session(&path).unwrap();
         assert_eq!(session.thread_name.as_deref(), Some("Inspect the trace UI"));
+    }
+
+    #[test]
+    fn parse_session_collects_observed_skill_files() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-09-07T10-00-00-skills.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-09-07T10:00:00Z","type":"session_meta","payload":{"id":"skills-session","timestamp":"2026-09-07T10:00:00Z"}}"#,
+                r#"{"timestamp":"2026-09-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-09-07T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-read-skill","input":"const r = await tools.exec_command({cmd:\"cat /Users/user/.codex/skills/lark/SKILL.md\"});"}}"#,
+                r#"{"timestamp":"2026-09-07T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-read-skill","output":"loaded"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.skills, vec!["lark".to_string()]);
     }
 
     #[test]

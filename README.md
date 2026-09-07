@@ -37,6 +37,8 @@ Use Codex Trace when you want to:
 - **Codex CLI JSONL viewer** — reads local Codex CLI session files from `~/.codex/sessions/`
 - **3-panel layout** — project-grouped session tree → turn list → turn detail
 - **Desktop session titles** — displays the Codex title from `session_index.jsonl`
+- **Skill and command visibility** — shows observed `SKILL.md` loads and extracts shell commands
+  (including Desktop `read` calls wrapped in JavaScript `exec` tools)
 - **Session and message search** — find Codex CLI sessions and messages faster than reading raw logs
 - **Live tailing** — SSE-based updates for ongoing Codex CLI sessions
 - **Tool call inspection** — inspect exec commands, MCP tools, patch apply events, web searches, image generation events, and collaboration agent activity

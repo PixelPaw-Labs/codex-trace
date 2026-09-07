@@ -52,6 +52,11 @@ describe("InfoBar", () => {
     expect(screen.getByText("Inspect the trace UI")).toBeInTheDocument();
   });
 
+  it("renders observed session skills", () => {
+    render(<InfoBar session={makeSession({ skills: ["openai-docs", "lark"] })} />);
+    expect(screen.getByText("skills: openai-docs, lark")).toBeInTheDocument();
+  });
+
   it("renders originator with 'via' prefix", () => {
     render(<InfoBar session={makeSession()} />);
     expect(screen.getByText("via codex-tui")).toBeInTheDocument();

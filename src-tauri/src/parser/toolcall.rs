@@ -176,14 +176,23 @@ impl ToolCallBuilder {
     ) {
         if let Some(pending) = self.pending.remove(call_id) {
             let is_patch = pending.name == "apply_patch";
+            let desktop_command = if pending.name == "exec" {
+                pending
+                    .input_text
+                    .as_deref()
+                    .and_then(extract_desktop_exec_command)
+            } else {
+                None
+            };
             self.finalized.push(ToolCall {
                 call_id: call_id.to_string(),
                 // Codex Desktop v0.153+ records its JavaScript/desktop execution
-                // tool as `custom_tool_call` named `exec`. It is not an apply-patch
-                // call; preserve it as Unknown so its input/output remains visible
-                // without presenting arbitrary JavaScript as a patch.
+                // tool as `custom_tool_call` named `exec`. Recognized wrappers are
+                // promoted to ExecCommand; arbitrary JavaScript remains Unknown.
                 kind: if is_patch {
                     ToolKind::PatchApply
+                } else if desktop_command.is_some() {
+                    ToolKind::ExecCommand
                 } else {
                     ToolKind::Unknown
                 },
@@ -192,7 +201,7 @@ impl ToolCallBuilder {
                 input_text: pending.input_text,
                 output: Some(output.to_string()),
                 exit_code,
-                command: None,
+                command: desktop_command,
                 cwd: None,
                 duration_secs: None,
                 mcp_server: None,
@@ -1263,6 +1272,49 @@ fn spawn_agent_status(output: &str) -> String {
     .to_string()
 }
 
+/// Extract the shell command from Codex Desktop's JavaScript exec wrapper.
+///
+/// Desktop records calls such as `tools.exec_command({cmd:"read ..."})` as a
+/// custom tool named `exec`. Keeping the wrapper as opaque JavaScript makes the
+/// call hard to find in the UI, so recognize the stable `exec_command({cmd:`
+/// envelope and expose the inner command as a normal exec tool.
+fn extract_desktop_exec_command(input: &str) -> Option<Vec<String>> {
+    let marker = input
+        .find("exec_command({cmd:")
+        .or_else(|| input.find("exec_command({ cmd:"))?;
+    let rest = &input[marker..];
+    let cmd_start = rest.find("cmd:")? + "cmd:".len();
+    let literal = rest[cmd_start..].trim_start();
+    let quote = literal.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in literal[quote.len_utf8()..].chars() {
+        if escaped {
+            value.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' && quote != '`' {
+            escaped = true;
+        } else if ch == quote {
+            if value.is_empty() {
+                return None;
+            }
+            return Some(redact_command(vec![value]));
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
 fn command_from_arguments(arguments: &Value) -> Option<Vec<String>> {
     if let Some(cmd) = arguments.get("cmd").and_then(|v| v.as_str()) {
         return Some(redact_command(vec![cmd.to_string()]));
@@ -1628,7 +1680,10 @@ fn parse_output_truncated(payload: &Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exec_function_output, parse_mcp_namespace, ToolCallBuilder, ToolKind};
+    use super::{
+        extract_desktop_exec_command, parse_exec_function_output, parse_mcp_namespace,
+        ToolCallBuilder, ToolKind,
+    };
     use serde_json::json;
 
     #[test]
@@ -2986,6 +3041,30 @@ mod tests {
             tool.arguments.get("tool_id").and_then(|v| v.as_str()),
             Some("sample@openai-curated")
         );
+    }
+
+    #[test]
+    fn desktop_exec_wrapper_exposes_inner_read_command() {
+        let input = r#"const r = await tools.exec_command({cmd:"read /tmp/session.jsonl",workdir:"/tmp"}); text(r.output);"#;
+        assert_eq!(
+            extract_desktop_exec_command(input),
+            Some(vec!["read /tmp/session.jsonl".to_string()])
+        );
+
+        let mut builder = ToolCallBuilder::new();
+        builder.add_custom_tool_call(
+            "desktop-read".to_string(),
+            "exec".to_string(),
+            Some(input.to_string()),
+        );
+        builder.finalize_custom_tool_output("desktop-read", "file contents", None);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(
+            tool.command.as_deref(),
+            Some(["read /tmp/session.jsonl".to_string()].as_slice())
+        );
+        assert_eq!(tool.output.as_deref(), Some("file contents"));
     }
 
     // Codex v0.147.0 (#36893, #36908): Codex's own redaction only applies at its

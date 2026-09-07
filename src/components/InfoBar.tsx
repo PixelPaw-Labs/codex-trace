@@ -16,6 +16,7 @@ export function InfoBar({ session }: InfoBarProps) {
   const modelClr = model ? getModelColor(model) : undefined;
   const sessionId = session.path.split("/").pop()?.replace(".jsonl", "") || session.id;
   const title = session.thread_name?.trim() || session.ai_title?.trim() || null;
+  const skills = session.skills ?? [];
 
   return (
     <div className="info-bar">
@@ -26,6 +27,11 @@ export function InfoBar({ session }: InfoBarProps) {
       )}
       {cwd && <span className="info-bar__project">{cwd}</span>}
       {sessionId && <span className="info-bar__session-id">{sessionId}</span>}
+      {skills.length > 0 && (
+        <span className="info-bar__skills" title={skills.join(", ")}>
+          skills: {skills.join(", ")}
+        </span>
+      )}
       {session.originator && <span className="info-bar__originator">via {session.originator}</span>}
       {branch && <span className="info-bar__branch">{branch}</span>}
       {model && (

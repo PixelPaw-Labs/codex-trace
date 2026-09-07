@@ -272,6 +272,8 @@ export interface CodexSession {
    * Session-level signal, distinct from the per-turn `forked_from_thread_id` on `CodexTurn`.
    * Null for non-forked sessions. */
   forked_from_thread_id: string | null;
+  /** Skill instruction files observed in this session's tool calls. */
+  skills?: string[];
 }
 
 export interface CodexSessionInfo {

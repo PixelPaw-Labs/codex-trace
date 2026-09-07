@@ -567,6 +567,15 @@ body {
   min-width: 0;
 }
 
+.info-bar__skills {
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 32vw;
+}
+
 .info-bar__session-id {
   font-size: 11px;
   font-family: var(--font-mono, monospace);

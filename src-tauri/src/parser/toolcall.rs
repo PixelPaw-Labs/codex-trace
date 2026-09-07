@@ -176,14 +176,18 @@ impl ToolCallBuilder {
     ) {
         if let Some(pending) = self.pending.remove(call_id) {
             let is_patch = pending.name == "apply_patch";
-            let desktop_command = if pending.name == "exec" {
+            let desktop_classification = if pending.name == "exec" {
                 pending
                     .input_text
                     .as_deref()
-                    .and_then(extract_desktop_exec_command)
+                    .and_then(classify_desktop_exec_command)
             } else {
                 None
             };
+            let desktop_command = desktop_classification
+                .as_ref()
+                .map(|(command, _)| command.clone());
+            let desktop_label = desktop_classification.map(|(_, label)| label);
             self.finalized.push(ToolCall {
                 call_id: call_id.to_string(),
                 // Codex Desktop v0.153+ records its JavaScript/desktop execution
@@ -196,7 +200,7 @@ impl ToolCallBuilder {
                 } else {
                     ToolKind::Unknown
                 },
-                name: pending.name,
+                name: desktop_label.unwrap_or(pending.name),
                 arguments: pending.arguments,
                 input_text: pending.input_text,
                 output: Some(output.to_string()),
@@ -1278,7 +1282,7 @@ fn spawn_agent_status(output: &str) -> String {
 /// custom tool named `exec`. Keeping the wrapper as opaque JavaScript makes the
 /// call hard to find in the UI, so recognize the stable `exec_command({cmd:`
 /// envelope and expose the inner command as a normal exec tool.
-fn extract_desktop_exec_command(input: &str) -> Option<Vec<String>> {
+fn classify_desktop_exec_command(input: &str) -> Option<(Vec<String>, String)> {
     let marker = input
         .find("exec_command({cmd:")
         .or_else(|| input.find("exec_command({ cmd:"))?;
@@ -1307,12 +1311,63 @@ fn extract_desktop_exec_command(input: &str) -> Option<Vec<String>> {
             if value.is_empty() {
                 return None;
             }
-            return Some(redact_command(vec![value]));
+            let command = redact_command(vec![value]);
+            let label = desktop_command_label(&command[0]);
+            return Some((command, label.to_string()));
         } else {
             value.push(ch);
         }
     }
     None
+}
+
+fn extract_desktop_exec_command(input: &str) -> Option<Vec<String>> {
+    classify_desktop_exec_command(input).map(|(command, _)| command)
+}
+
+fn desktop_command_label(command: &str) -> &'static str {
+    let trimmed = command.trim();
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let read = matches!(
+        first,
+        "read"
+            | "cat"
+            | "head"
+            | "tail"
+            | "sed"
+            | "awk"
+            | "rg"
+            | "grep"
+            | "find"
+            | "ls"
+            | "pwd"
+            | "stat"
+            | "file"
+            | "wc"
+    ) && !(first == "sed" && trimmed.contains(" -i"));
+    if read {
+        return "READ";
+    }
+
+    if matches!(first, "apply_patch" | "perl")
+        || (first == "sed" && trimmed.contains(" -i"))
+        || ((first == "python" || first == "python3")
+            && (trimmed.contains("write_text")
+                || trimmed.contains("open(") && trimmed.contains("'w'")))
+    {
+        return "EDIT";
+    }
+
+    if matches!(
+        first,
+        "write" | "tee" | "cp" | "mv" | "mkdir" | "touch" | "ln" | "install"
+    ) || trimmed.contains(" > ")
+        || trimmed.contains(" >> ")
+    {
+        return "WRITE";
+    }
+
+    "BASH"
 }
 
 fn command_from_arguments(arguments: &Value) -> Option<Vec<String>> {
@@ -1681,8 +1736,8 @@ fn parse_output_truncated(payload: &Value) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_desktop_exec_command, parse_exec_function_output, parse_mcp_namespace,
-        ToolCallBuilder, ToolKind,
+        classify_desktop_exec_command, extract_desktop_exec_command, parse_exec_function_output,
+        parse_mcp_namespace, ToolCallBuilder, ToolKind,
     };
     use serde_json::json;
 
@@ -3050,6 +3105,10 @@ mod tests {
             extract_desktop_exec_command(input),
             Some(vec!["read /tmp/session.jsonl".to_string()])
         );
+        assert_eq!(
+            classify_desktop_exec_command(input).map(|(_, label)| label),
+            Some("READ".to_string())
+        );
 
         let mut builder = ToolCallBuilder::new();
         builder.add_custom_tool_call(
@@ -3060,11 +3119,31 @@ mod tests {
         builder.finalize_custom_tool_output("desktop-read", "file contents", None);
         let tool = &builder.finalized[0];
         assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.name, "READ");
         assert_eq!(
             tool.command.as_deref(),
             Some(["read /tmp/session.jsonl".to_string()].as_slice())
         );
         assert_eq!(tool.output.as_deref(), Some("file contents"));
+        for (input, expected) in [
+            (
+                r#"const r = await tools.exec_command({cmd:"tee out.txt"});"#,
+                "WRITE",
+            ),
+            (
+                r#"const r = await tools.exec_command({cmd:"sed -i 's/a/b/' file"});"#,
+                "EDIT",
+            ),
+            (
+                r#"const r = await tools.exec_command({cmd:"git status --short"});"#,
+                "BASH",
+            ),
+        ] {
+            assert_eq!(
+                classify_desktop_exec_command(input).map(|(_, label)| label),
+                Some(expected.to_string())
+            );
+        }
     }
 
     // Codex v0.147.0 (#36893, #36908): Codex's own redaction only applies at its

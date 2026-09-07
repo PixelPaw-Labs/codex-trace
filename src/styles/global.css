@@ -3089,6 +3089,16 @@ body {
   color: var(--text-bright);
   white-space: nowrap;
 }
+.tool-call__name--read {
+  color: var(--token-input, #5f87af);
+}
+.tool-call__name--write,
+.tool-call__name--edit {
+  color: var(--token-output, #5faf5f);
+}
+.tool-call__name--bash {
+  color: var(--icon-bash);
+}
 .tool-call__summary {
   flex: 1;
   min-width: 0;

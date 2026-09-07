@@ -766,4 +766,22 @@ describe("ToolCallItem", () => {
     expect(screen.getByText("const result = await run();")).toBeInTheDocument();
     expect(screen.getByText("Script completed")).toBeInTheDocument();
   });
+
+  it("renders semantic labels for Desktop command wrappers", () => {
+    render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "exec_command",
+          name: "READ",
+          command: ["read", "/tmp/session.jsonl"],
+          output: "file contents",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("READ")).toBeInTheDocument();
+    expect(screen.getAllByText("read /tmp/session.jsonl").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("file contents")).toBeInTheDocument();
+  });
 });

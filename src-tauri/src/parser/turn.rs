@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::entry::{parse_timestamp_secs, RawEntry};
 use super::mentions::{decode_task_mentions, TaskMentionRef};
@@ -214,6 +214,12 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     // Gives tool calls the same kind of order index as agent messages so the two can be
     // interleaved chronologically in the UI.
     let mut call_order: HashMap<String, usize> = HashMap::new();
+    // Turns whose user_message was taken from a user-role `message` response_item rather
+    // than from event_msg.user_message (Codex Desktop v0.153 emits only the former). Such
+    // text is provisional: a later user-role response_item replaces it (Desktop writes the
+    // injected context first and the real prompt last), and event_msg.user_message always
+    // wins over it regardless of ordering.
+    let mut provisional_user_messages: HashSet<String> = HashSet::new();
 
     for (index, entry) in entries.iter().enumerate() {
         if let Some(call_id) = call_id_of(entry) {
@@ -226,6 +232,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     &mut turns,
                     &mut current_turn_id,
                     &mut tool_builders,
+                    &mut provisional_user_messages,
                     has_task_started,
                     &mut synthetic_turn_counter,
                     index,
@@ -236,7 +243,13 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             | "function_call_output"
             | "message"
             | "reasoning" => {
-                handle_response_item(entry, &mut turns, &current_turn_id, &mut tool_builders);
+                handle_response_item(
+                    entry,
+                    &mut turns,
+                    &current_turn_id,
+                    &mut tool_builders,
+                    &mut provisional_user_messages,
+                );
             }
             "turn_context" => {
                 handle_turn_context(entry, &mut turns, &current_turn_id);
@@ -287,11 +300,15 @@ fn call_id_of(entry: &RawEntry) -> Option<String> {
     None
 }
 
+// The turn-building state lives in `build_turns` and is threaded through by reference; one
+// more piece of it pushes this over clippy's default argument limit.
+#[allow(clippy::too_many_arguments)]
 fn handle_event_msg(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &mut Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    provisional_user_messages: &mut HashSet<String>,
     has_task_started: bool,
     synthetic_counter: &mut u32,
     index: usize,
@@ -393,7 +410,9 @@ fn handle_event_msg(
                     .or_insert_with(ToolCallBuilder::new);
             } else if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
-                    if turn.user_message.is_none() {
+                    // event_msg.user_message is authoritative: it fills an empty slot and
+                    // also replaces provisional text taken from a user-role response_item.
+                    if turn.user_message.is_none() || provisional_user_messages.remove(tid) {
                         turn.user_message = Some(message);
                         turn.task_mentions = task_mentions;
                     }
@@ -829,6 +848,7 @@ fn handle_response_item(
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    provisional_user_messages: &mut HashSet<String>,
 ) {
     let payload = if entry.entry_type == "response_item" {
         &entry.payload
@@ -1178,13 +1198,21 @@ fn handle_response_item(
         // role=user and input_text content blocks (rather than event_msg.user_message).
         // Use the last user message in a turn: the first one is often the injected
         // environment/context block, while the final one is the actual prompt.
+        //
+        // Regular CLI rollouts carry these items too (environment context, compaction
+        // summaries, the prompt as sent to the model) alongside event_msg.user_message, so
+        // this text is only provisional: it never overwrites a user_message that came from
+        // event_msg, and it can itself be replaced by a later event_msg.user_message.
         "message" if payload.get("role").and_then(|v| v.as_str()) == Some("user") => {
             let raw_text = extract_item_content(payload);
             if !raw_text.is_empty() {
-                let (text, task_mentions) = decode_task_mentions(&raw_text);
                 if let Some(turn) = turns.get_mut(tid) {
-                    turn.user_message = Some(text);
-                    turn.task_mentions = task_mentions;
+                    if turn.user_message.is_none() || provisional_user_messages.contains(tid) {
+                        let (text, task_mentions) = decode_task_mentions(&raw_text);
+                        turn.user_message = Some(text);
+                        turn.task_mentions = task_mentions;
+                        provisional_user_messages.insert(tid.to_string());
+                    }
                 }
             }
         }
@@ -2811,6 +2839,47 @@ mod tests {
         );
         assert_eq!(tool.exit_code, None);
         assert_eq!(tool.status, "completed");
+    }
+
+    // Regular Codex CLI rollouts also carry user-role response_item messages alongside
+    // event_msg.user_message (injected environment context, compaction summaries, the
+    // prompt as sent to the model). event_msg.user_message is authoritative and must win
+    // regardless of ordering; response_item text is only a fallback for Desktop sessions
+    // that never emit event_msg.user_message.
+
+    #[test]
+    fn user_role_response_item_does_not_overwrite_event_msg_user_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"cli-env-ctx","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.0"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/project</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1788688804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Fix the bug"),
+            "user-role response_item must not replace the event_msg.user_message prompt"
+        );
+    }
+
+    #[test]
+    fn event_msg_user_message_overrides_earlier_user_role_response_item() {
+        // Same authority rule when the response_item happens to be recorded first.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"cli-env-ctx-first","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.0"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/project</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1788688804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Fix the bug"));
     }
 
     #[test]

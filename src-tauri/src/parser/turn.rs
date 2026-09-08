@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::entry::{parse_timestamp_secs, RawEntry};
 use super::mentions::{decode_task_mentions, TaskMentionRef};
@@ -214,6 +214,12 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     // Gives tool calls the same kind of order index as agent messages so the two can be
     // interleaved chronologically in the UI.
     let mut call_order: HashMap<String, usize> = HashMap::new();
+    // Turns whose user_message was taken from a user-role `message` response_item rather
+    // than from event_msg.user_message (Codex Desktop v0.153 emits only the former). Such
+    // text is provisional: a later user-role response_item replaces it (Desktop writes the
+    // injected context first and the real prompt last), and event_msg.user_message always
+    // wins over it regardless of ordering.
+    let mut provisional_user_messages: HashSet<String> = HashSet::new();
 
     for (index, entry) in entries.iter().enumerate() {
         if let Some(call_id) = call_id_of(entry) {
@@ -226,6 +232,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     &mut turns,
                     &mut current_turn_id,
                     &mut tool_builders,
+                    &mut provisional_user_messages,
                     has_task_started,
                     &mut synthetic_turn_counter,
                     index,
@@ -236,7 +243,13 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             | "function_call_output"
             | "message"
             | "reasoning" => {
-                handle_response_item(entry, &mut turns, &current_turn_id, &mut tool_builders);
+                handle_response_item(
+                    entry,
+                    &mut turns,
+                    &current_turn_id,
+                    &mut tool_builders,
+                    &mut provisional_user_messages,
+                );
             }
             "turn_context" => {
                 handle_turn_context(entry, &mut turns, &current_turn_id);
@@ -287,11 +300,15 @@ fn call_id_of(entry: &RawEntry) -> Option<String> {
     None
 }
 
+// The turn-building state lives in `build_turns` and is threaded through by reference; one
+// more piece of it pushes this over clippy's default argument limit.
+#[allow(clippy::too_many_arguments)]
 fn handle_event_msg(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &mut Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    provisional_user_messages: &mut HashSet<String>,
     has_task_started: bool,
     synthetic_counter: &mut u32,
     index: usize,
@@ -393,7 +410,9 @@ fn handle_event_msg(
                     .or_insert_with(ToolCallBuilder::new);
             } else if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
-                    if turn.user_message.is_none() {
+                    // event_msg.user_message is authoritative: it fills an empty slot and
+                    // also replaces provisional text taken from a user-role response_item.
+                    if turn.user_message.is_none() || provisional_user_messages.remove(tid) {
                         turn.user_message = Some(message);
                         turn.task_mentions = task_mentions;
                     }
@@ -829,6 +848,7 @@ fn handle_response_item(
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    provisional_user_messages: &mut HashSet<String>,
 ) {
     let payload = if entry.entry_type == "response_item" {
         &entry.payload
@@ -851,6 +871,16 @@ fn handle_response_item(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // Codex Desktop v0.153 stores the same correlation field under
+    // internal_chat_message_metadata_passthrough rather than metadata.
+    let metadata_turn_id = metadata_turn_id.or_else(|| {
+        payload
+            .get("internal_chat_message_metadata_passthrough")
+            .and_then(|m| m.get("turn_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    });
 
     let tid: &str = match metadata_turn_id.as_deref().or(current_turn_id.as_deref()) {
         Some(t) => t,
@@ -938,31 +968,17 @@ fn handle_response_item(
             let name = str_field(payload, "name");
             let input = payload
                 .get("input")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .and_then(custom_tool_text)
+                .filter(|s| !s.is_empty());
             builder.add_custom_tool_call(call_id, name, input);
         }
 
         "custom_tool_call_output" => {
             let call_id = str_field(payload, "call_id");
-            // output field is a JSON string: {"output":"...","metadata":{"exit_code":N,...}}
-            let raw_output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
-            let output = serde_json::from_str::<Value>(raw_output)
-                .ok()
-                .and_then(|v| {
-                    v.get("output")
-                        .and_then(|o| o.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| raw_output.to_string());
-            let exit_code = serde_json::from_str::<Value>(raw_output)
-                .ok()
-                .and_then(|v| {
-                    v.get("metadata")
-                        .and_then(|m| m.get("exit_code"))
-                        .and_then(|c| c.as_i64())
-                        .map(|c| c as i32)
-                });
+            // Legacy Codex writes `output` as a JSON string containing `output`
+            // and optional `metadata.exit_code`. Codex Desktop v0.153+ writes a
+            // structured array of text blocks instead.
+            let (output, exit_code) = extract_custom_tool_output(payload);
             builder.finalize_custom_tool_output(&call_id, &output, exit_code);
         }
 
@@ -1178,6 +1194,29 @@ fn handle_response_item(
             }
         }
 
+        // Codex Desktop v0.153 records user prompts as response_item messages with
+        // role=user and input_text content blocks (rather than event_msg.user_message).
+        // Use the last user message in a turn: the first one is often the injected
+        // environment/context block, while the final one is the actual prompt.
+        //
+        // Regular CLI rollouts carry these items too (environment context, compaction
+        // summaries, the prompt as sent to the model) alongside event_msg.user_message, so
+        // this text is only provisional: it never overwrites a user_message that came from
+        // event_msg, and it can itself be replaced by a later event_msg.user_message.
+        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("user") => {
+            let raw_text = extract_item_content(payload);
+            if !raw_text.is_empty() {
+                if let Some(turn) = turns.get_mut(tid) {
+                    if turn.user_message.is_none() || provisional_user_messages.contains(tid) {
+                        let (text, task_mentions) = decode_task_mentions(&raw_text);
+                        turn.user_message = Some(text);
+                        turn.task_mentions = task_mentions;
+                        provisional_user_messages.insert(tid.to_string());
+                    }
+                }
+            }
+        }
+
         // Handle assistant message response_items. This includes schema-validated JSON content
         // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
         // is a JSON object rather than a plain string.
@@ -1284,6 +1323,50 @@ fn extract_item_content(payload: &Value) -> String {
         Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// Extract output from a custom tool result across legacy and Desktop formats.
+fn extract_custom_tool_output(payload: &Value) -> (String, Option<i32>) {
+    let Some(value) = payload.get("output") else {
+        return (String::new(), None);
+    };
+
+    if let Some(raw) = value.as_str() {
+        let parsed = serde_json::from_str::<Value>(raw).ok();
+        let output = parsed
+            .as_ref()
+            .and_then(|v| v.get("output"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw.to_owned());
+        let exit_code = parsed
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .and_then(|m| m.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok());
+        return (output, exit_code);
+    }
+
+    (custom_tool_text(value).unwrap_or_default(), None)
+}
+
+/// Convert a custom-tool input/output value to displayable text. Desktop uses
+/// OpenAI-style arrays of `{type, text}` blocks for structured tool output.
+fn custom_tool_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(items) = value.as_array() {
+        return Some(
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+        );
+    }
+    None
 }
 
 /// Extract plain text from a content value that may be a bare string, an array of
@@ -2718,6 +2801,80 @@ mod tests {
             r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
             r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":[{"type":"text","text":"Fix "},{"type":"text","text":"the bug"}]}}"#,
             r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Fix the bug"));
+    }
+
+    #[test]
+    fn v0153_desktop_messages_and_structured_custom_exec_are_parsed() {
+        // Codex Desktop v0.153 records prompts as response_item/message entries and
+        // its `exec` tool as custom_tool_call with an array-valued output.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"desktop-v153","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-desktop"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Injected context"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Actual request"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"custom-exec","input":"const result = await run();","internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-exec","output":[{"type":"input_text","text":"Script completed\n"},{"type":"input_text","text":"result output"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-desktop","completed_at":1788688806.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Actual request"));
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::Unknown);
+        assert_eq!(tool.name, "exec");
+        assert_eq!(
+            tool.input_text.as_deref(),
+            Some("const result = await run();")
+        );
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("Script completed\nresult output")
+        );
+        assert_eq!(tool.exit_code, None);
+        assert_eq!(tool.status, "completed");
+    }
+
+    // Regular Codex CLI rollouts also carry user-role response_item messages alongside
+    // event_msg.user_message (injected environment context, compaction summaries, the
+    // prompt as sent to the model). event_msg.user_message is authoritative and must win
+    // regardless of ordering; response_item text is only a fallback for Desktop sessions
+    // that never emit event_msg.user_message.
+
+    #[test]
+    fn user_role_response_item_does_not_overwrite_event_msg_user_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"cli-env-ctx","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.0"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/project</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1788688804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Fix the bug"),
+            "user-role response_item must not replace the event_msg.user_message prompt"
+        );
+    }
+
+    #[test]
+    fn event_msg_user_message_overrides_earlier_user_role_response_item() {
+        // Same authority rule when the response_item happens to be recorded first.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"cli-env-ctx-first","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.0"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/project</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1788688804.0}}"#,
         ]);
 
         let turns = build_turns(&entries);

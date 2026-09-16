@@ -9,7 +9,7 @@ import { isTauri } from "./isTauri";
 
 export function openUrl(url: string): void {
   if (isTauri) {
-    tauriOpenUrl(url);
+    tauriOpenUrl(url).catch((err) => console.error("could not open the URL:", err));
   } else {
     window.open(url, "_blank", "noopener");
   }

@@ -1,14 +1,16 @@
 import { renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const listeners = new Map<string, (e: { payload: unknown }) => void>();
+const listeners = new Map<string, (e: { payload: unknown }) => void | Promise<void>>();
 const unlisten = vi.fn();
 
 vi.mock("../lib/listen", () => ({
-  listen: vi.fn(async (event: string, handler: (e: { payload: unknown }) => void) => {
-    listeners.set(event, handler);
-    return unlisten;
-  }),
+  listen: vi.fn(
+    async (event: string, handler: (e: { payload: unknown }) => void | Promise<void>) => {
+      listeners.set(event, handler);
+      return unlisten;
+    },
+  ),
 }));
 
 const { useTauriEvent } = await import("./useTauriEvent");
@@ -58,5 +60,51 @@ describe("useTauriEvent", () => {
     unmount();
 
     expect(unlisten).toHaveBeenCalled();
+  });
+});
+
+describe("useTauriEvent async handlers", () => {
+  afterEach(() => {
+    listeners.clear();
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it("returns an async handler's promise so the caller can settle it", async () => {
+    const seen: string[] = [];
+    renderHook(() =>
+      useTauriEvent<string>("session-updated", async (payload) => {
+        await Promise.resolve();
+        seen.push(payload);
+      }),
+    );
+
+    await waitFor(() => expect(listeners.has("session-updated")).toBe(true));
+    await listeners.get("session-updated")?.({ payload: "late" });
+
+    expect(seen).toEqual(["late"]);
+  });
+
+  it("does not run an async handler after unmount", async () => {
+    const handler = vi.fn(async () => {});
+    const { unmount } = renderHook(() => useTauriEvent<string>("session-updated", handler));
+
+    await waitFor(() => expect(listeners.has("session-updated")).toBe(true));
+    const forward = listeners.get("session-updated")!;
+    unmount();
+    await forward({ payload: "after-unmount" });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("reports a failure to attach instead of leaving it unhandled", async () => {
+    const onError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { listen } = await import("../lib/listen");
+    vi.mocked(listen).mockRejectedValueOnce(new Error("bridge is gone"));
+
+    renderHook(() => useTauriEvent<string>("session-updated", vi.fn()));
+
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+    expect(String(onError.mock.calls[0][0])).toContain("failed to listen for session-updated");
   });
 });

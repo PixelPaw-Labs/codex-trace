@@ -98,7 +98,9 @@ describe("listen (SSE)", () => {
 
   it("opens one shared stream and delivers parsed payloads", async () => {
     const seen: unknown[] = [];
-    const off = await listen<{ a: number }>("session-update", (e) => seen.push(e.payload));
+    const off = await listen<{ a: number }>("session-update", (e) => {
+      seen.push(e.payload);
+    });
 
     expect(FakeEventSource.instances).toHaveLength(1);
     latest().message("session-update", JSON.stringify({ a: 1 }));
@@ -139,7 +141,9 @@ describe("listen (SSE)", () => {
 
   it("reopens a stream the browser refused, and keeps delivering events", async () => {
     const seen: unknown[] = [];
-    const off = await listen<{ n: number }>("session-update", (e) => seen.push(e.payload));
+    const off = await listen<{ n: number }>("session-update", (e) => {
+      seen.push(e.payload);
+    });
 
     // A reconnect refused with 401: EventSource closes and never retries.
     latest().fail();
@@ -243,7 +247,9 @@ describe("listen (SSE)", () => {
   it("keeps listeners attached across a credential change", async () => {
     const seen: unknown[] = [];
     setApiToken("old");
-    const off = await listen<{ n: number }>("session-update", (e) => seen.push(e.payload));
+    const off = await listen<{ n: number }>("session-update", (e) => {
+      seen.push(e.payload);
+    });
 
     setApiToken("new");
     latest().message("session-update", JSON.stringify({ n: 1 }));
@@ -277,6 +283,74 @@ describe("listen (SSE)", () => {
     const before = FakeEventSource.instances.length;
     vi.advanceTimersByTime(SSE_REOPEN_MIN_MS);
     expect(FakeEventSource.instances.length).toBe(before + 1);
+
+    off();
+  });
+});
+
+describe("listen handler errors", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    FakeEventSource.instances = [];
+    const mod = await import("./listen");
+    listen = mod.listen;
+    reconnectSse = mod.reconnectSse;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("awaits an async handler's rejection instead of leaking it", async () => {
+    const onError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const off = await listen("session-update", async () => {
+      await Promise.resolve();
+      throw new Error("handler blew up");
+    });
+
+    latest().message("session-update", "{}");
+    await vi.waitFor(() => expect(onError).toHaveBeenCalled());
+    expect(String(onError.mock.calls[0][0])).toContain("session-update handler failed");
+
+    off();
+  });
+
+  it("reports a handler that throws synchronously", async () => {
+    const onError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const off = await listen("session-update", () => {
+      throw new Error("sync blow up");
+    });
+
+    latest().message("session-update", "{}");
+
+    expect(onError).toHaveBeenCalled();
+    expect(String(onError.mock.calls[0][0])).toContain("session-update handler failed");
+
+    off();
+  });
+
+  it("drops a malformed frame without calling the handler or logging", async () => {
+    const onError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const handler = vi.fn();
+    const off = await listen("session-update", handler);
+
+    latest().message("session-update", "not json");
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+
+    off();
+  });
+
+  it("delivers to an async handler", async () => {
+    const seen: unknown[] = [];
+    const off = await listen<{ n: number }>("session-update", async (e) => {
+      await Promise.resolve();
+      seen.push(e.payload);
+    });
+
+    latest().message("session-update", JSON.stringify({ n: 7 }));
+    await vi.waitFor(() => expect(seen).toEqual([{ n: 7 }]));
 
     off();
   });

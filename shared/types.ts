@@ -335,6 +335,7 @@ export interface CodexSessionInfo {
 export interface SettingsResponse {
   sessions_dir: string | null;
   default_dir: string;
+  allowed_origins: string[];
 }
 
 export type ViewState = "picker" | "list" | "detail";

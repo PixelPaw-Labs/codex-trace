@@ -11,7 +11,10 @@ interface SettingsModalProps {
 export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
   const [sessionsDir, setSessionsDir] = useState("");
   const [defaultDir, setDefaultDir] = useState("");
+  const [allowedOrigins, setAllowedOrigins] = useState<string[]>([]);
+  const [newOrigin, setNewOrigin] = useState("");
   const [error, setError] = useState("");
+  const [originError, setOriginError] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -19,6 +22,7 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
       .then((res) => {
         setDefaultDir(res.default_dir);
         setSessionsDir(res.sessions_dir ?? res.default_dir);
+        setAllowedOrigins(res.allowed_origins);
       })
       .catch(console.error);
   }, []);
@@ -57,18 +61,56 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        handleSave();
+        void handleSave();
       }
     },
     [handleSave],
+  );
+
+  // Origins persist as soon as they change rather than on Save, so the running
+  // server picks them up immediately — the same as every other setting.
+  const persistOrigins = useCallback(async (origins: string[]) => {
+    setOriginError("");
+    try {
+      const res = await invoke<SettingsResponse>("set_allowed_origins", { origins });
+      setAllowedOrigins(res.allowed_origins);
+      return true;
+    } catch (err) {
+      setOriginError(String(err));
+      return false;
+    }
+  }, []);
+
+  const handleAddOrigin = useCallback(async () => {
+    const trimmed = newOrigin.trim();
+    if (!trimmed) return;
+    const ok = await persistOrigins([...allowedOrigins, trimmed]);
+    if (ok) setNewOrigin("");
+  }, [newOrigin, allowedOrigins, persistOrigins]);
+
+  const handleRemoveOrigin = useCallback(
+    (origin: string) => {
+      void persistOrigins(allowedOrigins.filter((o) => o !== origin));
+    },
+    [allowedOrigins, persistOrigins],
+  );
+
+  const handleOriginKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void handleAddOrigin();
+      }
+    },
+    [handleAddOrigin],
   );
 
   return (
     <PopoutModal
       onClose={onClose}
       header={<span className="settings-modal__title">Settings</span>}
-      initialWidth={520}
-      initialHeight={240}
+      initialWidth={560}
+      initialHeight={420}
     >
       <div className="settings-modal">
         <label className="settings-modal__label" htmlFor="sessions-dir">
@@ -90,6 +132,55 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
         />
         <p className="settings-modal__hint">Default: {defaultDir}</p>
         {error && <p className="settings-modal__error">{error}</p>}
+
+        <label className="settings-modal__label" htmlFor="new-origin">
+          Allowed Origins
+        </label>
+        <p className="settings-modal__hint">
+          Websites allowed to call the local API from a browser. The desktop app and the same-origin
+          web UI never need an entry here.
+        </p>
+        {allowedOrigins.length > 0 && (
+          <ul className="settings-modal__origins">
+            {allowedOrigins.map((origin) => (
+              <li key={origin} className="settings-modal__origin">
+                <span className="settings-modal__origin-value">{origin}</span>
+                <button
+                  className="settings-modal__origin-remove"
+                  onClick={() => handleRemoveOrigin(origin)}
+                  aria-label={`Remove ${origin}`}
+                  title={`Remove ${origin}`}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="settings-modal__origin-add">
+          <input
+            id="new-origin"
+            className="settings-modal__input"
+            type="text"
+            value={newOrigin}
+            onChange={(e) => {
+              setNewOrigin(e.target.value);
+              setOriginError("");
+            }}
+            onKeyDown={handleOriginKeyDown}
+            placeholder="https://example.com:8080"
+            spellCheck={false}
+          />
+          <button
+            className="settings-modal__btn"
+            onClick={() => void handleAddOrigin()}
+            disabled={!newOrigin.trim()}
+          >
+            Add
+          </button>
+        </div>
+        {originError && <p className="settings-modal__error">{originError}</p>}
+
         <div className="settings-modal__actions">
           <button
             className="settings-modal__btn settings-modal__btn--secondary"

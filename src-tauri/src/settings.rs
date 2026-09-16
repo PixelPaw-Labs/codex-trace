@@ -6,6 +6,10 @@ use std::path::PathBuf;
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions_dir: Option<String>,
+    /// Extra origins allowed to call the local HTTP API cross-origin, on top of
+    /// the built-in dev/web UI origins. Managed from Settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -44,5 +48,38 @@ mod tests {
     fn deserialize_empty_json_gives_defaults() {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert!(s.sessions_dir.is_none());
+        assert!(s.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn default_settings_has_no_allowed_origins() {
+        assert!(Settings::default().allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn empty_allowed_origins_omitted_from_json() {
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!json.contains("allowed_origins"), "{json}");
+    }
+
+    #[test]
+    fn allowed_origins_roundtrip_through_json() {
+        let s = Settings {
+            sessions_dir: None,
+            allowed_origins: vec![
+                "http://a.example".to_string(),
+                "https://b.example".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.allowed_origins, s.allowed_origins);
+    }
+
+    #[test]
+    fn settings_written_before_allowed_origins_existed_still_parse() {
+        let s: Settings = serde_json::from_str(r#"{"sessions_dir":"/tmp/x"}"#).unwrap();
+        assert_eq!(s.sessions_dir.as_deref(), Some("/tmp/x"));
+        assert!(s.allowed_origins.is_empty());
     }
 }

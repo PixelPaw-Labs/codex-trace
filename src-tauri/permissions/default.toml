@@ -9,6 +9,7 @@ permissions = [
   "allow-unwatch-picker",
   "allow-get-settings",
   "allow-set-sessions-dir",
+  "allow-set-allowed-origins",
   "allow-switch-to-browser",
 ]
 
@@ -51,6 +52,11 @@ commands.allow = ["get_settings"]
 identifier = "allow-set-sessions-dir"
 description = "Allow setting the sessions directory"
 commands.allow = ["set_sessions_dir"]
+
+[[permission]]
+identifier = "allow-set-allowed-origins"
+description = "Allow setting the extra CORS-allowed origins"
+commands.allow = ["set_allowed_origins"]
 
 [[permission]]
 identifier = "allow-switch-to-browser"

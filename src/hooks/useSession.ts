@@ -144,13 +144,44 @@ export function useSession() {
     }
   }, []);
 
+  /**
+   * Re-fetch the turns that are already open, replacing each body only once its
+   * replacement has arrived.
+   *
+   * Emptying the map instead would blank whatever the user is reading — the
+   * detail view falls back to "Loading turn…" — and on a live session the
+   * watcher fires on every appended line, so that flash would repeat for as
+   * long as the session runs.
+   */
+  const refreshLoadedTurns = useCallback(async () => {
+    const path = pathRef.current;
+    if (!path) return;
+    const loadId = loadIdRef.current;
+    await Promise.all(
+      [...loadedRef.current].map(async (index) => {
+        try {
+          const turn = await invoke<CodexTurn>("load_turn", { path, index });
+          if (loadIdRef.current !== loadId) return;
+          setTurns((prev) => {
+            // Evicted while the fetch was in flight: leave it evicted.
+            if (!prev.has(index)) return prev;
+            const next = new Map(prev);
+            next.set(index, turn);
+            return next;
+          });
+        } catch {
+          // The turn no longer exists at that index. Keep what is on screen
+          // rather than blanking it; the index refresh below moves the user.
+        }
+      }),
+    );
+  }, []);
+
   // `session-refresh` carries no data — the watcher sends only a signal, having
   // already re-read the file into the backend's cache. Fetching here keeps the
   // session off the wire once per connected client per write.
   useTauriEvent("session-refresh", async () => {
-    // The file changed, so every body fetched from it may be out of date.
-    resetTurns();
-    await refreshIndex();
+    await Promise.all([refreshIndex(), refreshLoadedTurns()]);
   });
 
   useEffect(() => {

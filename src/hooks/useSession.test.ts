@@ -250,7 +250,7 @@ describe("useSession", () => {
     await waitFor(() => expect(result.current.summaries).toHaveLength(12));
   });
 
-  it("drops loaded turn bodies on the live-update signal", async () => {
+  it("refreshes an open turn in place rather than blanking it", async () => {
     const { result } = renderHook(() => useSession());
     await act(async () => {
       await result.current.loadSession("/s.jsonl");
@@ -258,11 +258,60 @@ describe("useSession", () => {
     });
     expect(result.current.turns.size).toBe(1);
 
-    await act(async () => {
-      handlers.get("session-refresh")?.({});
+    // The body the backend will serve after the file grew.
+    invoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "load_session") return index(10);
+      if (cmd === "load_turn") {
+        return { ...turn((args as { index: number }).index), status: "complete" } as CodexTurn;
+      }
+      return undefined;
     });
 
-    await waitFor(() => expect(result.current.turns.size).toBe(0));
+    await act(async () => {
+      await handlers.get("session-refresh")?.({});
+    });
+
+    // Never empty: blanking it makes the detail view fall back to
+    // "Loading turn…" on every appended line of a live session.
+    expect(result.current.turns.size).toBe(1);
+    expect(result.current.turns.get(0)).toMatchObject({ turn_id: "turn-0", status: "complete" });
+  });
+
+  it("re-reads every open turn on the live-update signal", async () => {
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+      await openInOrder(result.current.ensureTurn, [2, 5]);
+    });
+    invoke.mockClear();
+
+    await act(async () => {
+      await handlers.get("session-refresh")?.({});
+    });
+
+    expect(requestedTurns().toSorted()).toEqual([2, 5]);
+  });
+
+  it("keeps a turn on screen when its refresh fails", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+      await result.current.ensureTurn(0);
+    });
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_session") return index(10);
+      if (cmd === "load_turn") throw new Error("no turn at index 0");
+      return undefined;
+    });
+
+    await act(async () => {
+      await handlers.get("session-refresh")?.({});
+    });
+
+    expect(result.current.turns.get(0)).toMatchObject({ turn_id: "turn-0" });
+    errors.mockRestore();
   });
 
   it("ignores the live-update signal when no session is open", async () => {

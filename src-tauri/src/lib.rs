@@ -60,6 +60,7 @@ pub fn run() {
             commands::picker::unwatch_picker,
             commands::settings::get_settings,
             commands::settings::set_sessions_dir,
+            commands::cors::set_allowed_origins,
             switch_to_browser,
         ])
         .setup(move |app| {

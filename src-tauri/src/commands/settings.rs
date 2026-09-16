@@ -10,6 +10,7 @@ use crate::state::AppState;
 pub struct SettingsResponse {
     pub sessions_dir: Option<String>,
     pub default_dir: String,
+    pub allowed_origins: Vec<String>,
 }
 
 pub fn platform_default_dir() -> String {
@@ -27,6 +28,7 @@ pub fn build_settings_response(settings: &Settings) -> SettingsResponse {
     SettingsResponse {
         sessions_dir: settings.sessions_dir.clone(),
         default_dir: platform_default_dir(),
+        allowed_origins: settings.allowed_origins.clone(),
     }
 }
 

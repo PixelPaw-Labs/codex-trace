@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::{header, HeaderValue, Method};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -10,7 +11,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, Manager};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::state::AppState;
@@ -48,6 +49,80 @@ pub fn resolve_static_dir() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Origins the browser UI is served from. In web/dev mode the frontend runs on
+/// `localhost:1420` and calls the API on port 11424 — a distinct origin — so
+/// these are allowlisted for CORS. The Tauri desktop webview talks to the
+/// backend over the IPC bridge (never HTTP), and the Docker image serves the UI
+/// same-origin, so neither needs an entry here. Extra origins can be added at
+/// launch via `CODEXTRACE_ALLOWED_ORIGINS` or at runtime from Settings
+/// (`Settings.allowed_origins`, checked per-request in `build_cors`); the two
+/// are unioned, not replaced.
+const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = ["http://localhost:1420", "http://127.0.0.1:1420"];
+
+/// Split a raw `CODEXTRACE_ALLOWED_ORIGINS` value into individual origins,
+/// dropping empty entries and surrounding whitespace.
+fn parse_extra_origins(raw: Option<String>) -> Vec<String> {
+    raw.into_iter()
+        .flat_map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Resolve the *static* half of the CORS origin allowlist: the built-in
+/// dev/web origins plus any added via the `CODEXTRACE_ALLOWED_ORIGINS` env var
+/// (comma-separated). Read once at startup because env vars cannot change at
+/// runtime. The *live* half (origins configured from Settings) is checked
+/// per-request in `build_cors`'s predicate.
+fn resolve_allowed_origins() -> Vec<String> {
+    let mut origins: Vec<String> = DEFAULT_ALLOWED_ORIGINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    origins.extend(parse_extra_origins(
+        std::env::var("CODEXTRACE_ALLOWED_ORIGINS").ok(),
+    ));
+    origins
+}
+
+/// Exact string match against either half of the allowlist. Deliberately not a
+/// prefix or suffix match: `http://localhost:1420.evil.com` must not pass
+/// because it starts with an allowed origin.
+fn origin_allowed(origin: &str, static_origins: &[String], live_origins: &[String]) -> bool {
+    static_origins.iter().any(|o| o == origin) || live_origins.iter().any(|o| o == origin)
+}
+
+/// Build a CORS layer scoped to the allowlisted origins. This replaces a
+/// permissive `*` policy under which any website the user visited could read
+/// local Codex session data (prompts, code, tool output) cross-origin while the
+/// app was running.
+///
+/// The origin check is a live predicate rather than a static list so that
+/// origins added from Settings take effect immediately, matching every other
+/// setting — no server restart.
+fn build_cors(app_state: Arc<AppState>) -> CorsLayer {
+    let static_origins = resolve_allowed_origins();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
+                let Ok(origin_str) = origin.to_str() else {
+                    return false;
+                };
+                let live_origins = app_state
+                    .settings
+                    .lock()
+                    .map(|g| g.allowed_origins.clone())
+                    .unwrap_or_default();
+                origin_allowed(origin_str, &static_origins, &live_origins)
+            },
+        ))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
 /// Start the HTTP server from a Tauri AppHandle (desktop/web mode).
 pub async fn start_http_server(app: AppHandle) {
     let app_state: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
@@ -71,6 +146,7 @@ async fn run_server(state: Arc<HttpState>) {
     let mut router = Router::new()
         .route("/api/settings", get(api_get_settings))
         .route("/api/settings/dir", post(api_set_sessions_dir))
+        .route("/api/settings/origins", post(api_set_allowed_origins))
         .route("/api/sessions", post(api_discover_sessions))
         .route("/api/session/load", post(api_load_session))
         .route("/api/session/watch", post(api_watch_session))
@@ -85,7 +161,8 @@ async fn run_server(state: Arc<HttpState>) {
         eprintln!("HTTP API: serving static assets from {dir}");
     }
 
-    let router = router.layer(CorsLayer::permissive()).with_state(state);
+    let cors_state = state.app_state.clone();
+    let router = router.layer(build_cors(cors_state)).with_state(state);
 
     let (host, port) = resolve_bind_addr();
     let addr = format!("{host}:{port}");
@@ -176,6 +253,35 @@ async fn api_set_sessions_dir(
         }
     };
     guard.sessions_dir = body.path;
+    if let Err(e) = crate::settings::save_settings(&guard) {
+        return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    ok_json(&crate::commands::settings::build_settings_response(&guard))
+}
+
+#[derive(Deserialize)]
+struct SetOriginsBody {
+    origins: Vec<String>,
+}
+
+async fn api_set_allowed_origins(
+    State(state): State<Arc<HttpState>>,
+    Json(body): Json<SetOriginsBody>,
+) -> Response {
+    let app_state = app_state(&state);
+
+    let validated = match crate::commands::cors::sanitize_and_validate_origins(body.origins) {
+        Ok(v) => v,
+        Err(e) => return err_response(axum::http::StatusCode::BAD_REQUEST, e),
+    };
+
+    let mut guard = match app_state.settings.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    };
+    guard.allowed_origins = validated;
     if let Err(e) = crate::settings::save_settings(&guard) {
         return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e);
     }
@@ -341,5 +447,110 @@ mod tests {
     #[test]
     fn pick_port_uses_parsed_value() {
         assert_eq!(pick_port(Some("8080".to_string())), 8080);
+    }
+
+    // -----------------------------------------------------------------------
+    // CORS allowlist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_extra_origins_is_empty_when_missing() {
+        assert!(parse_extra_origins(None).is_empty());
+    }
+
+    #[test]
+    fn parse_extra_origins_splits_and_trims() {
+        assert_eq!(
+            parse_extra_origins(Some(" http://a.example , http://b.example ".to_string())),
+            vec!["http://a.example", "http://b.example"],
+        );
+    }
+
+    #[test]
+    fn parse_extra_origins_drops_empty_entries() {
+        assert!(parse_extra_origins(Some(" , ,".to_string())).is_empty());
+    }
+
+    #[test]
+    fn default_origins_are_the_dev_web_ui() {
+        assert_eq!(
+            DEFAULT_ALLOWED_ORIGINS,
+            ["http://localhost:1420", "http://127.0.0.1:1420"],
+        );
+    }
+
+    #[test]
+    fn default_origins_parse_to_valid_header_values() {
+        for origin in DEFAULT_ALLOWED_ORIGINS {
+            assert!(HeaderValue::from_str(origin).is_ok(), "{origin}");
+        }
+    }
+
+    #[test]
+    fn origin_allowed_matches_a_static_origin() {
+        let static_origins = vec!["http://localhost:1420".to_string()];
+        assert!(origin_allowed(
+            "http://localhost:1420",
+            &static_origins,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn origin_allowed_matches_a_live_settings_origin() {
+        let live = vec!["https://trace.example".to_string()];
+        assert!(origin_allowed("https://trace.example", &[], &live));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_an_unlisted_origin() {
+        let static_origins = vec!["http://localhost:1420".to_string()];
+        assert!(!origin_allowed(
+            "https://evil.example",
+            &static_origins,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_a_prefix_extension_of_an_allowed_origin() {
+        // A suffix/prefix match would let `http://localhost:1420.evil.com`
+        // through; the comparison must stay exact.
+        let static_origins = vec!["http://localhost:1420".to_string()];
+        assert!(!origin_allowed(
+            "http://localhost:1420.evil.com",
+            &static_origins,
+            &[]
+        ));
+        assert!(!origin_allowed(
+            "http://evil.com/http://localhost:1420",
+            &static_origins,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn origin_allowed_is_case_sensitive_and_scheme_sensitive() {
+        let static_origins = vec!["http://localhost:1420".to_string()];
+        assert!(!origin_allowed(
+            "https://localhost:1420",
+            &static_origins,
+            &[]
+        ));
+        assert!(!origin_allowed(
+            "http://LOCALHOST:1420",
+            &static_origins,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_everything_when_both_lists_are_empty() {
+        assert!(!origin_allowed("http://localhost:1420", &[], &[]));
+    }
+
+    #[test]
+    fn build_cors_constructs_without_panicking() {
+        let _ = build_cors(Arc::new(AppState::new()));
     }
 }

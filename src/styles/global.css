@@ -2300,6 +2300,54 @@ body {
   background: #4a9aee;
 }
 
+.settings-modal__origins {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-modal__origin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.settings-modal__origin-value {
+  flex: 1;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.settings-modal__origin-remove {
+  flex: none;
+  padding: 0 6px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.settings-modal__origin-remove:hover {
+  color: var(--error);
+}
+
+.settings-modal__origin-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* ============================================================
    Codex Trace additions
    ============================================================ */

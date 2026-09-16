@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "../lib/invoke";
 import { PopoutModal } from "./PopoutModal";
-import type { SettingsResponse } from "../../shared/types";
+import { AcceptedClients } from "./AcceptedClients";
+import type { ApiClient, SettingsResponse } from "../../shared/types";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -12,6 +13,9 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
   const [sessionsDir, setSessionsDir] = useState("");
   const [defaultDir, setDefaultDir] = useState("");
   const [allowedOrigins, setAllowedOrigins] = useState<string[]>([]);
+  const [clients, setClients] = useState<ApiClient[]>([]);
+  const [authEnabled, setAuthEnabled] = useState(true);
+  const [authSource, setAuthSource] = useState("file");
   const [newOrigin, setNewOrigin] = useState("");
   const [error, setError] = useState("");
   const [originError, setOriginError] = useState("");
@@ -23,6 +27,9 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
         setDefaultDir(res.default_dir);
         setSessionsDir(res.sessions_dir ?? res.default_dir);
         setAllowedOrigins(res.allowed_origins);
+        setClients(res.clients);
+        setAuthEnabled(res.api_auth_enabled);
+        setAuthSource(res.api_auth_source);
       })
       .catch(console.error);
   }, []);
@@ -110,7 +117,7 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
       onClose={onClose}
       header={<span className="settings-modal__title">Settings</span>}
       initialWidth={560}
-      initialHeight={420}
+      initialHeight={560}
     >
       <div className="settings-modal">
         <label className="settings-modal__label" htmlFor="sessions-dir">
@@ -180,6 +187,13 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
           </button>
         </div>
         {originError && <p className="settings-modal__error">{originError}</p>}
+
+        <AcceptedClients
+          clients={clients}
+          authEnabled={authEnabled}
+          authSource={authSource}
+          onClientsChanged={setClients}
+        />
 
         <div className="settings-modal__actions">
           <button

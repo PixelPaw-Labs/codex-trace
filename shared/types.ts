@@ -332,10 +332,34 @@ export interface CodexSessionInfo {
   mentioned_thread_ids: string[];
 }
 
+/** A registered API client. Never carries a credential. */
+export interface ApiClient {
+  id: string;
+  name: string;
+  /** Registered automatically (`web-ui`); its credential lives in a file. */
+  builtin: boolean;
+  /** Unix seconds. */
+  created_at: number;
+  /** Credentials issued before this are rejected. Bumped by a reissue. */
+  issued_at: number;
+  revoked_at?: number | null;
+}
+
+/** A freshly minted credential, shown once and never stored. */
+export interface IssuedCredential {
+  client: ApiClient;
+  credential: string;
+}
+
 export interface SettingsResponse {
   sessions_dir: string | null;
   default_dir: string;
   allowed_origins: string[];
+  /** False only under `CODEXTRACE_API_AUTH=off`. */
+  api_auth_enabled: boolean;
+  /** `"file"`, `"ephemeral"`, or `"disabled"`. */
+  api_auth_source: string;
+  clients: ApiClient[];
 }
 
 export type ViewState = "picker" | "list" | "detail";

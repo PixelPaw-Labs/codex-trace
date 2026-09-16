@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { isTauri } from "./isTauri";
 import { API_BASE } from "./config";
+import { authHeaders } from "./apiToken";
 
 interface Route {
   method?: "POST";
@@ -10,6 +11,25 @@ interface Route {
 
 const routes: Record<string, Route> = {
   get_settings: { path: "/api/settings" },
+  set_allowed_origins: {
+    method: "POST",
+    path: "/api/settings/origins",
+    body: (a) => ({ origins: a.origins ?? [] }),
+  },
+  list_clients: { path: "/api/clients" },
+  register_client: {
+    method: "POST",
+    path: "/api/clients",
+    body: (a) => ({ name: a.name }),
+  },
+  reissue_client: {
+    method: "POST",
+    path: (a) => `/api/clients/${encodeURIComponent(String(a.id))}/reissue`,
+  },
+  revoke_client: {
+    method: "POST",
+    path: (a) => `/api/clients/${encodeURIComponent(String(a.id))}/revoke`,
+  },
   set_sessions_dir: {
     method: "POST",
     path: "/api/settings/dir",
@@ -42,7 +62,13 @@ const routes: Record<string, Route> = {
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    // Sends the HttpOnly credential cookie the server set on the HTML shell,
+    // which is what the Docker same-origin bundle authenticates with. Not
+    // "include": a cross-origin caller (the dev server) uses the header carrier
+    // instead, and a credentialed cross-origin request would need the API to
+    // allow credentials, which it deliberately does not.
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...init?.headers },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));

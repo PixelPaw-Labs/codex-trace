@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
+mod auth;
+mod clients;
 mod commands;
 mod http_api;
+mod jwt;
 mod parser;
 mod settings;
 mod state;
@@ -24,13 +27,13 @@ pub fn run() {
     // dominant cause of high CPU usage in Docker containers.
     if headless {
         eprintln!("Headless mode: HTTP API on http://127.0.0.1:11424");
-        let app_state = Arc::new(state::AppState::new());
+        let app_state = Arc::new(state::AppState::new(auth::resolve_auth()));
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(http_api::start_http_server_headless(app_state));
         return;
     }
 
-    let app_state = Arc::new(state::AppState::new());
+    let app_state = Arc::new(state::AppState::new(auth::resolve_auth()));
 
     let mut builder = tauri::Builder::default();
 
@@ -61,6 +64,10 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::set_sessions_dir,
             commands::cors::set_allowed_origins,
+            commands::clients::list_clients,
+            commands::clients::register_client,
+            commands::clients::reissue_client,
+            commands::clients::revoke_client,
             switch_to_browser,
         ])
         .setup(move |app| {

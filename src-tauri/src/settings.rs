@@ -12,9 +12,34 @@ pub struct Settings {
     pub allowed_origins: Vec<String>,
 }
 
+/// Env var that relocates the whole config root, so a test run never touches a
+/// developer's real settings, signing key or client registry.
+pub const ENV_CONFIG_DIR: &str = "CODEXTRACE_CONFIG_DIR";
+
+/// The app's config root — `$CODEXTRACE_CONFIG_DIR` when set, else
+/// `<OS config dir>/codex-trace`. `None` when the OS has no config dir and no
+/// override is given.
+pub fn config_root() -> Option<PathBuf> {
+    config_root_from(std::env::var(ENV_CONFIG_DIR).ok(), dirs::config_dir())
+}
+
+/// Pure core of [`config_root`] for tests.
+pub fn config_root_from(
+    override_dir: Option<String>,
+    os_config: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => os_config.map(|c| c.join("codex-trace")),
+    }
+}
+
 fn settings_path() -> Result<PathBuf, String> {
-    let config = dirs::config_dir().ok_or("no config directory")?;
-    Ok(config.join("codex-trace").join("settings.json"))
+    let root = config_root().ok_or("no config directory")?;
+    Ok(root.join("settings.json"))
 }
 
 pub fn load_settings() -> Settings {

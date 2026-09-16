@@ -31,7 +31,12 @@ axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.7", features = ["cors", "fs"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 indexmap = { version = "2", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.10"
+subtle = "2"
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
 zstd = "0.13"
 regex = "1"
 
@@ -49,3 +54,4 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

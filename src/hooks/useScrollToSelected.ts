@@ -12,12 +12,20 @@ import { useRef, useEffect } from "react";
  * `scrollTop` cannot reach an ancestor; when there is no dedicated scroll
  * container we do nothing rather than risk scrolling the shell.
  */
-export function useScrollToSelected(dep: number) {
+export function useScrollToSelected(selected: number) {
   const ref = useRef<HTMLDivElement>(null);
+  // The selection this hook last scrolled for. Callers move `ref` onto whichever
+  // item is selected and refs are not reactive, so the selected index is the
+  // signal that the ref now points somewhere else — and the effect reads it
+  // rather than merely listing it.
+  const scrolledFor = useRef<number | null>(null);
 
   useEffect(() => {
+    if (scrolledFor.current === selected) return;
+
     const el = ref.current;
     if (!el) return;
+    scrolledFor.current = selected;
 
     let container = el.parentElement;
     while (container && container !== document.body) {
@@ -43,7 +51,7 @@ export function useScrollToSelected(dep: number) {
     } else if (elRect.bottom > containerRect.bottom) {
       container.scrollTop += elRect.bottom - containerRect.bottom;
     }
-  }, [dep]);
+  }, [selected]);
 
   return ref;
 }

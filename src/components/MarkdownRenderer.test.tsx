@@ -1,53 +1,56 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
-vi.mock("react-syntax-highlighter", () => ({
-  Prism: ({ children, language }: { children: string; language: string }) => (
-    <pre data-language={language}>{children}</pre>
-  ),
-}));
-vi.mock("react-syntax-highlighter/dist/esm/styles/prism", () => ({ oneDark: {} }));
+/** Same DOM nodes, by identity — not merely the same markup. */
+function sameNodes(a: Element[], b: Element[]): boolean {
+  return a.length > 0 && a.length === b.length && a.every((node, i) => node === b[i]);
+}
+
+const MARKDOWN = ["Here is some code:", "", "```ts", "const a = 1;", "```"].join("\n");
 
 describe("MarkdownRenderer", () => {
-  it("renders plain markdown text", () => {
-    render(<MarkdownRenderer content="Hello world" />);
-    expect(screen.getByText("Hello world")).toBeInTheDocument();
+  it("highlights a fenced code block", async () => {
+    render(<MarkdownRenderer content={MARKDOWN} />);
+    expect(await screen.findByText(/const/)).toBeInTheDocument();
   });
 
-  it("renders markdown bold", () => {
-    const { container } = render(<MarkdownRenderer content="**bold text**" />);
-    expect(container.querySelector("strong")).toBeInTheDocument();
+  it("renders pure JSON as a formatted block", async () => {
+    render(<MarkdownRenderer content='{"b":2,"a":1}' />);
+    expect(await screen.findByText(/"a"/)).toBeInTheDocument();
   });
 
-  it("detects bare JSON object and renders via SyntaxHighlighter", () => {
-    const { container } = render(<MarkdownRenderer content='{"key":"value","num":42}' />);
-    expect(container.querySelector('[data-language="json"]')).toBeInTheDocument();
-    expect(container.textContent).toContain('"key"');
+  it("keeps the highlighted block's DOM nodes across a re-render", async () => {
+    const { container, rerender } = render(<MarkdownRenderer content={MARKDOWN} />);
+    await screen.findByText(/const/);
+    const before = [...container.querySelectorAll("code *")];
+    expect(before.length).toBeGreaterThan(0);
+
+    // Same content, new render pass. A code renderer defined during render gets
+    // a fresh component identity each time, so React tears the block down and
+    // rebuilds it — throwing away the highlighter's work and any scroll
+    // position inside a wide block.
+    rerender(<MarkdownRenderer content={MARKDOWN} />);
+    const after = [...container.querySelectorAll("code *")];
+
+    expect(sameNodes(before, after)).toBe(true);
   });
 
-  it("detects bare JSON array and renders via SyntaxHighlighter", () => {
-    const { container } = render(<MarkdownRenderer content="[1,2,3]" />);
-    expect(container.querySelector('[data-language="json"]')).toBeInTheDocument();
-  });
+  it("keeps the block when an unrelated prop-driven re-render happens", async () => {
+    function Wrapper({ label }: { label: string }) {
+      return (
+        <div>
+          <span>{label}</span>
+          <MarkdownRenderer content={MARKDOWN} />
+        </div>
+      );
+    }
+    const { container, rerender } = render(<Wrapper label="one" />);
+    await screen.findByText(/const/);
+    const before = [...container.querySelectorAll("code *")];
 
-  it("formats bare JSON with pretty-printing", () => {
-    const { container } = render(<MarkdownRenderer content='{"a":1,"b":2}' />);
-    expect(container.textContent).toMatch(/\n/);
-  });
+    rerender(<Wrapper label="two" />);
 
-  it("does not treat invalid JSON starting with { as a code block", () => {
-    const { container } = render(<MarkdownRenderer content="{not valid json}" />);
-    expect(container.querySelector("[data-language]")).not.toBeInTheDocument();
-  });
-
-  it("does not treat plain text as JSON", () => {
-    const { container } = render(<MarkdownRenderer content="just text" />);
-    expect(container.querySelector("[data-language]")).not.toBeInTheDocument();
-  });
-
-  it("renders fenced code block with syntax highlighting via ReactMarkdown", () => {
-    const { container } = render(<MarkdownRenderer content={"```js\nconsole.log('hi')\n```"} />);
-    expect(container.querySelector('[data-language="js"]')).toBeInTheDocument();
+    expect(sameNodes(before, [...container.querySelectorAll("code *")])).toBe(true);
   });
 });

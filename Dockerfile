@@ -38,6 +38,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json tsconfig.node.json vite.config.ts index.html ./
+COPY bin ./bin
 COPY src ./src
 COPY shared ./shared
 

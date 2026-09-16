@@ -12,6 +12,9 @@ function settings(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
     sessions_dir: "/home/user/.codex/sessions",
     default_dir: "/home/user/.codex/sessions",
     allowed_origins: [],
+    api_auth_enabled: true,
+    api_auth_source: "file",
+    clients: [],
     ...overrides,
   };
 }

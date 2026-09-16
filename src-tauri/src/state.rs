@@ -1,7 +1,11 @@
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+use crate::auth::{AuthMode, ClientIdentity, ResolvedAuth};
+use crate::clients::{self, Client, ClientRegistry};
+use crate::jwt::Claims;
 use crate::parser::discover::CodexSessionInfo;
 use crate::settings::Settings;
 use crate::watcher::WatcherHandle;
@@ -21,26 +25,267 @@ struct SessionsCache {
 
 const SESSIONS_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// The on-disk registry, when it is safe to adopt at runtime: the file must
+/// exist, parse, and still know every built-in client. A missing or emptied
+/// `clients.json` (someone "resetting" while the server runs) or a half-edited
+/// one must not lock every client out; startup handles those cases instead.
+fn load_adoptable_registry(root: &Path) -> Option<ClientRegistry> {
+    let path = crate::auth::registry_path(root);
+    if !path.exists() {
+        return None;
+    }
+    let on_disk = ClientRegistry::load(&path).ok()?;
+    clients::BUILTIN_NAMES
+        .iter()
+        .all(|name| on_disk.find_by_name(name).is_some())
+        .then_some(on_disk)
+}
+
 pub struct AppState {
     pub session_watcher: Mutex<Option<WatcherHandle>>,
     pub picker_watcher: Mutex<Option<WatcherHandle>>,
     pub settings: Mutex<Settings>,
+    /// Live client-verification mode (see `crate::auth`), read on every request.
+    pub auth: RwLock<AuthMode>,
+    clients: RwLock<ClientRegistry>,
+    web_ui_credential: RwLock<Option<String>>,
+    config_root: RwLock<Option<PathBuf>>,
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
     sessions_cache: Mutex<Option<SessionsCache>>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    /// Everything auth-related is injected (see `crate::auth::resolve_auth`) so
+    /// construction itself never touches the filesystem.
+    pub fn new(resolved: ResolvedAuth) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             session_watcher: Mutex::new(None),
             picker_watcher: Mutex::new(None),
             settings: Mutex::new(crate::settings::load_settings()),
+            auth: RwLock::new(resolved.mode),
+            clients: RwLock::new(resolved.registry),
+            web_ui_credential: RwLock::new(resolved.web_ui_credential),
+            config_root: RwLock::new(resolved.config_root),
             watched_session_ongoing: Mutex::new(None),
             event_tx,
             sessions_cache: Mutex::new(None),
         }
+    }
+
+    /// Test constructor: the given mode, the built-in clients registered in
+    /// memory (with a `web-ui` credential when enabled), and **no** config root
+    /// — so nothing a test does can reach a developer's real secrets. Tests that
+    /// need persistence point at a temp dir via [`set_config_root`](Self::set_config_root).
+    #[cfg(test)]
+    pub fn for_tests(mode: AuthMode) -> Self {
+        let mut registry = ClientRegistry::default();
+        registry.ensure_builtins(clients::now());
+        let web_ui_credential = mode.key().and_then(|key| {
+            registry
+                .find_by_name(clients::WEB_UI)
+                .map(|c| crate::auth::issue_credential(c, key, c.issued_at))
+        });
+        Self::new(ResolvedAuth {
+            mode,
+            registry,
+            web_ui_credential,
+            config_root: None,
+            warnings: vec![],
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_config_root(&self, root: Option<PathBuf>) {
+        if let Ok(mut g) = self.config_root.write() {
+            *g = root;
+        }
+    }
+
+    /// `Ok(None)` when nothing is persisted (ephemeral key, tests). A poisoned
+    /// lock is an error rather than a silent "nothing to persist", so a mutation
+    /// can never report success without having been saved.
+    fn config_root(&self) -> Result<Option<PathBuf>, String> {
+        self.config_root
+            .read()
+            .map(|g| g.clone())
+            .map_err(|_| "config root lock poisoned".to_string())
+    }
+
+    /// Clone of the live auth mode, for building `SettingsResponse`.
+    pub fn auth_snapshot(&self) -> AuthMode {
+        self.auth
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// The accepted clients (never their credentials).
+    pub fn clients_snapshot(&self) -> Vec<Client> {
+        self.clients
+            .read()
+            .map(|g| g.clients.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clients.clone())
+    }
+
+    pub fn web_ui_credential(&self) -> Option<String> {
+        self.web_ui_credential.read().ok().and_then(|g| g.clone())
+    }
+
+    fn signing_key(&self) -> Result<Vec<u8>, String> {
+        self.auth
+            .read()
+            .map_err(|e| e.to_string())?
+            .key()
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                "API client verification is disabled (CODEXTRACE_API_AUTH=off); there are no \
+                 client credentials to manage"
+                    .to_string()
+            })
+    }
+
+    /// Replace the in-memory registry with the on-disk one when they differ.
+    /// Must be called with the `clients` write guard held, so the compare and
+    /// the swap cannot interleave with a mutation (otherwise a concurrent revoke
+    /// could be undone by a refresh that loaded the file a moment before it was
+    /// saved). Also re-reads the `web-ui` credential file, which follows the
+    /// registry. Returns whether anything changed.
+    fn adopt_from_disk_locked(&self, guard: &mut ClientRegistry, root: &Path) -> bool {
+        let Some(on_disk) = load_adoptable_registry(root) else {
+            return false;
+        };
+        if *guard == on_disk {
+            return false;
+        }
+        *guard = on_disk;
+        let web_ui =
+            crate::auth::read_trimmed(&crate::auth::builtin_credential_path(root, clients::WEB_UI));
+        if let Ok(mut g) = self.web_ui_credential.write() {
+            *g = web_ui;
+        }
+        true
+    }
+
+    /// Apply `mutate` to the registry and persist the result before it becomes
+    /// visible. Under the write lock the on-disk registry is adopted first, so a
+    /// change made by another codex-trace process sharing the config dir (a
+    /// revoke, say) is not overwritten by this one's stale copy. If the save
+    /// fails, memory is left exactly as it was.
+    fn mutate_registry<T>(
+        &self,
+        mutate: impl FnOnce(&mut ClientRegistry) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let root = self.config_root()?;
+        let mut guard = self.clients.write().map_err(|e| e.to_string())?;
+        if let Some(root) = &root {
+            self.adopt_from_disk_locked(&mut guard, root);
+        }
+        let mut next = guard.clone();
+        let out = mutate(&mut next)?;
+        if let Some(root) = &root {
+            next.save(&crate::auth::registry_path(root))?;
+        }
+        *guard = next;
+        Ok(out)
+    }
+
+    /// Keep a built-in client's credential file (and the live `web-ui` cookie
+    /// value) in step with a reissue or revocation.
+    fn sync_builtin_credential(&self, client: &Client, credential: Option<&str>) {
+        if !client.builtin {
+            return;
+        }
+        if let Ok(Some(root)) = self.config_root() {
+            let path = crate::auth::builtin_credential_path(&root, &client.name);
+            match credential {
+                Some(c) => {
+                    if let Err(e) =
+                        crate::auth::write_private_atomic(&path, format!("{c}\n").as_bytes())
+                    {
+                        eprintln!(
+                            "HTTP API: WARNING — could not write {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        if client.name == clients::WEB_UI {
+            if let Ok(mut g) = self.web_ui_credential.write() {
+                *g = credential.map(str::to_owned);
+            }
+        }
+    }
+
+    /// Register a new client and mint its credential (returned once).
+    pub fn register_client(&self, name: &str) -> Result<(Client, String), String> {
+        let key = self.signing_key()?;
+        let client = self.mutate_registry(|r| r.register(name, clients::now()))?;
+        let credential = crate::auth::issue_credential(&client, &key, client.issued_at);
+        Ok((client, credential))
+    }
+
+    /// Reissue: mint a new credential and invalidate every older one.
+    pub fn reissue_client(&self, id: uuid::Uuid) -> Result<(Client, String), String> {
+        let key = self.signing_key()?;
+        let client = self.mutate_registry(|r| r.reissue(id, clients::now()))?;
+        let credential = crate::auth::issue_credential(&client, &key, client.issued_at);
+        self.sync_builtin_credential(&client, Some(&credential));
+        Ok((client, credential))
+    }
+
+    /// Revoke: every credential of this client stops working immediately.
+    pub fn revoke_client(&self, id: uuid::Uuid) -> Result<Client, String> {
+        self.signing_key()?;
+        let client = self.mutate_registry(|r| r.revoke(id, clients::now()))?;
+        self.sync_builtin_credential(&client, None);
+        Ok(client)
+    }
+
+    fn check_registry(&self, id: uuid::Uuid, iat: i64) -> Option<ClientIdentity> {
+        let registry = self.clients.read().ok()?;
+        let client = registry.find(id)?;
+        if client.is_revoked() || iat < client.issued_at {
+            return None;
+        }
+        Some(ClientIdentity {
+            id,
+            name: client.name.clone(),
+        })
+    }
+
+    /// Map verified claims to a live client. On a miss, re-read the registry
+    /// from disk once — another codex-trace process sharing the config dir may
+    /// have registered or reissued this client — and retry. Called by the auth
+    /// middleware, so the happy path never touches the disk.
+    pub fn authenticate(&self, claims: &Claims) -> Option<ClientIdentity> {
+        let id = uuid::Uuid::parse_str(&claims.sub).ok()?;
+        if let Some(identity) = self.check_registry(id, claims.iat) {
+            return Some(identity);
+        }
+        if self.refresh_clients_from_disk() {
+            return self.check_registry(id, claims.iat);
+        }
+        None
+    }
+
+    /// Adopt the on-disk registry (and the `web-ui` credential file) when they
+    /// differ from memory. Returns whether anything changed. No-op without a
+    /// config root, and never adopts a missing, unparsable or built-in-less file
+    /// (see [`load_adoptable_registry`]).
+    pub fn refresh_clients_from_disk(&self) -> bool {
+        let Ok(Some(root)) = self.config_root() else {
+            return false;
+        };
+        let Ok(mut guard) = self.clients.write() else {
+            return false;
+        };
+        self.adopt_from_disk_locked(&mut guard, &root)
     }
 
     pub fn stop_session_watcher(&self) -> Result<(), String> {
@@ -127,7 +372,7 @@ mod tests {
     use super::*;
 
     fn make_state() -> AppState {
-        AppState::new()
+        AppState::for_tests(AuthMode::Disabled)
     }
 
     #[test]

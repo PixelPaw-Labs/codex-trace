@@ -10,6 +10,10 @@ permissions = [
   "allow-get-settings",
   "allow-set-sessions-dir",
   "allow-set-allowed-origins",
+  "allow-list-clients",
+  "allow-register-client",
+  "allow-reissue-client",
+  "allow-revoke-client",
   "allow-switch-to-browser",
 ]
 
@@ -57,6 +61,26 @@ commands.allow = ["set_sessions_dir"]
 identifier = "allow-set-allowed-origins"
 description = "Allow setting the extra CORS-allowed origins"
 commands.allow = ["set_allowed_origins"]
+
+[[permission]]
+identifier = "allow-list-clients"
+description = "Allow listing the accepted API clients"
+commands.allow = ["list_clients"]
+
+[[permission]]
+identifier = "allow-register-client"
+description = "Allow registering a new API client"
+commands.allow = ["register_client"]
+
+[[permission]]
+identifier = "allow-reissue-client"
+description = "Allow reissuing an API client's credential"
+commands.allow = ["reissue_client"]
+
+[[permission]]
+identifier = "allow-revoke-client"
+description = "Allow revoking an API client"
+commands.allow = ["revoke_client"]
 
 [[permission]]
 identifier = "allow-switch-to-browser"

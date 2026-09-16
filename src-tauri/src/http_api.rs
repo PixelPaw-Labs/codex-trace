@@ -1,8 +1,9 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{header, HeaderValue, Method};
+use axum::extract::{Extension, Path as UrlPath, State};
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use axum::middleware::from_fn_with_state;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -14,6 +15,7 @@ use tokio_stream::StreamExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
+use crate::auth;
 use crate::state::AppState;
 use crate::watcher::{start_picker_watcher, start_session_watcher};
 
@@ -77,7 +79,7 @@ fn parse_extra_origins(raw: Option<String>) -> Vec<String> {
 /// (comma-separated). Read once at startup because env vars cannot change at
 /// runtime. The *live* half (origins configured from Settings) is checked
 /// per-request in `build_cors`'s predicate.
-fn resolve_allowed_origins() -> Vec<String> {
+pub(crate) fn resolve_allowed_origins() -> Vec<String> {
     let mut origins: Vec<String> = DEFAULT_ALLOWED_ORIGINS
         .iter()
         .map(|s| s.to_string())
@@ -120,7 +122,15 @@ fn build_cors(app_state: Arc<AppState>) -> CorsLayer {
             },
         ))
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE])
+        // The credential header has to be allowlisted or the preflight for
+        // every dev-mode call fails: the dev server is a different origin from
+        // the API, so `npm run dev` in a browser cannot authenticate at all.
+        // Deliberately no `allow_credentials`: a cross-origin caller uses the
+        // header (or `?token=`) carrier, never the cookie.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static(crate::auth::TOKEN_HEADER),
+        ])
 }
 
 /// Start the HTTP server from a Tauri AppHandle (desktop/web mode).
@@ -142,27 +152,57 @@ pub async fn start_http_server_headless(state: Arc<AppState>) {
     .await;
 }
 
-async fn run_server(state: Arc<HttpState>) {
+/// Assemble the API router, the optional static-asset fallback, and the
+/// middleware around them.
+///
+/// Layer order matters:
+/// - `route_layer` applies the auth middleware to the registered API routes
+///   only — the static fallback stays public (the SPA shell must load before it
+///   can authenticate) and unknown paths still 404 rather than 401.
+/// - The static fallback gets its own middleware that hands the credential to
+///   the same-origin browser UI as a cookie (see `auth::attach_credential_cookie`).
+/// - CORS is added last, so it runs first: preflights are answered before the
+///   auth check, and 401 responses carry CORS headers so the browser can read
+///   the `{"error"}` body.
+fn build_router(state: Arc<HttpState>, static_dir: Option<String>) -> Router {
     let mut router = Router::new()
         .route("/api/settings", get(api_get_settings))
         .route("/api/settings/dir", post(api_set_sessions_dir))
         .route("/api/settings/origins", post(api_set_allowed_origins))
+        .route(
+            "/api/clients",
+            get(api_list_clients).post(api_register_client),
+        )
+        .route("/api/clients/{id}/reissue", post(api_reissue_client))
+        .route("/api/clients/{id}/revoke", post(api_revoke_client))
+        .route("/api/whoami", get(api_whoami))
         .route("/api/sessions", post(api_discover_sessions))
         .route("/api/session/load", post(api_load_session))
         .route("/api/session/watch", post(api_watch_session))
         .route("/api/session/unwatch", post(api_unwatch_session))
         .route("/api/picker/watch", post(api_watch_picker))
         .route("/api/picker/unwatch", post(api_unwatch_picker))
-        .route("/api/events", get(api_events));
+        .route("/api/events", get(api_events))
+        .route_layer(from_fn_with_state(state.clone(), auth::require_client));
 
-    if let Some(dir) = resolve_static_dir() {
+    if let Some(dir) = static_dir {
         let serve = ServeDir::new(&dir).append_index_html_on_directories(true);
-        router = router.fallback_service(serve);
+        let static_ui = Router::new()
+            .fallback_service(serve)
+            .layer(from_fn_with_state(
+                state.clone(),
+                auth::attach_credential_cookie,
+            ));
+        router = router.fallback_service(static_ui);
         eprintln!("HTTP API: serving static assets from {dir}");
     }
 
     let cors_state = state.app_state.clone();
-    let router = router.layer(build_cors(cors_state)).with_state(state);
+    router.layer(build_cors(cors_state)).with_state(state)
+}
+
+async fn run_server(state: Arc<HttpState>) {
+    let router = build_router(state, resolve_static_dir());
 
     let (host, port) = resolve_bind_addr();
     let addr = format!("{host}:{port}");
@@ -188,7 +228,7 @@ fn app_state(state: &HttpState) -> &AppState {
     &state.app_state
 }
 
-fn err_response(status: axum::http::StatusCode, msg: String) -> Response {
+pub(crate) fn err_response(status: axum::http::StatusCode, msg: String) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
@@ -216,7 +256,11 @@ async fn api_get_settings(State(state): State<Arc<HttpState>>) -> Response {
             return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     };
-    ok_json(&crate::commands::settings::build_settings_response(&guard))
+    ok_json(&crate::commands::settings::build_settings_response(
+        &guard,
+        &app_state.auth_snapshot(),
+        app_state.clients_snapshot(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -256,7 +300,11 @@ async fn api_set_sessions_dir(
     if let Err(e) = crate::settings::save_settings(&guard) {
         return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    ok_json(&crate::commands::settings::build_settings_response(&guard))
+    ok_json(&crate::commands::settings::build_settings_response(
+        &guard,
+        &app_state.auth_snapshot(),
+        app_state.clients_snapshot(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -285,7 +333,80 @@ async fn api_set_allowed_origins(
     if let Err(e) = crate::settings::save_settings(&guard) {
         return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    ok_json(&crate::commands::settings::build_settings_response(&guard))
+    ok_json(&crate::commands::settings::build_settings_response(
+        &guard,
+        &app_state.auth_snapshot(),
+        app_state.clients_snapshot(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Accepted clients
+// ---------------------------------------------------------------------------
+
+/// Registered clients — never their credentials.
+async fn api_list_clients(State(state): State<Arc<HttpState>>) -> Response {
+    ok_json(&crate::commands::clients::list_clients_impl(app_state(
+        &state,
+    )))
+}
+
+#[derive(Deserialize)]
+struct RegisterClientBody {
+    name: String,
+}
+
+/// Register a client and return its credential exactly once.
+async fn api_register_client(
+    State(state): State<Arc<HttpState>>,
+    Json(body): Json<RegisterClientBody>,
+) -> Response {
+    match crate::commands::clients::register_client_impl(app_state(&state), &body.name) {
+        Ok(issued) => ok_json(&issued),
+        Err(e) => err_response(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// Reissue a client's credential, invalidating every older one. When the client
+/// is `web-ui` the new credential is also set as the same-origin cookie so the
+/// Docker browser tab that asked keeps working.
+async fn api_reissue_client(
+    State(state): State<Arc<HttpState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    match crate::commands::clients::reissue_client_impl(app_state(&state), &id) {
+        Ok(issued) => {
+            let mut response = ok_json(&issued);
+            if issued.client.name == crate::clients::WEB_UI {
+                if let Some(cookie) = auth::credential_cookie_header(&issued.credential) {
+                    response.headers_mut().append(header::SET_COOKIE, cookie);
+                }
+            }
+            response
+        }
+        Err(e) => err_response(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_revoke_client(
+    State(state): State<Arc<HttpState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    match crate::commands::clients::revoke_client_impl(app_state(&state), &id) {
+        Ok(client) => ok_json(&client),
+        Err(e) => err_response(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// Who is calling? `client` is `null` only when verification is disabled
+/// (`CODEXTRACE_API_AUTH=off`); every other caller was identified by the
+/// middleware.
+async fn api_whoami(identity: Option<Extension<auth::ClientIdentity>>) -> Response {
+    let identity = identity.map(|Extension(i)| i);
+    ok_json(&serde_json::json!({
+        "auth_enabled": identity.is_some(),
+        "client": identity,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +672,292 @@ mod tests {
 
     #[test]
     fn build_cors_constructs_without_panicking() {
-        let _ = build_cors(Arc::new(AppState::new()));
+        let _ = build_cors(Arc::new(AppState::for_tests(auth::AuthMode::Disabled)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Client verification (router level)
+    // -----------------------------------------------------------------------
+
+    mod client_auth {
+        use super::*;
+        use crate::auth::{AuthMode, KeySource, TOKEN_COOKIE, TOKEN_HEADER};
+        use crate::clients::WEB_UI;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+        fn enabled_state() -> Arc<HttpState> {
+            Arc::new(HttpState {
+                app_state: Arc::new(AppState::for_tests(AuthMode::Enabled {
+                    key: KEY.to_vec(),
+                    source: KeySource::Ephemeral,
+                })),
+                app: None,
+            })
+        }
+
+        fn disabled_state() -> Arc<HttpState> {
+            Arc::new(HttpState {
+                app_state: Arc::new(AppState::for_tests(AuthMode::Disabled)),
+                app: None,
+            })
+        }
+
+        fn router_of(state: &Arc<HttpState>) -> Router {
+            build_router(state.clone(), None)
+        }
+
+        fn get_with(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+            let mut b = Request::builder().uri(uri);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            b.body(Body::empty()).unwrap()
+        }
+
+        async fn status_of(router: Router, req: Request<Body>) -> StatusCode {
+            router.oneshot(req).await.unwrap().status()
+        }
+
+        async fn json_of(router: Router, req: Request<Body>) -> serde_json::Value {
+            let body = router.oneshot(req).await.unwrap().into_body();
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        #[tokio::test]
+        async fn an_unauthenticated_api_request_is_rejected() {
+            let state = enabled_state();
+            let status = status_of(router_of(&state), get_with("/api/settings", &[])).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_rejection_names_where_to_get_a_credential() {
+            let state = enabled_state();
+            let json = json_of(router_of(&state), get_with("/api/settings", &[])).await;
+            let msg = json["error"].as_str().unwrap();
+            assert!(msg.contains("Accepted clients"), "{msg}");
+            assert!(msg.contains("X-CodexTrace-Token"), "{msg}");
+        }
+
+        #[tokio::test]
+        async fn every_carrier_authenticates_the_web_ui_client() {
+            let state = enabled_state();
+            let cred = state.app_state.web_ui_credential().unwrap();
+
+            for req in [
+                get_with("/api/whoami", &[(TOKEN_HEADER, &cred)]),
+                get_with(
+                    "/api/whoami",
+                    &[("authorization", &format!("Bearer {cred}"))],
+                ),
+                get_with(&format!("/api/whoami?token={cred}"), &[]),
+                get_with(
+                    "/api/whoami",
+                    &[("cookie", &format!("{TOKEN_COOKIE}={cred}"))],
+                ),
+            ] {
+                let json = json_of(router_of(&state), req).await;
+                assert_eq!(json["client"]["name"], WEB_UI, "{json}");
+                assert_eq!(json["auth_enabled"], true);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_credential_signed_with_another_key_is_rejected() {
+            let state = enabled_state();
+            let forged = crate::jwt::sign(
+                &crate::jwt::Claims {
+                    sub: uuid::Uuid::new_v4().to_string(),
+                    name: WEB_UI.into(),
+                    iat: crate::clients::now(),
+                },
+                b"a-completely-different-key-0000000",
+            );
+            let status = status_of(
+                router_of(&state),
+                get_with("/api/settings", &[(TOKEN_HEADER, &forged)]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_valid_credential_for_an_unregistered_client_is_rejected() {
+            let state = enabled_state();
+            let stranger = crate::jwt::sign(
+                &crate::jwt::Claims {
+                    sub: uuid::Uuid::new_v4().to_string(),
+                    name: "ghost".into(),
+                    iat: crate::clients::now(),
+                },
+                KEY,
+            );
+            let status = status_of(
+                router_of(&state),
+                get_with("/api/settings", &[(TOKEN_HEADER, &stranger)]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn revoking_one_client_does_not_lock_out_another() {
+            let state = enabled_state();
+            let keep = state.app_state.register_client("keeper").unwrap().1;
+            let (drop_client, drop_cred) = state.app_state.register_client("dropper").unwrap();
+
+            state.app_state.revoke_client(drop_client.id).unwrap();
+
+            assert_eq!(
+                status_of(
+                    router_of(&state),
+                    get_with("/api/settings", &[(TOKEN_HEADER, &drop_cred)])
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+            );
+            assert_eq!(
+                status_of(
+                    router_of(&state),
+                    get_with("/api/settings", &[(TOKEN_HEADER, &keep)])
+                )
+                .await,
+                StatusCode::OK,
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reissue_kills_the_previous_credential_immediately() {
+            let state = enabled_state();
+            let (client, first) = state.app_state.register_client("rotator").unwrap();
+            let (_, second) = state.app_state.reissue_client(client.id).unwrap();
+
+            assert_eq!(
+                status_of(
+                    router_of(&state),
+                    get_with("/api/settings", &[(TOKEN_HEADER, &first)])
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+            );
+            assert_eq!(
+                status_of(
+                    router_of(&state),
+                    get_with("/api/settings", &[(TOKEN_HEADER, &second)])
+                )
+                .await,
+                StatusCode::OK,
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cors_preflight_is_never_blocked_by_the_auth_check() {
+            let state = enabled_state();
+            let req = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/settings")
+                .header("origin", "http://localhost:1420")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap();
+            assert_ne!(
+                status_of(router_of(&state), req).await,
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+
+        /// The dev server is a different origin from the API, so the browser
+        /// preflights every call that carries the credential header. If the
+        /// header is not allowlisted the preflight fails and `npm run dev`
+        /// cannot authenticate at all.
+        #[tokio::test]
+        async fn the_preflight_allows_the_credential_header() {
+            let state = enabled_state();
+            let req = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/settings/dir")
+                .header("origin", "http://localhost:1420")
+                .header("access-control-request-method", "POST")
+                .header(
+                    "access-control-request-headers",
+                    format!("content-type,{TOKEN_HEADER}"),
+                )
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = router_of(&state).oneshot(req).await.unwrap();
+            let allowed = resp
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            assert!(allowed.contains(TOKEN_HEADER), "allowed headers: {allowed}");
+            assert!(
+                allowed.contains("content-type"),
+                "allowed headers: {allowed}"
+            );
+        }
+
+        /// A cross-origin caller authenticates with the header or `?token=`
+        /// carrier, never the cookie, so the API must not invite credentialed
+        /// cross-origin requests.
+        #[tokio::test]
+        async fn the_preflight_does_not_allow_credentials() {
+            let state = enabled_state();
+            let req = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/settings")
+                .header("origin", "http://localhost:1420")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = router_of(&state).oneshot(req).await.unwrap();
+            assert!(resp
+                .headers()
+                .get("access-control-allow-credentials")
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn an_unknown_path_is_404_not_401() {
+            let state = enabled_state();
+            let status = status_of(router_of(&state), get_with("/nope", &[])).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn verification_off_lets_every_request_through_without_an_identity() {
+            let state = disabled_state();
+            let json = json_of(router_of(&state), get_with("/api/whoami", &[])).await;
+            assert_eq!(json["auth_enabled"], false);
+            assert!(json["client"].is_null());
+        }
+
+        #[tokio::test]
+        async fn settings_report_the_auth_mode_and_clients_but_never_a_credential() {
+            let state = enabled_state();
+            let cred = state.app_state.web_ui_credential().unwrap();
+            let json = json_of(
+                router_of(&state),
+                get_with("/api/settings", &[(TOKEN_HEADER, &cred)]),
+            )
+            .await;
+
+            assert_eq!(json["api_auth_enabled"], true);
+            assert_eq!(json["api_auth_source"], "ephemeral");
+            assert_eq!(json["clients"][0]["name"], WEB_UI);
+            assert!(
+                !json.to_string().contains(&cred),
+                "the settings payload must never carry a credential"
+            );
+        }
     }
 }

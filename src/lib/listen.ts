@@ -7,6 +7,7 @@
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import { isTauri } from "./isTauri";
 import { API_BASE } from "./config";
+import { withTokenQuery } from "./apiToken";
 
 export type UnlistenFn = () => void;
 
@@ -16,7 +17,14 @@ let sseRefCount = 0;
 
 function ensureSse(): EventSource {
   if (!sseSource || sseSource.readyState === EventSource.CLOSED) {
-    sseSource = new EventSource(`${API_BASE}/api/events`);
+    // `EventSource` cannot set headers, so the credential rides in the query
+    // string; in Docker the same-origin cookie covers it and this is a no-op.
+    // `withCredentials` stays false: it only affects cross-origin requests,
+    // where the cookie is not the carrier, and turning it on would make the
+    // browser demand `Access-Control-Allow-Credentials` the API does not send.
+    sseSource = new EventSource(withTokenQuery(`${API_BASE}/api/events`), {
+      withCredentials: false,
+    });
   }
   sseRefCount++;
   return sseSource;

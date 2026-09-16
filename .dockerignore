@@ -1,0 +1,18 @@
+# Everything the image builds from source. Without these the daemon receives
+# ~9.5GB of local build output before the first instruction runs.
+node_modules
+src-tauri/target
+dist
+
+.git
+.github
+.gitignore
+
+*.log
+.DS_Store
+.vscode
+.idea
+
+docs
+screenshots
+*.md

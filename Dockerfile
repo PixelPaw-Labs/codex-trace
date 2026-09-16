@@ -88,7 +88,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dumb-init \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --home-dir /home/app --shell /bin/bash --uid 1000 app
+    && useradd --create-home --home-dir /home/app --shell /bin/bash --uid 1000 app \
+    && mkdir -p /home/app/.config /home/app/.codex/sessions \
+    && chown -R app:app /home/app/.config /home/app/.codex
 
 WORKDIR /app
 
@@ -107,10 +109,18 @@ USER app
 
 VOLUME ["/home/app/.codex/sessions"]
 
+# Keeps settings.json, the API signing secret and the issued client
+# credentials (all under XDG_CONFIG_HOME above) across container recreation.
+# A plain `docker run` without an explicit -v still gets an anonymous volume
+# here; compose users get a named one instead.
+VOLUME ["/home/app/.config"]
+
 EXPOSE 1422
 
+# /bin/sh is dash on this image and does not support the /dev/tcp redirect,
+# so invoke bash explicitly.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD /bin/sh -c 'exec 3<>/dev/tcp/127.0.0.1/${CODEXTRACE_HTTP_PORT:-1422}' || exit 1
+    CMD /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/${CODEXTRACE_HTTP_PORT:-1422}' || exit 1
 
 ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["codex-trace", "--headless"]

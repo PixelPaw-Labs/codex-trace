@@ -221,6 +221,10 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     // injected context first and the real prompt last), and event_msg.user_message always
     // wins over it regardless of ordering.
     let mut provisional_user_messages: HashSet<String> = HashSet::new();
+    // Assistant replies seen as response_items, keyed by turn. Classic rollouts carry the same
+    // text as event_msg.agent_message too, so these are only used for a turn the event stream
+    // left with no agent messages at all — Codex Desktop v0.154 emits nothing else.
+    let mut provisional_agent_messages: HashMap<String, Vec<AgentMsg>> = HashMap::new();
 
     for (index, entry) in entries.iter().enumerate() {
         if let Some(call_id) = call_id_of(entry) {
@@ -250,6 +254,8 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     &current_turn_id,
                     &mut tool_builders,
                     &mut provisional_user_messages,
+                    &mut provisional_agent_messages,
+                    index,
                 );
             }
             "turn_context" => {
@@ -264,6 +270,24 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             }
             _ => {}
         }
+    }
+
+    // Fill in assistant replies for turns the event stream left silent, and prefer the one the
+    // model marked as the answer over whichever happened to come first.
+    for (turn_id, messages) in provisional_agent_messages {
+        let Some(turn) = turns.get_mut(&turn_id) else {
+            continue;
+        };
+        if !turn.agent_messages.is_empty() {
+            continue;
+        }
+        if let Some(answer) = messages
+            .iter()
+            .find(|m| m.phase.as_deref() == Some("final_answer"))
+        {
+            turn.final_answer = Some(answer.text.clone());
+        }
+        turn.agent_messages = messages;
     }
 
     // Finalize all tool builders
@@ -850,6 +874,8 @@ fn handle_response_item(
     current_turn_id: &Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
     provisional_user_messages: &mut HashSet<String>,
+    provisional_agent_messages: &mut HashMap<String, Vec<AgentMsg>>,
+    index: usize,
 ) {
     let payload = if entry.entry_type == "response_item" {
         &entry.payload
@@ -1221,13 +1247,36 @@ fn handle_response_item(
         // Handle assistant message response_items. This includes schema-validated JSON content
         // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
         // is a JSON object rather than a plain string.
+        //
+        // Codex Desktop v0.154 stopped emitting event_msg.agent_message entirely: an assistant
+        // reply now exists only as a response_item, carrying the same `phase` the event used to.
+        // Without collecting these the turn has no agent messages at all — the list shows a
+        // blank Codex bubble and the detail view shows neither commentary nor the answer.
+        //
+        // Classic CLI rollouts record both, the same text twice, so these are only provisional:
+        // `build_turns` uses them for a turn whose event_msg stream produced nothing.
         "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+            let text = extract_item_content(payload);
+            if text.is_empty() {
+                return;
+            }
+            let phase = payload
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            provisional_agent_messages
+                .entry(tid.to_string())
+                .or_default()
+                .push(AgentMsg {
+                    text: text.clone(),
+                    phase,
+                    timestamp: entry.timestamp.clone().unwrap_or_default(),
+                    is_reasoning: false,
+                    order: index,
+                });
             if let Some(turn) = turns.get_mut(tid) {
                 if turn.final_answer.is_none() {
-                    let text = extract_item_content(payload);
-                    if !text.is_empty() {
-                        turn.final_answer = Some(text);
-                    }
+                    turn.final_answer = Some(text);
                 }
             }
         }
@@ -4729,5 +4778,79 @@ mod tests {
         assert_eq!(turns[0].agent_messages[0].text, full_text);
         assert!(turns[0].agent_messages[0].text.len() > 256 * 1024);
         assert_eq!(turns[0].final_answer.as_deref(), Some(full_text.as_str()));
+    }
+
+    // Codex Desktop v0.154 stopped emitting event_msg.agent_message. An assistant reply is
+    // now only a response_item carrying the `phase` the event used to carry, so a turn whose
+    // text is read solely from event_msg comes out completely blank.
+
+    #[test]
+    fn v0154_assistant_response_items_become_agent_messages() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-16T09:57:00Z","type":"session_meta","payload":{"id":"v0154-agent-msgs","timestamp":"2026-09-16T09:57:00Z","cli_version":"0.154.0-alpha.6.2"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the logs now."}],"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is what I found."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789552624.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 2);
+        assert_eq!(turns[0].agent_messages[0].text, "Checking the logs now.");
+        assert_eq!(
+            turns[0].agent_messages[0].phase.as_deref(),
+            Some("commentary")
+        );
+        assert!(!turns[0].agent_messages[0].is_reasoning);
+        assert_eq!(turns[0].agent_messages[1].text, "Here is what I found.");
+    }
+
+    #[test]
+    fn v0154_final_answer_comes_from_the_message_marked_as_the_answer() {
+        // The commentary arrives first, so taking whichever assistant message came first
+        // would show a "still working on it" line where the answer belongs.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-16T09:57:00Z","type":"session_meta","payload":{"id":"v0154-answer-phase","timestamp":"2026-09-16T09:57:00Z","cli_version":"0.154.0-alpha.6.2"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working on it."}],"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The answer is 42."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789552624.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns[0].final_answer.as_deref(), Some("The answer is 42."));
+    }
+
+    #[test]
+    fn a_classic_rollout_does_not_show_its_agent_messages_twice() {
+        // Classic CLI rollouts record the same reply twice: once as the event the TUI
+        // rendered and once as the item sent to the model.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-16T09:57:00Z","type":"session_meta","payload":{"id":"classic-dup","timestamp":"2026-09-16T09:57:00Z","cli_version":"0.150.0"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:02Z","type":"event_msg","payload":{"type":"agent_message","message":"The answer is 42.","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The answer is 42."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789552624.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].final_answer.as_deref(), Some("The answer is 42."));
+    }
+
+    #[test]
+    fn v0154_assistant_messages_keep_their_place_among_the_tool_calls() {
+        // The detail view interleaves messages and tool calls by `order`, so a message that
+        // came back with order 0 would be dragged to the top of the turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-16T09:57:00Z","type":"session_meta","payload":{"id":"v0154-order","timestamp":"2026-09-16T09:57:00Z","cli_version":"0.154.0-alpha.6.2"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}],"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}],"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-09-16T09:57:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789552624.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert!(
+            turns[0].agent_messages[0].order < turns[0].agent_messages[1].order,
+            "each message must carry its own position in the stream"
+        );
     }
 }

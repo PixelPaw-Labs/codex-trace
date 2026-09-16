@@ -391,4 +391,19 @@ export interface SettingsResponse {
   clients: ApiClient[];
 }
 
+/** How many top-level sessions a date has, for the sidebar's group headers. Counted over
+ * every matching session, so a header is right before the rows under it have arrived. */
+export interface DateGroupCount {
+  date_group: string;
+  count: number;
+}
+
+/** One batch of the session list. `total` and `groups` describe the whole match, not the
+ * batch, so the UI knows how much more there is to ask for. */
+export interface SessionPage {
+  sessions: CodexSessionInfo[];
+  total: number;
+  groups: DateGroupCount[];
+}
+
 export type ViewState = "picker" | "list" | "detail";

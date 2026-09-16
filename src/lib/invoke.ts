@@ -45,7 +45,12 @@ export const routes: Record<string, Route> = {
   list_sessions: {
     method: "POST",
     path: "/api/sessions",
-    body: (a) => ({ dir: a.sessionsDir as string }),
+    body: (a) => ({
+      dir: a.sessionsDir as string,
+      offset: a.offset ?? 0,
+      limit: a.limit ?? null,
+      query: a.query ?? null,
+    }),
   },
   load_session: {
     method: "POST",

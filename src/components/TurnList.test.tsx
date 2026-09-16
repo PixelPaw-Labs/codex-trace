@@ -1,11 +1,16 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { forwardRef, useImperativeHandle, type ReactNode, type Ref } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { forwardRef, useEffect, useImperativeHandle, type ReactNode, type Ref } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TurnSummary } from "../../shared/types";
 
 // react-virtuoso measures rows against real geometry, which jsdom does not
 // provide, so it would render nothing. Render every row instead — these tests
 // are about what a row shows, not about which rows are on screen.
+const scrollToIndex = vi.fn();
+/** The `rangeChanged` callback the component handed to Virtuoso, so a test can
+ *  simulate the user scrolling the list. */
+let rangeChanged: ((range: { startIndex: number; endIndex: number }) => void) | null = null;
+
 vi.mock("react-virtuoso", async () => {
   const actual = await vi.importActual<typeof import("react-virtuoso")>("react-virtuoso");
   return {
@@ -16,15 +21,20 @@ vi.mock("react-virtuoso", async () => {
         itemContent,
         className,
         context,
+        rangeChanged: onRangeChanged,
       }: {
         totalCount: number;
         itemContent: (index: number, data: unknown, context: unknown) => ReactNode;
         className?: string;
         context?: unknown;
+        rangeChanged?: (range: { startIndex: number; endIndex: number }) => void;
       },
       ref: Ref<unknown>,
     ) {
-      useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }));
+      useImperativeHandle(ref, () => ({ scrollToIndex }));
+      useEffect(() => {
+        rangeChanged = onRangeChanged ?? null;
+      });
       return (
         <div className={className}>
           {Array.from({ length: totalCount }, (_, i) => (
@@ -166,5 +176,53 @@ describe("selectionScrollTarget", () => {
 
   it("does not scroll when nothing is selected", () => {
     expect(selectionScrollTarget(-1, range)).toBeNull();
+  });
+});
+
+describe("TurnList scrolling", () => {
+  const many = Array.from({ length: 60 }, (_, i) =>
+    makeSummary({ turn_id: `t${i}`, user_message: `prompt ${i}` }),
+  );
+
+  beforeEach(() => {
+    scrollToIndex.mockClear();
+    rangeChanged = null;
+  });
+
+  it("does not scroll when the user scrolls the selection out of view", () => {
+    render(<TurnList summaries={many} selectedIndex={0} onSelectTurn={vi.fn()} />);
+    scrollToIndex.mockClear();
+
+    // The user wheels down: Virtuoso reports the new window continuously.
+    act(() => rangeChanged?.({ startIndex: 20, endIndex: 30 }));
+    act(() => rangeChanged?.({ startIndex: 30, endIndex: 40 }));
+
+    // Scrolling from here would drag the list straight back to turn 0 and make
+    // the list impossible to scroll away from.
+    expect(scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it("brings the selection back into view when the selection moves", () => {
+    const { rerender } = render(
+      <TurnList summaries={many} selectedIndex={0} onSelectTurn={vi.fn()} />,
+    );
+    act(() => rangeChanged?.({ startIndex: 0, endIndex: 10 }));
+    scrollToIndex.mockClear();
+
+    rerender(<TurnList summaries={many} selectedIndex={40} onSelectTurn={vi.fn()} />);
+
+    expect(scrollToIndex).toHaveBeenCalledWith({ index: 40, align: "end" });
+  });
+
+  it("leaves the list alone when the new selection is already on screen", () => {
+    const { rerender } = render(
+      <TurnList summaries={many} selectedIndex={12} onSelectTurn={vi.fn()} />,
+    );
+    act(() => rangeChanged?.({ startIndex: 10, endIndex: 20 }));
+    scrollToIndex.mockClear();
+
+    rerender(<TurnList summaries={many} selectedIndex={15} onSelectTurn={vi.fn()} />);
+
+    expect(scrollToIndex).not.toHaveBeenCalled();
   });
 });

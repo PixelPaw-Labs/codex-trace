@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { TurnSummary } from "../../shared/types";
 import { formatDuration, formatTokens } from "../../shared/format";
@@ -228,16 +228,22 @@ export function TurnList({ summaries, selectedIndex, onSelectTurn }: TurnListPro
     [onSelectTurn, toggleCodex],
   );
 
-  // Keyboard navigation moves the selection without scrolling; bring it back
-  // into view against the window actually on screen. Virtuoso owns the
-  // scroller, so this scrolls the list and nothing above it.
-  const handleRangeChanged = useCallback(
-    (range: { startIndex: number; endIndex: number }) => {
-      const target = selectionScrollTarget(selectedIndex, range);
-      if (target) virtuosoRef.current?.scrollToIndex(target);
-    },
-    [selectedIndex],
-  );
+  // The window currently on screen. Recording it is all `rangeChanged` may do:
+  // it fires continuously while the user scrolls, so scrolling from here would
+  // drag the list straight back to the selected row and make the list
+  // impossible to scroll away from.
+  const rangeRef = useRef({ startIndex: 0, endIndex: 0 });
+  const handleRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
+    rangeRef.current = range;
+  }, []);
+
+  // Keyboard navigation moves the selection without scrolling, so bring the
+  // selected row back into view when — and only when — the selection changes.
+  // Virtuoso owns the scroller, so this scrolls the list and nothing above it.
+  useEffect(() => {
+    const target = selectionScrollTarget(selectedIndex, rangeRef.current);
+    if (target) virtuosoRef.current?.scrollToIndex(target);
+  }, [selectedIndex]);
 
   if (summaries.length === 0) {
     return (
@@ -255,6 +261,9 @@ export function TurnList({ summaries, selectedIndex, onSelectTurn }: TurnListPro
       // Keep the view pinned to the newest turn while a session is live, but
       // only when the user is already at the bottom.
       followOutput="smooth"
+      // Render rows this far outside the viewport so a row is built before it
+      // scrolls into view, rather than visibly appearing at the viewport edge.
+      increaseViewportBy={{ top: 600, bottom: 600 }}
       rangeChanged={handleRangeChanged}
       computeItemKey={(index) => summaries[index]?.turn_id ?? index}
       context={{

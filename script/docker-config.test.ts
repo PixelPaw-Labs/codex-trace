@@ -15,6 +15,7 @@ function read(name: string): string {
 const dockerfile = read("Dockerfile");
 const compose = read("docker-compose.yml");
 const viteConfig = read("vite.config.ts");
+const dockerignore = read(".dockerignore");
 
 /** Every `VOLUME ["..."]` path declared in the Dockerfile. */
 function declaredVolumes(): string[] {
@@ -115,6 +116,18 @@ describe("volumes", () => {
 });
 
 describe("build context", () => {
+  it("excludes local build output from the context", () => {
+    const ignored = dockerignore
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    // The image builds all three from source. Shipping the local copies sends
+    // gigabytes to the daemon before the first instruction runs.
+    for (const path of ["node_modules", "src-tauri/target", "dist"]) {
+      expect(ignored, `${path} is excluded from the build context`).toContain(path);
+    }
+  });
+
   it("copies everything vite.config.ts imports into the frontend stage", () => {
     const copied = frontendCopiedPaths();
     for (const imported of viteConfigLocalImports()) {

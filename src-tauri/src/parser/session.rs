@@ -18,6 +18,7 @@ pub struct GitInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct CodexSession {
     pub id: String,
     pub timestamp: String,

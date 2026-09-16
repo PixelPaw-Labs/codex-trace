@@ -16,9 +16,31 @@ pub fn load_session_from_path(path: &str) -> Result<crate::parser::session::Code
     parse_session(p)
 }
 
+/// The session's metadata and its lightweight turn index. Turn bodies are
+/// fetched one at a time by [`load_turn`], so the frontend never holds a whole
+/// transcript's tool output at once.
 #[tauri::command]
-pub async fn load_session(path: String) -> Result<crate::parser::session::CodexSession, String> {
-    load_session_from_path(&path)
+pub async fn load_session(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::parser::summary::SessionIndex, String> {
+    if path.is_empty() {
+        return Err(NO_SESSION_PATH_PROVIDED.to_string());
+    }
+    state.load_session_index(&path)
+}
+
+/// One turn, with its bodies, by position in the turn index.
+#[tauri::command]
+pub async fn load_turn(
+    path: String,
+    index: usize,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::parser::turn::CodexTurn, String> {
+    if path.is_empty() {
+        return Err(NO_SESSION_PATH_PROVIDED.to_string());
+    }
+    state.load_turn(&path, index)
 }
 
 #[tauri::command]
@@ -37,6 +59,7 @@ pub async fn watch_session(
 #[tauri::command]
 pub async fn unwatch_session(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.clear_watched_ongoing();
+    state.clear_parsed_session();
     state.stop_session_watcher()
 }
 

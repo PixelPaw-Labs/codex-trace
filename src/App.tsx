@@ -95,6 +95,14 @@ export function App() {
     [changeView],
   );
 
+  // The detail view is the only place a turn's bodies are needed, so they are
+  // fetched when it opens rather than with the session.
+  const ensureTurn = session.ensureTurn;
+  useEffect(() => {
+    if (view !== "detail") return;
+    void ensureTurn(selectedTurn);
+  }, [view, selectedTurn, ensureTurn]);
+
   const handleToggleDate = useCallback((dateGroup: string) => {
     setCollapsedDates((prev) => {
       const next = new Set(prev);
@@ -104,21 +112,18 @@ export function App() {
     });
   }, []);
 
-  const turns = session.session?.turns ?? [];
-  const selectedTurnData = turns[selectedTurn];
+  const summaries = session.summaries;
+  const selectedTurnData = session.turns.get(selectedTurn) ?? null;
   const workerPanelTool = useMemo(() => {
     if (!workerPanelCallId || !selectedTurnData) return null;
     return findToolByCallId(selectedTurnData.tool_calls, workerPanelCallId);
   }, [selectedTurnData, workerPanelCallId]);
 
   const expandAll = useCallback(() => {
-    if (view === "detail") {
-      const currentTurns = session.session?.turns ?? [];
-      if (currentTurns[selectedTurn]) {
-        addAllTools(currentTurns[selectedTurn].tool_calls.map((_, i) => i));
-      }
+    if (view === "detail" && selectedTurnData) {
+      addAllTools(selectedTurnData.tool_calls.map((_, i) => i));
     }
-  }, [view, session.session, selectedTurn, addAllTools]);
+  }, [view, selectedTurnData, addAllTools]);
 
   const collapseAll = useCallback(() => clearTools(), [clearTools]);
 
@@ -139,7 +144,7 @@ export function App() {
   // Keyboard navigation
   useKeyboard({
     j: () => {
-      if (view === "list") setSelectedTurn((i) => Math.min(i + 1, turns.length - 1));
+      if (view === "list") setSelectedTurn((i) => Math.min(i + 1, summaries.length - 1));
       if (view === "picker") setPickerSelected((i) => Math.min(i + 1, picker.sessions.length - 1));
     },
     k: () => {
@@ -147,7 +152,7 @@ export function App() {
       if (view === "picker") setPickerSelected((i) => Math.max(i - 1, 0));
     },
     Enter: () => {
-      if (view === "list" && turns.length > 0) handleOpenDetail(selectedTurn);
+      if (view === "list" && summaries.length > 0) handleOpenDetail(selectedTurn);
       if (view === "picker" && picker.sessions.length > 0)
         handleSelectSession(picker.sessions[pickerSelected]);
     },
@@ -224,7 +229,7 @@ export function App() {
 
           {view === "list" && !session.loading && session.session && (
             <TurnList
-              turns={turns}
+              summaries={summaries}
               selectedIndex={selectedTurn}
               onSelectTurn={(i) => {
                 setSelectedTurn(i);
@@ -233,9 +238,13 @@ export function App() {
             />
           )}
 
-          {view === "detail" && turns[selectedTurn] && (
+          {view === "detail" && !selectedTurnData && summaries[selectedTurn] && (
+            <div className="app__loading">Loading turn…</div>
+          )}
+
+          {view === "detail" && selectedTurnData && (
             <TurnDetail
-              turn={turns[selectedTurn]}
+              turn={selectedTurnData}
               expanded={expandedTools}
               onToggle={toggleTool}
               onBack={() => changeView("list")}

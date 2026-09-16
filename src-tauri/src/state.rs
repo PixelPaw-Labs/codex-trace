@@ -7,6 +7,9 @@ use crate::auth::{AuthMode, ClientIdentity, ResolvedAuth};
 use crate::clients::{self, Client, ClientRegistry};
 use crate::jwt::Claims;
 use crate::parser::discover::CodexSessionInfo;
+use crate::parser::session::CodexSession;
+use crate::parser::summary::SessionIndex;
+use crate::parser::turn::CodexTurn;
 use crate::settings::Settings;
 use crate::watcher::WatcherHandle;
 
@@ -23,7 +26,21 @@ struct SessionsCache {
     sessions: Vec<CodexSessionInfo>,
 }
 
+/// Prefix of the error returned when a turn index is past the end of the
+/// session. `http_api` matches on it to answer 404 rather than 500.
+pub const NO_TURN_AT_INDEX: &str = "no turn at index";
+
 const SESSIONS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// The most recently parsed session, so opening turn after turn in the detail
+/// view re-reads the file only when it has actually changed on disk. One entry:
+/// the viewer shows one session at a time, and holding more would defeat the
+/// point of not shipping every turn body to the frontend.
+struct ParsedSession {
+    path: String,
+    modified: Option<std::time::SystemTime>,
+    session: CodexSession,
+}
 
 /// The on-disk registry, when it is safe to adopt at runtime: the file must
 /// exist, parse, and still know every built-in client. A missing or emptied
@@ -53,6 +70,7 @@ pub struct AppState {
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
     sessions_cache: Mutex<Option<SessionsCache>>,
+    parsed_session: Mutex<Option<ParsedSession>>,
 }
 
 impl AppState {
@@ -71,6 +89,7 @@ impl AppState {
             watched_session_ongoing: Mutex::new(None),
             event_tx,
             sessions_cache: Mutex::new(None),
+            parsed_session: Mutex::new(None),
         }
     }
 
@@ -359,6 +378,71 @@ impl AppState {
         Ok(sessions)
     }
 
+    /// Mtime of `path`, or `None` when it cannot be read. A `None` on either
+    /// side of the comparison counts as "changed", so an unreadable mtime
+    /// re-parses rather than serving a possibly stale turn.
+    fn modified_at(path: &str) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
+
+    /// Run `f` over the parsed session at `path`, parsing it only when the
+    /// cached copy is for a different file or the file has changed on disk.
+    ///
+    /// The closure borrows the session rather than returning a clone, so the
+    /// caller can pull out one turn without copying every other one.
+    fn with_parsed_session<T>(
+        &self,
+        path: &str,
+        f: impl FnOnce(&CodexSession) -> T,
+    ) -> Result<T, String> {
+        self.with_parsed_session_mut(path, |s| f(s))
+    }
+
+    /// As [`Self::with_parsed_session`], but the closure may borrow the cached
+    /// session mutably — used to lift its turns out and put them back without
+    /// copying them.
+    fn with_parsed_session_mut<T>(
+        &self,
+        path: &str,
+        f: impl FnOnce(&mut CodexSession) -> T,
+    ) -> Result<T, String> {
+        let modified = Self::modified_at(path);
+        let mut guard = self.parsed_session.lock().map_err(|e| e.to_string())?;
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|c| c.path == path && modified.is_some() && c.modified == modified);
+        if !fresh {
+            let session = crate::commands::session::load_session_from_path(path)?;
+            *guard = Some(ParsedSession {
+                path: path.to_string(),
+                modified,
+                session,
+            });
+        }
+        let cached = guard.as_mut().expect("just populated");
+        Ok(f(&mut cached.session))
+    }
+
+    /// The session's metadata and its lightweight turn index — no turn bodies.
+    pub fn load_session_index(&self, path: &str) -> Result<SessionIndex, String> {
+        self.with_parsed_session_mut(path, SessionIndex::of_cached)
+    }
+
+    /// One turn, with its bodies, by position in the turn index.
+    pub fn load_turn(&self, path: &str, index: usize) -> Result<CodexTurn, String> {
+        let turn = self.with_parsed_session(path, |s| s.turns.get(index).cloned())?;
+        turn.ok_or_else(|| format!("{NO_TURN_AT_INDEX} {index}"))
+    }
+
+    /// Drop the parsed session, so the next read re-parses. Called when a
+    /// watched session changes and when the view moves off it, so a large
+    /// transcript is not held after it stops being looked at.
+    pub fn clear_parsed_session(&self) {
+        if let Ok(mut guard) = self.parsed_session.lock() {
+            *guard = None;
+        }
+    }
+
     pub fn broadcast(&self, event: &str, data: &str) {
         let _ = self.event_tx.send(SseEvent {
             event: event.to_string(),
@@ -373,6 +457,184 @@ mod tests {
 
     fn make_state() -> AppState {
         AppState::for_tests(AuthMode::Disabled)
+    }
+
+    /// A two-turn session whose second turn carries a large tool output, so a
+    /// test can tell the index apart from the bodies by size alone.
+    fn write_session(dir: &std::path::Path) -> String {
+        let path = dir.join("rollout-2026-05-07T00-00-00-paged.jsonl");
+        let big = "x".repeat(50_000);
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"session_id":"paged","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#.to_string(),
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#.to_string(),
+                r#"{"timestamp":"2026-05-07T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576002.0}}"#.to_string(),
+                r#"{"timestamp":"2026-05-07T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#.to_string(),
+                r#"{"timestamp":"2026-05-07T00:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":[\"ls\"]}"}}"#.to_string(),
+                format!(
+                    r#"{{"timestamp":"2026-05-07T00:00:05Z","type":"event_msg","payload":{{"type":"exec_command_end","call_id":"c1","exit_code":0,"aggregated_output":"{big}"}}}}"#
+                ),
+                r#"{"timestamp":"2026-05-07T00:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1746576006.0}}"#.to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn the_session_index_carries_summaries_but_no_turn_bodies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+
+        let index = state.load_session_index(&path).unwrap();
+
+        assert_eq!(index.summaries.len(), 2);
+        assert!(index.session.turns.is_empty());
+        let json = serde_json::to_string(&index).unwrap();
+        assert!(
+            !json.contains(&"x".repeat(1_000)),
+            "the index must not carry tool output",
+        );
+    }
+
+    #[test]
+    fn load_turn_returns_the_bodies_the_index_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+
+        let turn = state.load_turn(&path, 1).unwrap();
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].output.as_deref().unwrap().len(), 50_000);
+    }
+
+    /// The index read must not copy the turn bodies out of the cache. A clone
+    /// of the whole session would duplicate every tool output in the
+    /// transcript, once per index read — and the watcher triggers one of those
+    /// per append while a session is live.
+    #[test]
+    fn reading_the_index_leaves_the_cached_bodies_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+
+        let index = state.load_session_index(&path).unwrap();
+        assert_eq!(index.summaries.len(), 2);
+        assert!(
+            index.session.turns.is_empty(),
+            "the index carries no bodies"
+        );
+
+        // Straight after the index read, the cache must still have the bodies:
+        // this is served from the same parse, not a re-parse.
+        let turn = state.load_turn(&path, 1).unwrap();
+        assert_eq!(turn.tool_calls[0].output.as_deref().unwrap().len(), 50_000);
+
+        // And the turns are still there for a second index read.
+        assert_eq!(state.load_session_index(&path).unwrap().summaries.len(), 2);
+    }
+
+    #[test]
+    fn load_turn_reports_an_index_past_the_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+
+        let err = state.load_turn(&path, 99).unwrap_err();
+        assert!(err.starts_with(NO_TURN_AT_INDEX), "{err}");
+    }
+
+    #[test]
+    fn the_parsed_session_is_reused_while_the_file_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+        assert_eq!(state.load_session_index(&path).unwrap().summaries.len(), 2);
+
+        // Append a third turn but restore the original mtime, so only a cache
+        // hit can still report two.
+        let grown = [
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"timestamp":"2026-05-07T00:00:07Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}"#.to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, grown).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+
+        assert_eq!(
+            state.load_session_index(&path).unwrap().summaries.len(),
+            2,
+            "served from the cache rather than re-parsed",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_mtime_re_parses_rather_than_serving_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+        state.load_session_index(&path).unwrap();
+
+        // No mtime to compare against: fall back to reading, and report the
+        // read failure instead of quietly handing back the old parse.
+        std::fs::remove_file(&path).unwrap();
+        assert!(state.load_turn(&path, 0).is_err());
+    }
+
+    #[test]
+    fn a_changed_file_is_reparsed_rather_than_served_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+        assert_eq!(state.load_session_index(&path).unwrap().summaries.len(), 2);
+
+        // Rewrite with a third turn, forcing a new mtime.
+        let extra = [
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"timestamp":"2026-05-07T00:00:07Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}"#.to_string(),
+            r#"{"timestamp":"2026-05-07T00:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3","completed_at":1746576008.0}}"#.to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, extra).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(2_000_000_000, 0))
+            .unwrap();
+
+        assert_eq!(state.load_session_index(&path).unwrap().summaries.len(), 3);
+    }
+
+    #[test]
+    fn clearing_the_parsed_session_forces_a_reread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+        state.load_session_index(&path).unwrap();
+
+        state.clear_parsed_session();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(state.load_turn(&path, 0).is_err(), "no longer cached");
+    }
+
+    #[test]
+    fn a_second_session_replaces_the_first_in_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = write_session(tmp.path());
+        let second_dir = tempfile::tempdir().unwrap();
+        let second = write_session(second_dir.path());
+        let state = make_state();
+
+        state.load_session_index(&first).unwrap();
+        state.load_session_index(&second).unwrap();
+        std::fs::remove_file(&first).unwrap();
+
+        assert!(state.load_turn(&first, 0).is_err(), "first was evicted");
+        assert!(state.load_turn(&second, 0).is_ok());
     }
 
     #[test]

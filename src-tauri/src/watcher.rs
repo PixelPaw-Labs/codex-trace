@@ -56,9 +56,14 @@ impl WatcherHandle {
     }
 }
 
+/// A live update carries the same lightweight index as the initial load: the
+/// session's metadata and one summary per turn, never the turn bodies. A
+/// growing transcript would otherwise re-broadcast its entire tool output to
+/// every connected client on every write.
 #[derive(Clone, serde::Serialize)]
 struct SessionUpdatePayload {
-    session: crate::parser::session::CodexSession,
+    #[serde(flatten)]
+    index: crate::parser::summary::SessionIndex,
 }
 
 /// True for `rollout-*.jsonl` and `rollout-*.jsonl.zst` files — Codex's background
@@ -139,8 +144,12 @@ pub fn start_session_watcher(
 
                     let ongoing = session.is_ongoing;
                     state.set_watched_ongoing(path_for_rebuild.clone(), ongoing);
+                    // The file changed, so anything parsed from it is stale.
+                    state.clear_parsed_session();
 
-                    let payload = SessionUpdatePayload { session };
+                    let payload = SessionUpdatePayload {
+                        index: crate::parser::summary::SessionIndex::of(session),
+                    };
                     if let Ok(json) = serde_json::to_string(&payload) {
                         state.broadcast("session-update", &json);
                     }

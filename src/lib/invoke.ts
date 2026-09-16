@@ -9,7 +9,14 @@ interface Route {
   body?: (args: Record<string, unknown>) => unknown;
 }
 
-const routes: Record<string, Route> = {
+/**
+ * HTTP equivalents of the Tauri commands, for the browser and Docker builds.
+ *
+ * Every command registered in `src-tauri/src/lib.rs` needs an entry here or it
+ * silently fails outside the desktop app — nothing at compile time connects the
+ * two lists, so `invoke.test.ts` reads the Rust source and diffs them.
+ */
+export const routes: Record<string, Route> = {
   get_settings: { path: "/api/settings" },
   set_allowed_origins: {
     method: "POST",
@@ -44,6 +51,11 @@ const routes: Record<string, Route> = {
     method: "POST",
     path: "/api/session/load",
     body: (a) => ({ path: a.path }),
+  },
+  load_turn: {
+    method: "POST",
+    path: "/api/session/turn",
+    body: (a) => ({ path: a.path, index: a.index }),
   },
   watch_session: {
     method: "POST",

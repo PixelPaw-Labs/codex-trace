@@ -1,9 +1,8 @@
 import { useState, useCallback, useRef } from "react";
-import type { CodexTurn } from "../../shared/types";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import type { TurnSummary } from "../../shared/types";
 import { formatDuration, formatTokens } from "../../shared/format";
 import { formatExactTime } from "../lib/format";
-import { useAutoScroll } from "../hooks/useAutoScroll";
-import { useScrollToSelected } from "../hooks/useScrollToSelected";
 import { OngoingDots } from "./OngoingDots";
 import {
   UserIcon,
@@ -16,21 +15,178 @@ import {
 } from "./Icons";
 
 interface TurnListProps {
-  turns: CodexTurn[];
+  summaries: TurnSummary[];
   selectedIndex: number;
   onSelectTurn: (index: number) => void;
 }
 
-function statusIcon(status: CodexTurn["status"]): string {
+function statusIcon(status: TurnSummary["status"]): string {
   if (status === "complete") return "✓";
   if (status === "aborted") return "✗";
   if (status === "cancelled") return "⊘";
   return "!";
 }
 
-export function TurnList({ turns, selectedIndex, onSelectTurn }: TurnListProps) {
-  const listRef = useAutoScroll<HTMLDivElement>(turns.length);
-  const selectedRef = useScrollToSelected(selectedIndex);
+/**
+ * How to bring the selected row into view given the rows currently rendered.
+ * `null` when no scroll is needed. Above the window → align to the top so the
+ * user header stays visible; below → align to the end.
+ */
+export function selectionScrollTarget(
+  selectedIndex: number,
+  range: { startIndex: number; endIndex: number },
+): { index: number; align: "start" | "end" } | null {
+  if (selectedIndex < 0) return null;
+  if (selectedIndex < range.startIndex) return { index: selectedIndex, align: "start" };
+  if (selectedIndex > range.endIndex) return { index: selectedIndex, align: "end" };
+  return null;
+}
+
+/** The row timestamp: when the turn finished, else its last agent message. */
+function agentTimestamp(summary: TurnSummary): string | null {
+  if (summary.completed_at) {
+    return formatExactTime(new Date(summary.completed_at * 1000).toISOString());
+  }
+  return summary.last_agent_timestamp ? formatExactTime(summary.last_agent_timestamp) : null;
+}
+
+/** Per-render data threaded to the row renderer via Virtuoso's `context`, so the
+ * renderer can stay a stable module-level function instead of an inline one. */
+interface TurnRowContext {
+  summaries: TurnSummary[];
+  selectedIndex: number;
+  expandedUsers: Set<number>;
+  expandedCodex: Set<number>;
+  onToggleUser: (index: number) => void;
+  onCodexClick: (index: number) => void;
+  onSelectTurn: (index: number) => void;
+}
+
+function renderTurnRow(i: number, _data: unknown, ctx: TurnRowContext) {
+  const summary = ctx.summaries[i];
+  if (!summary) return null;
+  const isSelected = i === ctx.selectedIndex;
+  const userMsg = summary.user_message ?? "";
+  const userExpanded = ctx.expandedUsers.has(i);
+  const userTs = summary.started_at
+    ? formatExactTime(new Date(summary.started_at * 1000).toISOString())
+    : null;
+  const agentTs = agentTimestamp(summary);
+
+  return (
+    <div className="turn-list__turn">
+      {/* User message */}
+      <div
+        className={`message message--user${isSelected ? " message--selected" : ""}`}
+        onClick={() => ctx.onToggleUser(i)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") ctx.onToggleUser(i);
+        }}
+      >
+        <div className="message__header">
+          <span className="message__role-icon">
+            <UserIcon />
+          </span>
+          <span className="message__role message__role--user">User</span>
+          {userTs && <span className="message__timestamp">{userTs}</span>}
+        </div>
+        {userMsg && (
+          <div className={`message__content${!userExpanded ? " message__content--collapsed" : ""}`}>
+            {userMsg}
+          </div>
+        )}
+      </div>
+
+      {/* Agent (Codex) message */}
+      <div
+        className={`message message--claude${isSelected ? " message--selected" : ""}`}
+        onClick={() => ctx.onCodexClick(i)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") ctx.onSelectTurn(i);
+        }}
+      >
+        <div className="message__header">
+          <span className="message__role-icon">
+            <CodexIcon />
+          </span>
+          <span className="message__role message__role--claude">Codex</span>
+          {summary.status === "ongoing" && <OngoingDots />}
+          {summary.has_detail && (
+            <button
+              className="message__detail-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.onSelectTurn(i);
+              }}
+            >
+              Detail <ForwardIcon />
+            </button>
+          )}
+          {agentTs && <span className="message__timestamp">{agentTs}</span>}
+        </div>
+
+        {summary.agent_preview && (
+          <div
+            className={`message__content${!ctx.expandedCodex.has(i) ? " message__content--collapsed" : ""}`}
+          >
+            {summary.agent_preview}
+          </div>
+        )}
+
+        {((summary.total_tokens ?? 0) > 0 ||
+          summary.tool_call_count > 0 ||
+          summary.duration_ms !== null) && (
+          <div className="message__stats">
+            {summary.status !== "ongoing" && (
+              <span className={`message__stat turn-list__status--${summary.status}`}>
+                {statusIcon(summary.status)}
+              </span>
+            )}
+            {(summary.total_tokens ?? 0) > 0 && (
+              <span className="message__stat">
+                <span className="message__stat-icon">
+                  <TokensIcon />
+                </span>
+                {formatTokens(summary.total_tokens!)} tok
+              </span>
+            )}
+            {summary.tool_call_count > 0 && (
+              <span className="message__stat">
+                <span className="message__stat-icon">
+                  <ToolsIcon />
+                </span>
+                {summary.tool_call_count} tool{summary.tool_call_count > 1 ? "s" : ""}
+              </span>
+            )}
+            {summary.reasoning_count > 0 && (
+              <span className="message__stat">
+                <span className="message__stat-icon">
+                  <ThinkingIcon />
+                </span>
+                {summary.reasoning_count} think
+              </span>
+            )}
+            {summary.duration_ms !== null && (
+              <span className="message__stat">
+                <span className="message__stat-icon">
+                  <DurationIcon />
+                </span>
+                {formatDuration(summary.duration_ms)}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function TurnList({ summaries, selectedIndex, onSelectTurn }: TurnListProps) {
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [expandedUsers, setExpandedUsers] = useState<Set<number>>(new Set());
   const [expandedCodex, setExpandedCodex] = useState<Set<number>>(new Set());
   const clickTimers = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
@@ -72,143 +228,45 @@ export function TurnList({ turns, selectedIndex, onSelectTurn }: TurnListProps) 
     [onSelectTurn, toggleCodex],
   );
 
+  // Keyboard navigation moves the selection without scrolling; bring it back
+  // into view against the window actually on screen. Virtuoso owns the
+  // scroller, so this scrolls the list and nothing above it.
+  const handleRangeChanged = useCallback(
+    (range: { startIndex: number; endIndex: number }) => {
+      const target = selectionScrollTarget(selectedIndex, range);
+      if (target) virtuosoRef.current?.scrollToIndex(target);
+    },
+    [selectedIndex],
+  );
+
+  if (summaries.length === 0) {
+    return (
+      <div className="message-list">
+        <div className="message-list__empty">No turns in this session.</div>
+      </div>
+    );
+  }
+
   return (
-    <div ref={listRef} className="message-list">
-      {turns.map((turn, i) => {
-        const isSelected = i === selectedIndex;
-        const userMsg = turn.user_message ?? "";
-        const userExpanded = expandedUsers.has(i);
-        const agentPreview =
-          turn.agent_messages.find((m) => m.phase === "final_answer")?.text ??
-          turn.agent_messages.find((m) => !m.is_reasoning)?.text ??
-          null;
-        const hasDetail = turn.agent_messages.length > 0 || turn.tool_calls.length > 0;
-        const reasoningCount = turn.agent_messages.filter((m) => m.is_reasoning).length;
-        const userTs = turn.started_at
-          ? formatExactTime(new Date(turn.started_at * 1000).toISOString())
-          : null;
-        const agentTs = turn.completed_at
-          ? formatExactTime(new Date(turn.completed_at * 1000).toISOString())
-          : turn.agent_messages.at(-1)?.timestamp
-            ? formatExactTime(turn.agent_messages.at(-1)!.timestamp)
-            : null;
-
-        return (
-          <div
-            key={turn.turn_id}
-            ref={isSelected ? selectedRef : undefined}
-            className="turn-list__turn"
-          >
-            {/* User message */}
-            <div
-              className={`message message--user${isSelected ? " message--selected" : ""}`}
-              onClick={() => toggleUser(i)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") toggleUser(i);
-              }}
-            >
-              <div className="message__header">
-                <span className="message__role-icon">
-                  <UserIcon />
-                </span>
-                <span className="message__role message__role--user">User</span>
-                {userTs && <span className="message__timestamp">{userTs}</span>}
-              </div>
-              {userMsg && (
-                <div
-                  className={`message__content${!userExpanded ? " message__content--collapsed" : ""}`}
-                >
-                  {userMsg}
-                </div>
-              )}
-            </div>
-
-            {/* Agent (Codex) message */}
-            <div
-              className={`message message--claude${isSelected ? " message--selected" : ""}`}
-              onClick={() => handleCodexClick(i)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") onSelectTurn(i);
-              }}
-            >
-              <div className="message__header">
-                <span className="message__role-icon">
-                  <CodexIcon />
-                </span>
-                <span className="message__role message__role--claude">Codex</span>
-                {turn.status === "ongoing" && <OngoingDots />}
-                {hasDetail && (
-                  <button
-                    className="message__detail-btn"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectTurn(i);
-                    }}
-                  >
-                    Detail <ForwardIcon />
-                  </button>
-                )}
-                {agentTs && <span className="message__timestamp">{agentTs}</span>}
-              </div>
-
-              {agentPreview && (
-                <div
-                  className={`message__content${!expandedCodex.has(i) ? " message__content--collapsed" : ""}`}
-                >
-                  {agentPreview}
-                </div>
-              )}
-
-              {(turn.total_tokens || turn.tool_calls.length > 0 || turn.duration_ms !== null) && (
-                <div className="message__stats">
-                  {turn.status !== "ongoing" && (
-                    <span className={`message__stat turn-list__status--${turn.status}`}>
-                      {statusIcon(turn.status)}
-                    </span>
-                  )}
-                  {(turn.total_tokens?.total_tokens ?? 0) > 0 && (
-                    <span className="message__stat">
-                      <span className="message__stat-icon">
-                        <TokensIcon />
-                      </span>
-                      {formatTokens(turn.total_tokens!.total_tokens)} tok
-                    </span>
-                  )}
-                  {turn.tool_calls.length > 0 && (
-                    <span className="message__stat">
-                      <span className="message__stat-icon">
-                        <ToolsIcon />
-                      </span>
-                      {turn.tool_calls.length} tool{turn.tool_calls.length > 1 ? "s" : ""}
-                    </span>
-                  )}
-                  {reasoningCount > 0 && (
-                    <span className="message__stat">
-                      <span className="message__stat-icon">
-                        <ThinkingIcon />
-                      </span>
-                      {reasoningCount} think
-                    </span>
-                  )}
-                  {turn.duration_ms !== null && (
-                    <span className="message__stat">
-                      <span className="message__stat-icon">
-                        <DurationIcon />
-                      </span>
-                      {formatDuration(turn.duration_ms)}
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      })}
-      {turns.length === 0 && <div className="message-list__empty">No turns in this session.</div>}
-    </div>
+    <Virtuoso<unknown, TurnRowContext>
+      ref={virtuosoRef}
+      className="message-list"
+      totalCount={summaries.length}
+      // Keep the view pinned to the newest turn while a session is live, but
+      // only when the user is already at the bottom.
+      followOutput="smooth"
+      rangeChanged={handleRangeChanged}
+      computeItemKey={(index) => summaries[index]?.turn_id ?? index}
+      context={{
+        summaries,
+        selectedIndex,
+        expandedUsers,
+        expandedCodex,
+        onToggleUser: toggleUser,
+        onCodexClick: handleCodexClick,
+        onSelectTurn,
+      }}
+      itemContent={renderTurnRow}
+    />
   );
 }

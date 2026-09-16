@@ -47,3 +47,27 @@ describe("HTTP route table", () => {
     expect(registeredCommands()).toContain("load_session");
   });
 });
+
+describe("in-flight invoke counter", () => {
+  it("counts a call while it is pending and clears it afterwards", async () => {
+    const { invoke, inFlightInvokeCount } = await import("./invoke");
+    expect(inFlightInvokeCount()).toBe(0);
+
+    // No backend here, so the call rejects — the counter must still come back
+    // down, or the webview recycle would wait out its timeout every time.
+    const pending = invoke("get_settings").catch(() => {});
+    expect(inFlightInvokeCount()).toBe(1);
+
+    await pending;
+    expect(inFlightInvokeCount()).toBe(0);
+  });
+
+  it("counts concurrent calls", async () => {
+    const { invoke, inFlightInvokeCount } = await import("./invoke");
+    const calls = [invoke("get_settings").catch(() => {}), invoke("list_sessions").catch(() => {})];
+    expect(inFlightInvokeCount()).toBe(2);
+
+    await Promise.all(calls);
+    expect(inFlightInvokeCount()).toBe(0);
+  });
+});

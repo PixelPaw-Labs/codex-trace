@@ -14,6 +14,12 @@ import { KeybindBar } from "./components/KeybindBar";
 import { ViewToolbar } from "./components/ViewToolbar";
 import { ResizeHandle } from "./components/ResizeHandle";
 import { SettingsModal } from "./components/SettingsModal";
+import {
+  shouldRecycle,
+  saveRestoreState,
+  takeRestoreState,
+  reloadWebview,
+} from "./lib/webviewRecycle";
 
 function findToolByCallId(tools: CodexToolCall[], callId: string): CodexToolCall | null {
   for (const tool of tools) {
@@ -77,15 +83,49 @@ export function App() {
     setWorkerPanelCallId(null);
   }, []);
 
-  const handleSelectSession = useCallback(
-    (info: CodexSessionInfo) => {
-      loadSession(info.path);
+  const openSessionByPath = useCallback(
+    (path: string) => {
+      loadSession(path);
       changeView("list");
       setSelectedTurn(0);
       clearTools();
     },
     [loadSession, clearTools, changeView],
   );
+
+  // How many sessions have been opened this page lifetime, for deciding when to
+  // recycle the webview (see lib/webviewRecycle.ts for why).
+  const switchCountRef = useRef(0);
+
+  const handleSelectSession = useCallback(
+    (info: CodexSessionInfo) => {
+      switchCountRef.current += 1;
+      if (shouldRecycle(switchCountRef.current)) {
+        saveRestoreState({ sessionPath: info.path });
+        // The reload waits for in-flight invokes to settle first, so it is
+        // async. If it ever throws, open the session normally rather than
+        // silently doing nothing.
+        void reloadWebview().catch(() => openSessionByPath(info.path));
+        return;
+      }
+      openSessionByPath(info.path);
+    },
+    [openSessionByPath],
+  );
+
+  // Restore whichever session was open right before a memory-driven reload, so
+  // the reload is not disruptive.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    const pending = takeRestoreState();
+    // The "synchronizing with an external system" case the rule carves out:
+    // takeRestoreState() reads and *consumes* session storage, so it cannot run
+    // during render, and opening the session is inherently a state update.
+    // oxlint-disable-next-line react/set-state-in-effect
+    if (pending) openSessionByPath(pending.sessionPath);
+  }, [openSessionByPath]);
 
   const handleOpenDetail = useCallback(
     (index: number) => {

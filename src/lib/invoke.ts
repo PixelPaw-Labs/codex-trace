@@ -101,7 +101,23 @@ async function httpInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
   return fetchJson<T>(`${API_BASE}${path}`, init);
 }
 
+let inFlightCount = 0;
+
+/**
+ * Number of `invoke` calls currently awaiting a response. Reloading the webview
+ * while a Tauri IPC call is in flight can crash it on macOS — callers that need
+ * to reload (see lib/webviewRecycle.ts) check this first.
+ */
+export function inFlightInvokeCount(): number {
+  return inFlightCount;
+}
+
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (isTauri) return tauriInvoke<T>(cmd, args);
-  return httpInvoke<T>(cmd, args);
+  inFlightCount++;
+  try {
+    if (isTauri) return await tauriInvoke<T>(cmd, args);
+    return await httpInvoke<T>(cmd, args);
+  } finally {
+    inFlightCount--;
+  }
 }

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::borrow::Cow;
 
 /// A raw JSONL line from a Codex session file, loosely typed.
 #[derive(Debug, Clone)]
@@ -10,10 +11,81 @@ pub struct RawEntry {
     pub raw: Value,
 }
 
+/// Parses four ASCII hex bytes into a `u16`.
+fn hex4_to_u16(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    u16::from_str_radix(std::str::from_utf8(&bytes[..4]).ok()?, 16).ok()
+}
+
+/// Replaces lone UTF-16 surrogates in `\uXXXX` escapes with U+FFFD.
+///
+/// RFC 8259 has no representation for an unpaired surrogate and serde_json
+/// rejects the whole line, so a single truncated emoji silently drops an entry
+/// from the session. A producer that truncates a string at a byte or UTF-16
+/// offset can split a surrogate pair and emit one half. Valid pairs are left
+/// alone, and a line without surrogates is returned borrowed.
+pub fn sanitize_lone_surrogates(s: &str) -> Cow<'_, str> {
+    const REPLACEMENT: &[u8] = b"\\uFFFD";
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut out: Option<Vec<u8>> = None;
+
+    while i < len {
+        if bytes[i] == b'\\' && i + 5 < len && bytes[i + 1] == b'u' {
+            if let Some(cp) = hex4_to_u16(&bytes[i + 2..i + 6]) {
+                if (0xD800..=0xDBFF).contains(&cp) {
+                    let paired = i + 11 < len
+                        && bytes[i + 6] == b'\\'
+                        && bytes[i + 7] == b'u'
+                        && hex4_to_u16(&bytes[i + 8..i + 12])
+                            .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low));
+                    if paired {
+                        if let Some(buf) = out.as_mut() {
+                            buf.extend_from_slice(&bytes[i..i + 12]);
+                        }
+                        i += 12;
+                    } else {
+                        out.get_or_insert_with(|| bytes[..i].to_vec())
+                            .extend_from_slice(REPLACEMENT);
+                        i += 6;
+                    }
+                    continue;
+                }
+                if (0xDC00..=0xDFFF).contains(&cp) {
+                    out.get_or_insert_with(|| bytes[..i].to_vec())
+                        .extend_from_slice(REPLACEMENT);
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+        if let Some(buf) = out.as_mut() {
+            buf.push(bytes[i]);
+        }
+        i += 1;
+    }
+
+    match out {
+        None => Cow::Borrowed(s),
+        // Only ASCII is ever pushed in place of ASCII, so the buffer stays UTF-8.
+        Some(buf) => Cow::Owned(String::from_utf8_lossy(&buf).into_owned()),
+    }
+}
+
+/// Parses one raw JSONL line into a `Value`, repairing lone surrogates first.
+/// Every reader of a session file goes through here so a truncated emoji costs
+/// one replacement character rather than the whole entry.
+pub fn parse_line_value(line: &str) -> Option<Value> {
+    serde_json::from_str(&sanitize_lone_surrogates(line)).ok()
+}
+
 impl RawEntry {
     /// Parse a single JSONL line into a RawEntry.
     pub fn parse(line: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(line).ok()?;
+        let v: Value = parse_line_value(line)?;
 
         // Skip "state" placeholder entries
         if v.get("record_type").and_then(|t| t.as_str()) == Some("state") {
@@ -124,6 +196,88 @@ pub fn parse_timestamp_secs(ts: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- lone UTF-16 surrogate sanitization ---
+
+    #[test]
+    fn serde_json_rejects_a_lone_surrogate() {
+        // The reason this pass exists: without it the whole entry is dropped.
+        let line = r#"{"type":"event_msg","payload":{"message":"cut \ud83d"}}"#;
+        assert!(serde_json::from_str::<Value>(line).is_err());
+    }
+
+    #[test]
+    fn a_line_without_surrogates_is_not_copied() {
+        let line = r#"{"type":"event_msg","payload":{"message":"plain text"}}"#;
+        assert!(matches!(sanitize_lone_surrogates(line), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_valid_surrogate_pair_is_not_copied() {
+        // 🐶 is the dog face emoji.
+        let line = r#"{"type":"event_msg","payload":{"message":"dog 🐶"}}"#;
+        let out = sanitize_lone_surrogates(line);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), line);
+    }
+
+    #[test]
+    fn a_lone_high_surrogate_becomes_the_replacement_character() {
+        let line = r#"{"type":"event_msg","payload":{"message":"cut \ud83d"}}"#;
+        let out = sanitize_lone_surrogates(line);
+        assert!(out.contains(r"\uFFFD"));
+        assert!(!out.contains(r"\ud83d"));
+    }
+
+    #[test]
+    fn a_lone_low_surrogate_becomes_the_replacement_character() {
+        let line = r#"{"type":"event_msg","payload":{"message":"tail \udc36 only"}}"#;
+        let out = sanitize_lone_surrogates(line);
+        assert!(out.contains(r"\uFFFD"));
+        assert!(!out.contains(r"\udc36"));
+    }
+
+    #[test]
+    fn a_high_surrogate_followed_by_another_high_surrogate_is_repaired() {
+        let line = r#"{"m":"\ud83d🐶"}"#;
+        let v = parse_line_value(line).expect("repaired line must parse");
+        let text = v.get("m").and_then(|m| m.as_str()).unwrap();
+        assert_eq!(text, "\u{FFFD}\u{1F436}");
+    }
+
+    #[test]
+    fn a_truncated_escape_at_the_end_of_a_line_is_left_alone() {
+        let line = r#"{"m":"\ud8"#;
+        assert!(matches!(sanitize_lone_surrogates(line), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn an_entry_truncated_mid_emoji_still_parses() {
+        let line = r#"{"type":"event_msg","timestamp":"2026-05-07T00:00:00Z","payload":{"type":"agent_message","message":"output cut \ud83d"}}"#;
+        let entry = RawEntry::parse(line).expect("a lone surrogate must not drop the entry");
+        assert_eq!(entry.entry_type, "event_msg");
+        let message = entry
+            .payload
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap();
+        assert_eq!(message, "output cut \u{FFFD}");
+    }
+
+    #[test]
+    fn every_surrogate_in_a_line_is_repaired() {
+        let line = r#"{"m":"\ud83d a \udc36 b 🐶"}"#;
+        let v = parse_line_value(line).expect("repaired line must parse");
+        assert_eq!(
+            v.get("m").and_then(|m| m.as_str()).unwrap(),
+            "\u{FFFD} a \u{FFFD} b \u{1F436}"
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_still_rejected() {
+        assert!(parse_line_value("{not json").is_none());
+    }
 
     #[test]
     fn extract_session_id_reads_id_field() {

@@ -14,9 +14,19 @@ services:
       CODEXTRACE_STATIC_DIR: /app/dist
     volumes:
       - "${CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}:/home/app/.codex/sessions:ro"
+      # Keeps settings.json, the API signing secret and the issued client
+      # credentials across container recreation. Without this they live only in
+      # the container's writable layer, so the sessions directory resets and
+      # every client's credential stops verifying on recreate.
+      - codex-trace-config:/home/app/.config
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/1422"]
+      # CMD-SHELL runs via /bin/sh, which is dash on this image and does not
+      # support the /dev/tcp redirect below — invoke bash explicitly.
+      test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/1422"]
       interval: 30s
       timeout: 5s
       start_period: 10s
       retries: 3
+
+volumes:
+  codex-trace-config:

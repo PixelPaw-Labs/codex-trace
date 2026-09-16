@@ -1,5 +1,17 @@
 import { useRef, useEffect } from "react";
 
+/**
+ * Keep the selected list item in view by scrolling its own nearest scroll
+ * container, never the page.
+ *
+ * `element.scrollIntoView()` scrolls every scrollable ancestor, and an
+ * `overflow: hidden` element is still programmatically scrollable. The app
+ * shell (`.app`, `#root`, `body`) is `overflow: hidden`, so any layout that
+ * gives it a scroll range lets `scrollIntoView` push the toolbars off the top
+ * with no scrollbar to bring them back. Adjusting the container's own
+ * `scrollTop` cannot reach an ancestor; when there is no dedicated scroll
+ * container we do nothing rather than risk scrolling the shell.
+ */
 export function useScrollToSelected(dep: number) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -21,19 +33,15 @@ export function useScrollToSelected(dep: number) {
       container = container.parentElement;
     }
 
-    const containerHeight =
-      container && container !== document.body ? container.clientHeight : window.innerHeight;
+    if (!container || container === document.body) return;
 
     const elRect = el.getBoundingClientRect();
-    const containerRect =
-      container && container !== document.body
-        ? container.getBoundingClientRect()
-        : new DOMRect(0, 0, window.innerWidth, window.innerHeight);
+    const containerRect = container.getBoundingClientRect();
 
-    if (elRect.top < containerRect.top || el.offsetHeight > containerHeight) {
-      el.scrollIntoView({ block: "start" });
+    if (elRect.top < containerRect.top || el.offsetHeight > container.clientHeight) {
+      container.scrollTop += elRect.top - containerRect.top;
     } else if (elRect.bottom > containerRect.bottom) {
-      el.scrollIntoView({ block: "nearest" });
+      container.scrollTop += elRect.bottom - containerRect.bottom;
     }
   }, [dep]);
 

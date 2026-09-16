@@ -6,7 +6,13 @@ const invoke = vi.fn();
 vi.mock("../lib/invoke", () => ({
   invoke: (cmd: string, args?: unknown) => invoke(cmd, args),
 }));
-vi.mock("./useTauriEvent", () => ({ useTauriEvent: vi.fn() }));
+// Capture the live-update handler so a test can fire the signal by hand.
+const handlers = new Map<string, (payload: unknown) => void>();
+vi.mock("./useTauriEvent", () => ({
+  useTauriEvent: (event: string, handler: (payload: unknown) => void) => {
+    handlers.set(event, handler);
+  },
+}));
 
 const { useSession } = await import("./useSession");
 
@@ -62,6 +68,7 @@ function mockBackend(turnCount = 10) {
 describe("useSession", () => {
   beforeEach(() => {
     invoke.mockReset();
+    handlers.clear();
     mockBackend();
   });
 
@@ -225,6 +232,46 @@ describe("useSession", () => {
     });
     await waitFor(() => expect(result.current.turns.get(0)?.turn_id).toBe("turn-0"));
     errors.mockRestore();
+  });
+
+  it("re-fetches the index on the live-update signal", async () => {
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+    });
+
+    invoke.mockImplementation(async (cmd: string) =>
+      cmd === "load_session" ? index(12) : undefined,
+    );
+    await act(async () => {
+      handlers.get("session-refresh")?.({});
+    });
+
+    await waitFor(() => expect(result.current.summaries).toHaveLength(12));
+  });
+
+  it("drops loaded turn bodies on the live-update signal", async () => {
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+      await result.current.ensureTurn(0);
+    });
+    expect(result.current.turns.size).toBe(1);
+
+    await act(async () => {
+      handlers.get("session-refresh")?.({});
+    });
+
+    await waitFor(() => expect(result.current.turns.size).toBe(0));
+  });
+
+  it("ignores the live-update signal when no session is open", async () => {
+    renderHook(() => useSession());
+    await act(async () => {
+      handlers.get("session-refresh")?.({});
+    });
+
+    expect(invoke).not.toHaveBeenCalledWith("load_session", expect.anything());
   });
 
   it("reports a failed session load without leaving it loading", async () => {

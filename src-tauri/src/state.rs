@@ -406,13 +406,20 @@ impl AppState {
         path: &str,
         f: impl FnOnce(&mut CodexSession) -> T,
     ) -> Result<T, String> {
-        let modified = Self::modified_at(path);
+        // Codex's background worker replaces a cold rollout with a `.jsonl.zst`
+        // sibling, so the path a caller holds may no longer exist. Resolve for
+        // reading, but key the cache on the path the caller passed, so the
+        // watcher and the frontend share one entry.
+        let resolved = crate::parser::compression::resolve_rollout_path(std::path::Path::new(path))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        let modified = Self::modified_at(&resolved);
         let mut guard = self.parsed_session.lock().map_err(|e| e.to_string())?;
         let fresh = guard
             .as_ref()
             .is_some_and(|c| c.path == path && modified.is_some() && c.modified == modified);
         if !fresh {
-            let session = crate::commands::session::load_session_from_path(path)?;
+            let session = crate::commands::session::load_session_from_path(&resolved)?;
             *guard = Some(ParsedSession {
                 path: path.to_string(),
                 modified,
@@ -432,6 +439,14 @@ impl AppState {
     pub fn load_turn(&self, path: &str, index: usize) -> Result<CodexTurn, String> {
         let turn = self.with_parsed_session(path, |s| s.turns.get(index).cloned())?;
         turn.ok_or_else(|| format!("{NO_TURN_AT_INDEX} {index}"))
+    }
+
+    /// Re-read the watched session into the cache and report whether it is
+    /// still ongoing. The watcher calls this instead of parsing on its own, so
+    /// the parse a file change forces is the same one the frontend's follow-up
+    /// fetch reads — one parse per change rather than two.
+    pub fn refresh_parsed_session(&self, path: &str) -> Result<bool, String> {
+        self.with_parsed_session(path, |s| s.is_ongoing)
     }
 
     /// Drop the parsed session, so the next read re-parses. Called when a
@@ -635,6 +650,49 @@ mod tests {
 
         assert!(state.load_turn(&first, 0).is_err(), "first was evicted");
         assert!(state.load_turn(&second, 0).is_ok());
+    }
+
+    #[test]
+    fn refresh_parsed_session_reports_ongoing_and_warms_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path());
+        let state = make_state();
+
+        let ongoing = state.refresh_parsed_session(&path).unwrap();
+        assert!(!ongoing, "both turns completed");
+
+        // The follow-up read the frontend makes is served from that same parse.
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+        std::fs::write(&path, "{ not a session").unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        assert_eq!(state.load_session_index(&path).unwrap().summaries.len(), 2);
+    }
+
+    #[test]
+    fn refresh_parsed_session_reports_a_read_failure() {
+        let state = make_state();
+        assert!(state
+            .refresh_parsed_session("/nonexistent/session.jsonl")
+            .is_err());
+    }
+
+    #[test]
+    fn a_session_compressed_after_opening_is_still_readable_under_its_old_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = write_session(tmp.path());
+        let state = make_state();
+        assert_eq!(state.load_session_index(&plain).unwrap().summaries.len(), 2);
+
+        // Codex's background worker replaces the cold rollout with a `.zst`
+        // sibling; the frontend still holds the original path.
+        let raw = std::fs::read(&plain).unwrap();
+        let compressed = zstd::encode_all(raw.as_slice(), 3).unwrap();
+        std::fs::write(format!("{plain}.zst"), compressed).unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        state.clear_parsed_session();
+
+        assert_eq!(state.load_session_index(&plain).unwrap().summaries.len(), 2);
     }
 
     #[test]

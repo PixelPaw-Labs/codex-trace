@@ -120,21 +120,30 @@ export function reconnectSse(): void {
 // client pushed here over HMR (see lib/apiToken.ts) — the stream follows it.
 onApiTokenChange(() => reconnectSse());
 
-export async function listen<T>(
-  event: string,
-  handler: (event: { payload: T }) => void,
-): Promise<UnlistenFn> {
+/** An event handler may be async; its rejection is reported, never swallowed. */
+export type EventHandler<T> = (event: { payload: T }) => void | Promise<void>;
+
+export async function listen<T>(event: string, handler: EventHandler<T>): Promise<UnlistenFn> {
   if (isTauri) {
     return tauriListen<T>(event, handler);
   }
 
   const source = ensureSse();
   const onMessage = ((e: MessageEvent) => {
+    let payload: T;
     try {
-      const payload = JSON.parse(e.data) as T;
-      handler({ payload });
+      payload = JSON.parse(e.data) as T;
     } catch {
-      // ignore malformed events
+      // A malformed frame is the server's problem, not the handler's.
+      return;
+    }
+    // Outside the parse guard: a handler that throws is a bug worth seeing,
+    // not a frame to drop silently.
+    try {
+      const result = handler({ payload });
+      if (result) result.catch((err) => console.error(`${event} handler failed:`, err));
+    } catch (err) {
+      console.error(`${event} handler failed:`, err);
     }
   }) as EventListener;
   source.addEventListener(event, onMessage);

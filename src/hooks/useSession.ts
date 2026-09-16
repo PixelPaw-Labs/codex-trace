@@ -147,10 +147,10 @@ export function useSession() {
   // `session-refresh` carries no data — the watcher sends only a signal, having
   // already re-read the file into the backend's cache. Fetching here keeps the
   // session off the wire once per connected client per write.
-  useTauriEvent("session-refresh", () => {
+  useTauriEvent("session-refresh", async () => {
     // The file changed, so every body fetched from it may be out of date.
     resetTurns();
-    void refreshIndex();
+    await refreshIndex();
   });
 
   useEffect(() => {

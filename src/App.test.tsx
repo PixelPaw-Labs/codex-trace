@@ -1,10 +1,43 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { forwardRef, useImperativeHandle, type ReactNode, type Ref } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexSession, CodexSessionInfo, CodexToolCall } from "../shared/types";
 
 vi.mock("./lib/listen", () => ({
   listen: vi.fn(async () => () => {}),
 }));
+
+// react-virtuoso measures rows against real geometry, which jsdom does not
+// provide, so the turn list would render nothing to click.
+vi.mock("react-virtuoso", async () => {
+  const actual = await vi.importActual<typeof import("react-virtuoso")>("react-virtuoso");
+  return {
+    ...actual,
+    Virtuoso: forwardRef(function VirtuosoMock(
+      {
+        totalCount,
+        itemContent,
+        className,
+        context,
+      }: {
+        totalCount: number;
+        itemContent: (index: number, data: unknown, context: unknown) => ReactNode;
+        className?: string;
+        context?: unknown;
+      },
+      ref: Ref<unknown>,
+    ) {
+      useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }));
+      return (
+        <div className={className}>
+          {Array.from({ length: totalCount }, (_, i) => (
+            <div key={i}>{itemContent(i, undefined, context)}</div>
+          ))}
+        </div>
+      );
+    }),
+  };
+});
 
 const invoke = vi.fn();
 vi.mock("./lib/invoke", () => ({
@@ -124,6 +157,26 @@ function makeSessionInfo(): CodexSessionInfo {
   };
 }
 
+/** The list-view summary of a session's only turn. */
+function summaryOf(session: CodexSession) {
+  const turn = session.turns[0];
+  return {
+    turn_id: turn.turn_id,
+    status: turn.status,
+    started_at: turn.started_at,
+    completed_at: turn.completed_at,
+    duration_ms: turn.duration_ms,
+    user_message: turn.user_message,
+    agent_preview: turn.final_answer,
+    last_agent_timestamp: null,
+    tool_call_count: turn.tool_calls.length,
+    reasoning_count: 0,
+    total_tokens: null,
+    model: turn.model,
+    has_detail: turn.tool_calls.length > 0 || turn.agent_messages.length > 0,
+  };
+}
+
 /** The worker panel's own close button — unique to the mounted panel. */
 const PANEL = ".agent-panel__close";
 /** The per-tool-call toggle inside the detail view's activity list. */
@@ -156,11 +209,24 @@ describe("App worker panel", () => {
     invoke.mockImplementation(async (cmd: string) => {
       switch (cmd) {
         case "get_settings":
-          return { sessions_dir: "/sessions", default_dir: "/sessions" };
+          return {
+            sessions_dir: "/sessions",
+            default_dir: "/sessions",
+            allowed_origins: [],
+            api_auth_enabled: true,
+            api_auth_source: "file",
+            clients: [],
+          };
         case "list_sessions":
           return [makeSessionInfo()];
+        // The session load carries only the turn index; bodies arrive per turn.
         case "load_session":
-          return parentSession;
+          return {
+            session: { ...parentSession, turns: [] },
+            summaries: [summaryOf(parentSession)],
+          };
+        case "load_turn":
+          return parentSession.turns[0];
         default:
           return undefined;
       }

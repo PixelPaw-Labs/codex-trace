@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(Default))]
 pub enum ToolKind {
+    #[cfg_attr(test, default)]
     ExecCommand,
     McpTool,
     PatchApply,
@@ -34,6 +36,7 @@ pub enum ToolKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct ToolCall {
     pub call_id: String,
     pub kind: ToolKind,

@@ -7,5 +7,6 @@ pub mod ongoing;
 pub mod redact;
 pub mod session;
 pub mod spawn;
+pub mod summary;
 pub mod toolcall;
 pub mod turn;

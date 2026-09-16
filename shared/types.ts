@@ -222,6 +222,35 @@ export interface CodexTurn {
  * archives continue to open without error.
  */
 
+/** What the list view draws for one turn — no tool call or agent message
+ * bodies. Fetched for every turn; bodies come one turn at a time via
+ * `load_turn`. */
+export interface TurnSummary {
+  turn_id: string;
+  status: CodexTurn["status"];
+  started_at: number | null;
+  completed_at: number | null;
+  duration_ms: number | null;
+  user_message: string | null;
+  /** Final answer when there is one, else the first non-reasoning message. */
+  agent_preview: string | null;
+  /** Used for the row timestamp when `completed_at` is absent. */
+  last_agent_timestamp: string | null;
+  tool_call_count: number;
+  reasoning_count: number;
+  total_tokens: number | null;
+  model: string | null;
+  /** Whether opening the detail view would show anything. */
+  has_detail: boolean;
+}
+
+/** A session's metadata plus its lightweight turn index. `session.turns` is
+ * always empty — bodies are fetched per turn. */
+export interface SessionIndex {
+  session: CodexSession;
+  summaries: TurnSummary[];
+}
+
 export interface CodexSession {
   id: string;
   timestamp: string;

@@ -2,6 +2,7 @@
 description = "Default permissions for all codex-trace commands"
 permissions = [
   "allow-load-session",
+  "allow-load-turn",
   "allow-watch-session",
   "allow-unwatch-session",
   "allow-list-sessions",
@@ -21,6 +22,11 @@ permissions = [
 identifier = "allow-load-session"
 description = "Allow loading a session file"
 commands.allow = ["load_session"]
+
+[[permission]]
+identifier = "allow-load-turn"
+description = "Allow loading one turn's bodies from a session file"
+commands.allow = ["load_turn"]
 
 [[permission]]
 identifier = "allow-watch-session"

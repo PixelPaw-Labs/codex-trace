@@ -41,6 +41,7 @@ pub struct AgentMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct TokenInfo {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,

@@ -178,6 +178,7 @@ fn build_router(state: Arc<HttpState>, static_dir: Option<String>) -> Router {
         .route("/api/whoami", get(api_whoami))
         .route("/api/sessions", post(api_discover_sessions))
         .route("/api/session/load", post(api_load_session))
+        .route("/api/session/turn", post(api_load_turn))
         .route("/api/session/watch", post(api_watch_session))
         .route("/api/session/unwatch", post(api_unwatch_session))
         .route("/api/picker/watch", post(api_watch_picker))
@@ -239,6 +240,11 @@ fn ok_json<T: serde::Serialize>(val: &T) -> Response {
 fn session_load_error_status(msg: &str) -> axum::http::StatusCode {
     if msg == crate::commands::session::NO_SESSION_PATH_PROVIDED {
         axum::http::StatusCode::BAD_REQUEST
+    } else if msg.starts_with(crate::state::NO_TURN_AT_INDEX) {
+        // Asking for a turn the session does not have is a bad request, not a
+        // parse failure: a stale index in the frontend must not read as the
+        // session being broken.
+        axum::http::StatusCode::NOT_FOUND
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -436,12 +442,44 @@ struct PathBody {
     path: String,
 }
 
-async fn api_load_session(Json(body): Json<PathBody>) -> Response {
-    let session = match crate::commands::session::load_session_from_path(&body.path) {
-        Ok(s) => s,
-        Err(e) => return err_response(session_load_error_status(&e), e),
-    };
-    ok_json(&session)
+/// The session's metadata and its lightweight turn index — no turn bodies.
+async fn api_load_session(
+    State(state): State<Arc<HttpState>>,
+    Json(body): Json<PathBody>,
+) -> Response {
+    if body.path.is_empty() {
+        return err_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            crate::commands::session::NO_SESSION_PATH_PROVIDED.to_string(),
+        );
+    }
+    match app_state(&state).load_session_index(&body.path) {
+        Ok(index) => ok_json(&index),
+        Err(e) => err_response(session_load_error_status(&e), e),
+    }
+}
+
+#[derive(Deserialize)]
+struct TurnBody {
+    path: String,
+    index: usize,
+}
+
+/// One turn, with its bodies, by position in the turn index.
+async fn api_load_turn(
+    State(state): State<Arc<HttpState>>,
+    Json(body): Json<TurnBody>,
+) -> Response {
+    if body.path.is_empty() {
+        return err_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            crate::commands::session::NO_SESSION_PATH_PROVIDED.to_string(),
+        );
+    }
+    match app_state(&state).load_turn(&body.path, body.index) {
+        Ok(turn) => ok_json(&turn),
+        Err(e) => err_response(session_load_error_status(&e), e),
+    }
 }
 
 // ---------------------------------------------------------------------------

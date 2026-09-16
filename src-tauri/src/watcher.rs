@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
-use crate::parser::session::parse_session;
 use crate::state::AppState;
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(1000);
@@ -56,16 +55,6 @@ impl WatcherHandle {
     }
 }
 
-/// A live update carries the same lightweight index as the initial load: the
-/// session's metadata and one summary per turn, never the turn bodies. A
-/// growing transcript would otherwise re-broadcast its entire tool output to
-/// every connected client on every write.
-#[derive(Clone, serde::Serialize)]
-struct SessionUpdatePayload {
-    #[serde(flatten)]
-    index: crate::parser::summary::SessionIndex,
-}
-
 /// True for `rollout-*.jsonl` and `rollout-*.jsonl.zst` files — Codex's background
 /// compression worker replaces a cold plain rollout with a `.jsonl.zst` sibling, so both
 /// representations must be treated as session files for change detection.
@@ -86,6 +75,11 @@ fn is_related_session_path(changed_path: &Path, session_file: &Path) -> bool {
 }
 
 /// Start watching a session JSONL file for changes.
+///
+/// On a change the watcher re-reads the session into the shared parse cache
+/// (so the frontend's follow-up fetch is a cache hit) and broadcasts a
+/// lightweight `session-refresh` signal with no payload. Clients fetch the
+/// updated index via `load_session` / `/api/session/load`.
 pub fn start_session_watcher(
     path: String,
     state: Arc<AppState>,
@@ -133,29 +127,21 @@ pub fn start_session_watcher(
             tokio::select! {
                 _ = stop_rx.recv() => break,
                 Some(()) = signal_rx.recv() => {
-                    let p = std::path::Path::new(&path_for_rebuild);
-                    let Some(resolved) = crate::parser::compression::resolve_rollout_path(p) else {
-                        continue;
-                    };
-                    let session = match parse_session(&resolved) {
-                        Ok(s) => s,
+                    // Re-read into the shared cache: the frontend's follow-up
+                    // fetch then reuses this parse instead of forcing a second.
+                    let ongoing = match state.refresh_parsed_session(&path_for_rebuild) {
+                        Ok(o) => o,
                         Err(_) => continue,
                     };
-
-                    let ongoing = session.is_ongoing;
                     state.set_watched_ongoing(path_for_rebuild.clone(), ongoing);
-                    // The file changed, so anything parsed from it is stale.
-                    state.clear_parsed_session();
 
-                    let payload = SessionUpdatePayload {
-                        index: crate::parser::summary::SessionIndex::of(session),
-                    };
-                    if let Ok(json) = serde_json::to_string(&payload) {
-                        state.broadcast("session-update", &json);
-                    }
+                    // A signal with no payload, like `picker-refresh`. Sending
+                    // the session itself would put its whole turn index on the
+                    // wire once per connected client per write.
+                    state.broadcast("session-refresh", "{}");
 
                     if let Some(ref app_handle) = app {
-                        let _ = app_handle.emit("session-update", payload);
+                        let _ = app_handle.emit("session-refresh", serde_json::json!({}));
                     }
 
                     prev_ongoing = ongoing;

@@ -126,14 +126,31 @@ export function useSession() {
     }
   }, []);
 
-  useTauriEvent<SessionIndex>("session-update", (payload) => {
-    setState((prev) => ({
-      ...prev,
-      session: payload.session,
-      summaries: payload.summaries,
-    }));
+  /** Re-read the index for the open session. Used by the live-update signal. */
+  const refreshIndex = useCallback(async () => {
+    const path = pathRef.current;
+    if (!path) return;
+    const loadId = loadIdRef.current;
+    try {
+      const index = await invoke<SessionIndex>("load_session", { path });
+      if (loadIdRef.current !== loadId) return;
+      setState((prev) => ({
+        ...prev,
+        session: index.session,
+        summaries: index.summaries,
+      }));
+    } catch (err) {
+      console.error("Failed to refresh session:", err);
+    }
+  }, []);
+
+  // `session-refresh` carries no data — the watcher sends only a signal, having
+  // already re-read the file into the backend's cache. Fetching here keeps the
+  // session off the wire once per connected client per write.
+  useTauriEvent("session-refresh", () => {
     // The file changed, so every body fetched from it may be out of date.
     resetTurns();
+    void refreshIndex();
   });
 
   useEffect(() => {

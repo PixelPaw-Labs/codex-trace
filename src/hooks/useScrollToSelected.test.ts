@@ -164,4 +164,27 @@ describe("useScrollToSelected", () => {
     expect(() => rerender({ d: 1 })).not.toThrow();
     expect(result.current.current).toBeNull();
   });
+  it("does not re-scroll when the selection has not changed", () => {
+    const { container, el } = mount({
+      containerRect: rect(100, 300),
+      clientHeight: 200,
+      scrollTop: 0,
+      elRect: rect(320, 360),
+      offsetHeight: 40,
+    });
+
+    const { result, rerender } = renderHook(({ d }) => useScrollToSelected(d), {
+      initialProps: { d: 0 },
+    });
+    Object.defineProperty(result.current, "current", { value: el, writable: true });
+
+    rerender({ d: 3 });
+    expect(container.scrollTop).toBe(60);
+
+    // The user scrolls away by hand; a re-render for an unrelated reason must
+    // not yank the list back.
+    container.scrollTop = 0;
+    rerender({ d: 3 });
+    expect(container.scrollTop).toBe(0);
+  });
 });

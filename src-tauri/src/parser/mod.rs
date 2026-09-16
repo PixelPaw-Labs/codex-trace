@@ -5,6 +5,7 @@ pub mod entry;
 pub mod mentions;
 pub mod ongoing;
 pub mod redact;
+pub mod scan_cache;
 pub mod session;
 pub mod spawn;
 pub mod summary;

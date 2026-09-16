@@ -12,6 +12,7 @@ use super::spawn::parse_spawn_agent_output;
 
 /// Lightweight session info for the picker list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct CodexSessionInfo {
     pub id: String,
     pub path: String,
@@ -109,7 +110,10 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     }
 
     let mut infos: Vec<CodexSessionInfo> = Vec::new();
-    collect_jsonl_files(sessions_dir, &mut infos)?;
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    collect_jsonl_files(sessions_dir, &mut infos, &mut seen)?;
+    // Forget files this walk did not find, and keep what it did across restarts.
+    super::scan_cache::retain_and_persist(sessions_dir, &seen);
 
     // Sort newest first (ISO timestamp in filename is lexicographically sortable)
     infos.sort_by(|a, b| {
@@ -139,7 +143,11 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     Ok(infos)
 }
 
-fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<(), String> {
+fn collect_jsonl_files(
+    dir: &Path,
+    infos: &mut Vec<CodexSessionInfo>,
+    seen: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -148,7 +156,7 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl_files(&path, infos)?;
+            collect_jsonl_files(&path, infos, seen)?;
             continue;
         }
 
@@ -177,7 +185,16 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
             continue;
         }
 
+        seen.push(path.clone());
+
+        // Reading the file is the whole cost of discovery, so anything that has
+        // not changed since it was last scanned is served without opening it.
+        if let Some(info) = super::scan_cache::get(&path) {
+            infos.push(info);
+            continue;
+        }
         if let Some(info) = scan_session_file(&path) {
+            super::scan_cache::put(&path, &info);
             infos.push(info);
         }
     }
@@ -2037,5 +2054,71 @@ mod tests {
             .expect("queued-into session must still be discovered by its own id");
         assert_eq!(session.turn_count, 2);
         assert!(!session.is_ongoing);
+    }
+
+    /// Write a one-turn session and return its path.
+    fn write_one_turn_session(dir: &Path, id: &str) -> PathBuf {
+        let day_dir = dir.join("2026/09/16");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join(format!("rollout-2026-09-16T10-00-00-{id}.jsonl"));
+        std::fs::write(
+            &path,
+            [
+                format!(
+                    r#"{{"timestamp":"2026-09-16T10:00:00Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-09-16T10:00:00Z","cwd":"/project"}}}}"#
+                ),
+                r#"{"timestamp":"2026-09-16T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#.to_string(),
+                r#"{"timestamp":"2026-09-16T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789552802.0}}"#.to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn discovery_serves_an_unchanged_file_from_the_scan_cache() {
+        let tmp = tempdir().unwrap();
+        let path = write_one_turn_session(tmp.path(), "cached-hit");
+
+        assert_eq!(discover_sessions(tmp.path()).unwrap()[0].turn_count, 1);
+
+        // Plant a turn count the file itself could never produce. Getting it
+        // back proves the second walk answered without reopening the file.
+        let mut planted = discover_sessions(tmp.path()).unwrap()[0].clone();
+        planted.turn_count = 99;
+        super::super::scan_cache::put(&path, &planted);
+
+        assert_eq!(discover_sessions(tmp.path()).unwrap()[0].turn_count, 99);
+    }
+
+    #[test]
+    fn discovery_rescans_a_file_that_has_grown() {
+        let tmp = tempdir().unwrap();
+        let path = write_one_turn_session(tmp.path(), "cached-miss");
+        discover_sessions(tmp.path()).unwrap();
+
+        let mut grown = std::fs::read_to_string(&path).unwrap();
+        grown.push_str(
+            "\n{\"timestamp\":\"2026-09-16T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-2\"}}",
+        );
+        grown.push_str(
+            "\n{\"timestamp\":\"2026-09-16T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-2\",\"completed_at\":1789552804.0}}",
+        );
+        std::fs::write(&path, grown).unwrap();
+
+        assert_eq!(discover_sessions(tmp.path()).unwrap()[0].turn_count, 2);
+    }
+
+    #[test]
+    fn discovery_forgets_a_session_that_has_been_deleted() {
+        let tmp = tempdir().unwrap();
+        let path = write_one_turn_session(tmp.path(), "cached-gone");
+        assert_eq!(discover_sessions(tmp.path()).unwrap().len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(discover_sessions(tmp.path()).unwrap().is_empty());
+        assert!(super::super::scan_cache::get(&path).is_none());
     }
 }

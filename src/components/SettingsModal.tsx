@@ -2,14 +2,24 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "../lib/invoke";
 import { PopoutModal } from "./PopoutModal";
 import { AcceptedClients } from "./AcceptedClients";
+import { FONT_SCALE_PRESETS, formatFontScale } from "../lib/fontScale";
 import type { ApiClient, SettingsResponse } from "../../shared/types";
 
 interface SettingsModalProps {
   onClose: () => void;
   onSaved: (dir: string) => void;
+  /** Current global UI zoom level (1 = 100%). */
+  fontScale: number;
+  /** Apply a new zoom level immediately (also persisted by the caller). */
+  onFontScaleChange: (scale: number) => void;
 }
 
-export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
+export function SettingsModal({
+  onClose,
+  onSaved,
+  fontScale,
+  onFontScaleChange,
+}: SettingsModalProps) {
   const [sessionsDir, setSessionsDir] = useState("");
   const [defaultDir, setDefaultDir] = useState("");
   const [allowedOrigins, setAllowedOrigins] = useState<string[]>([]);
@@ -139,6 +149,26 @@ export function SettingsModal({ onClose, onSaved }: SettingsModalProps) {
         />
         <p className="settings-modal__hint">Default: {defaultDir}</p>
         {error && <p className="settings-modal__error">{error}</p>}
+
+        <label className="settings-modal__label" htmlFor="font-scale">
+          Font Size
+        </label>
+        <select
+          id="font-scale"
+          className="settings-modal__input"
+          value={fontScale}
+          onChange={(e) => onFontScaleChange(Number.parseFloat(e.target.value))}
+        >
+          {FONT_SCALE_PRESETS.map((preset) => (
+            <option key={preset} value={preset}>
+              {formatFontScale(preset)}
+            </option>
+          ))}
+        </select>
+        <p className="settings-modal__hint">
+          Scales the whole interface, the way a browser&rsquo;s zoom does. Applies immediately and
+          is remembered.
+        </p>
 
         <label className="settings-modal__label" htmlFor="new-origin">
           Allowed Origins

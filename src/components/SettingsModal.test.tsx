@@ -1,11 +1,13 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { FONT_SCALE_PRESETS, formatFontScale } from "../lib/fontScale";
 import type { SettingsResponse } from "../../shared/types";
 
 const invokeMock = vi.fn();
 vi.mock("../lib/invoke", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
 const { SettingsModal } = await import("./SettingsModal");
+type SettingsModalProps = Parameters<typeof SettingsModal>[0];
 
 function settings(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
   return {
@@ -19,8 +21,16 @@ function settings(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
   };
 }
 
-function renderModal() {
-  render(<SettingsModal onClose={vi.fn()} onSaved={vi.fn()} />);
+function renderModal(props: Partial<SettingsModalProps> = {}) {
+  render(
+    <SettingsModal
+      onClose={vi.fn()}
+      onSaved={vi.fn()}
+      fontScale={1}
+      onFontScaleChange={vi.fn()}
+      {...props}
+    />,
+  );
   return screen.findByPlaceholderText("https://example.com:8080");
 }
 
@@ -32,7 +42,14 @@ describe("SettingsModal allowed origins", () => {
   it("lists the origins already configured", async () => {
     invokeMock.mockResolvedValue(settings({ allowed_origins: ["https://a.example"] }));
 
-    render(<SettingsModal onClose={vi.fn()} onSaved={vi.fn()} />);
+    render(
+      <SettingsModal
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        fontScale={1}
+        onFontScaleChange={vi.fn()}
+      />,
+    );
 
     expect(await screen.findByText("https://a.example")).toBeInTheDocument();
   });
@@ -98,7 +115,14 @@ describe("SettingsModal allowed origins", () => {
       return Promise.resolve(settings({ allowed_origins: args.origins ?? [] }));
     });
 
-    render(<SettingsModal onClose={vi.fn()} onSaved={vi.fn()} />);
+    render(
+      <SettingsModal
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        fontScale={1}
+        onFontScaleChange={vi.fn()}
+      />,
+    );
     fireEvent.click(await screen.findByRole("button", { name: "Remove https://a.example" }));
 
     await waitFor(() => {
@@ -117,5 +141,36 @@ describe("SettingsModal allowed origins", () => {
 
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
     expect(invokeMock).not.toHaveBeenCalledWith("set_allowed_origins", expect.anything());
+  });
+});
+
+describe("SettingsModal font size", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(settings());
+  });
+
+  it("shows the current scale as a percentage", async () => {
+    await renderModal({ fontScale: 1.25 });
+
+    expect(screen.getByLabelText("Font Size")).toHaveValue("1.25");
+    expect(screen.getByRole("option", { name: "125%" })).toBeInTheDocument();
+  });
+
+  it("offers every preset", async () => {
+    await renderModal();
+
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(
+      FONT_SCALE_PRESETS.map(formatFontScale),
+    );
+  });
+
+  it("reports a chosen scale as a number", async () => {
+    const onFontScaleChange = vi.fn();
+    await renderModal({ onFontScaleChange });
+
+    fireEvent.change(screen.getByLabelText("Font Size"), { target: { value: "1.5" } });
+
+    expect(onFontScaleChange).toHaveBeenCalledWith(1.5);
   });
 });

@@ -143,6 +143,92 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     Ok(infos)
 }
 
+/// How many top-level sessions a date has, for the sidebar's group headers. Counted over
+/// the whole match so the header is right before the rows under it have been fetched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DateGroupCount {
+    pub date_group: String,
+    pub count: usize,
+}
+
+/// A slice of the discovered sessions, described well enough that the UI can show a
+/// correct header and know how much more there is without holding the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPage {
+    pub sessions: Vec<CodexSessionInfo>,
+    /// How many sessions match, not how many are in `sessions`.
+    pub total: usize,
+    pub groups: Vec<DateGroupCount>,
+}
+
+/// Whether `session` matches what the user typed. Name, id and working directory, the
+/// same three fields the picker's search box has always looked at.
+fn matches_query(session: &CodexSessionInfo, needle: &str) -> bool {
+    let haystacks = [
+        session.thread_name.as_deref().unwrap_or(""),
+        session.id.as_str(),
+        session.cwd.as_deref().unwrap_or(""),
+    ];
+    haystacks.iter().any(|h| h.to_lowercase().contains(needle))
+}
+
+/// Narrow `sessions` to those matching `query`, then take at most `limit` of them
+/// starting at `offset`.
+///
+/// Matching and counting happen over the whole list rather than over the slice: the UI
+/// asks for one batch at a time, and a search that only looked at the batches already
+/// fetched would quietly miss most of the directory.
+pub fn page_of(
+    sessions: Vec<CodexSessionInfo>,
+    query: Option<&str>,
+    offset: usize,
+    limit: Option<usize>,
+) -> SessionPage {
+    let needle = query.map(|q| q.trim().to_lowercase()).unwrap_or_default();
+    let matched: Vec<CodexSessionInfo> = if needle.is_empty() {
+        sessions
+    } else {
+        sessions
+            .into_iter()
+            .filter(|s| matches_query(s, &needle))
+            .collect()
+    };
+
+    // Inline workers are drawn under their parent rather than as rows of their own, so
+    // counting them here would make every group header read higher than the tree shows.
+    // Keyed rather than run-length counted, to match the tree: it groups through a Map,
+    // so a date that turns up again further down the list lands in the same group.
+    let mut counts: indexmap::IndexMap<&str, usize> = indexmap::IndexMap::new();
+    for session in matched.iter().filter(|s| !s.is_inline_worker) {
+        let date_group = if session.date_group.is_empty() {
+            "unknown"
+        } else {
+            session.date_group.as_str()
+        };
+        *counts.entry(date_group).or_insert(0) += 1;
+    }
+    let groups = counts
+        .into_iter()
+        .map(|(date_group, count)| DateGroupCount {
+            date_group: date_group.to_string(),
+            count,
+        })
+        .collect();
+
+    let total = matched.len();
+    let taken = matched
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    SessionPage {
+        sessions: taken,
+        total,
+        groups,
+    }
+}
+
 fn collect_jsonl_files(
     dir: &Path,
     infos: &mut Vec<CodexSessionInfo>,
@@ -2120,5 +2206,153 @@ mod tests {
 
         assert!(discover_sessions(tmp.path()).unwrap().is_empty());
         assert!(super::super::scan_cache::get(&path).is_none());
+    }
+
+    fn info(id: &str, date_group: &str) -> CodexSessionInfo {
+        CodexSessionInfo {
+            id: id.to_string(),
+            path: format!("/sessions/{date_group}/rollout-{id}.jsonl"),
+            date_group: date_group.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_page_returns_only_the_batch_that_was_asked_for() {
+        let all: Vec<CodexSessionInfo> = (0..10)
+            .map(|i| info(&i.to_string(), "2026/09/16"))
+            .collect();
+
+        let page = page_of(all, None, 4, Some(3));
+
+        assert_eq!(
+            page.sessions
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["4", "5", "6"]
+        );
+    }
+
+    #[test]
+    fn a_page_reports_how_many_sessions_there_are_in_total() {
+        let all: Vec<CodexSessionInfo> = (0..10)
+            .map(|i| info(&i.to_string(), "2026/09/16"))
+            .collect();
+
+        // Without this the list has no way to know whether to ask for more.
+        assert_eq!(page_of(all, None, 0, Some(3)).total, 10);
+    }
+
+    #[test]
+    fn asking_past_the_end_yields_an_empty_page_rather_than_an_error() {
+        let all: Vec<CodexSessionInfo> =
+            (0..3).map(|i| info(&i.to_string(), "2026/09/16")).collect();
+
+        let page = page_of(all, None, 99, Some(10));
+
+        assert!(page.sessions.is_empty());
+        assert_eq!(page.total, 3);
+    }
+
+    #[test]
+    fn no_limit_returns_everything_from_the_offset() {
+        let all: Vec<CodexSessionInfo> =
+            (0..5).map(|i| info(&i.to_string(), "2026/09/16")).collect();
+
+        assert_eq!(page_of(all, None, 2, None).sessions.len(), 3);
+    }
+
+    #[test]
+    fn a_search_runs_over_every_session_not_just_the_first_batch() {
+        let mut all: Vec<CodexSessionInfo> = (0..50)
+            .map(|i| info(&i.to_string(), "2026/09/16"))
+            .collect();
+        all[40].thread_name = Some("the needle".to_string());
+
+        // The UI only ever holds a batch at a time, so a search that looked at what was
+        // already fetched would never find this one.
+        let page = page_of(all, Some("needle"), 0, Some(10));
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].id, "40");
+    }
+
+    #[test]
+    fn a_search_matches_the_name_the_id_and_the_working_directory() {
+        let mut named = info("a", "2026/09/16");
+        named.thread_name = Some("Refactor the parser".to_string());
+        let mut located = info("b", "2026/09/16");
+        located.cwd = Some("/Users/dev/projects/widget".to_string());
+        let by_id = info("c-unique-id", "2026/09/16");
+        let all = vec![named, located, by_id];
+
+        assert_eq!(page_of(all.clone(), Some("refactor"), 0, None).total, 1);
+        assert_eq!(page_of(all.clone(), Some("WIDGET"), 0, None).total, 1);
+        assert_eq!(page_of(all, Some("c-unique"), 0, None).total, 1);
+    }
+
+    #[test]
+    fn a_blank_search_is_the_same_as_no_search() {
+        let all: Vec<CodexSessionInfo> =
+            (0..4).map(|i| info(&i.to_string(), "2026/09/16")).collect();
+
+        assert_eq!(page_of(all, Some("   "), 0, None).total, 4);
+    }
+
+    #[test]
+    fn group_counts_cover_the_whole_list_not_the_batch() {
+        let mut all: Vec<CodexSessionInfo> =
+            (0..8).map(|i| info(&i.to_string(), "2026/09/16")).collect();
+        all.extend((8..11).map(|i| info(&i.to_string(), "2026/09/15")));
+
+        // The sidebar shows these on its date headers, so a count of what happens to be
+        // loaded would read far too low until the user scrolled to the bottom.
+        let page = page_of(all, None, 0, Some(2));
+
+        assert_eq!(
+            page.groups,
+            vec![
+                DateGroupCount {
+                    date_group: "2026/09/16".to_string(),
+                    count: 8
+                },
+                DateGroupCount {
+                    date_group: "2026/09/15".to_string(),
+                    count: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_counts_leave_out_inline_workers() {
+        let mut all = vec![info("parent", "2026/09/16"), info("worker", "2026/09/16")];
+        all[1].is_inline_worker = true;
+
+        // The tree draws an inline worker under its parent, not as a row of its own.
+        assert_eq!(page_of(all, None, 0, None).groups[0].count, 1);
+    }
+
+    #[test]
+    fn a_session_with_no_date_is_grouped_as_unknown() {
+        let all = vec![info("a", "")];
+
+        assert_eq!(page_of(all, None, 0, None).groups[0].date_group, "unknown");
+    }
+
+    #[test]
+    fn a_date_that_turns_up_again_further_down_lands_in_the_same_group() {
+        let all = vec![
+            info("a", "2026/09/16"),
+            info("b", "2026/09/15"),
+            info("c", "2026/09/16"),
+        ];
+
+        // The tree groups through a Map, so it would merge these; the counts have to agree.
+        let page = page_of(all, None, 0, None);
+        assert_eq!(page.groups.len(), 2);
+        assert_eq!(page.groups[0].count, 2);
     }
 }

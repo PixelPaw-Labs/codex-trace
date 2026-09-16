@@ -218,7 +218,11 @@ describe("App worker panel", () => {
             clients: [],
           };
         case "list_sessions":
-          return [makeSessionInfo()];
+          return {
+            sessions: [makeSessionInfo()],
+            total: 1,
+            groups: [{ date_group: "2026/04/26", count: 1 }],
+          };
         // The session load carries only the turn index; bodies arrive per turn.
         case "load_session":
           return {

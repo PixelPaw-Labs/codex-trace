@@ -1,4 +1,4 @@
-import { useRef, useMemo } from "react";
+import { useRef, useMemo, useCallback, useEffect } from "react";
 import type { CodexSessionInfo } from "../../shared/types";
 import { formatTokens, truncate } from "../../shared/format";
 import { shortModel, formatExactTime } from "../lib/format";
@@ -12,10 +12,26 @@ import { VscTerminal } from "react-icons/vsc";
 interface SessionPickerProps {
   sessions: CodexSessionInfo[];
   loading: boolean;
+  loadingMore?: boolean;
+  hasMore?: boolean;
   searchQuery: string;
   selectedIndex: number;
   onSelectSession: (info: CodexSessionInfo) => void;
   onSearchChange: (q: string) => void;
+  onReachEnd?: () => void;
+}
+
+/** How close to the bottom of a list counts as "at the end", in pixels. Generous enough
+ * that the next batch is on its way before the user runs out of rows to read. */
+export const LOAD_MORE_THRESHOLD_PX = 600;
+
+/** Whether a scroller is close enough to its end to ask for the next batch. */
+export function isNearEnd(el: {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+}): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= LOAD_MORE_THRESHOLD_PX;
 }
 
 function groupByDate(
@@ -33,14 +49,31 @@ function groupByDate(
 export function SessionPicker({
   sessions,
   loading,
+  loadingMore = false,
+  hasMore = false,
   searchQuery,
   selectedIndex,
   onSelectSession,
   onSearchChange,
+  onReachEnd,
 }: SessionPickerProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const selectedRef = useScrollToSelected(selectedIndex);
+
+  const handleScroll = useCallback(() => {
+    const el = listRef.current;
+    if (el && isNearEnd(el)) onReachEnd?.();
+  }, [onReachEnd]);
+
+  // Re-checked whenever the number of rows changes: a batch that does not fill the
+  // viewport leaves nothing to scroll, so no scroll event would ever arrive to ask for
+  // the rest and the list would strand at one batch.
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || !hasMore) return;
+    if (sessions.length === 0 || isNearEnd(el)) onReachEnd?.();
+  }, [hasMore, sessions.length, onReachEnd]);
 
   const totalTokens = useMemo(
     () => sessions.reduce((acc, s) => acc + (s.total_tokens ?? 0), 0),
@@ -72,7 +105,7 @@ export function SessionPicker({
         />
       </div>
 
-      <div ref={listRef} className="picker__list">
+      <div ref={listRef} className="picker__list" onScroll={handleScroll}>
         {loading && <div className="picker__loading">Loading…</div>}
 
         {!loading && sessions.length === 0 && (
@@ -162,6 +195,12 @@ export function SessionPicker({
             })}
           </div>
         ))}
+
+        {hasMore && (
+          <div className="picker__loading-more">
+            {loadingMore ? "Loading more…" : "Scroll for more"}
+          </div>
+        )}
       </div>
     </div>
   );

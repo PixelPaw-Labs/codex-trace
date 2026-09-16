@@ -245,8 +245,12 @@ export function App() {
             sessions={picker.allSessions}
             selectedPath={session.sessionPath || null}
             collapsedDates={collapsedDates}
+            groupCounts={picker.groups}
+            loadingMore={picker.loadingMore}
+            hasMore={picker.hasMore}
             onSelectSession={handleSelectSession}
             onToggleDate={handleToggleDate}
+            onReachEnd={picker.loadMore}
           />
         </div>
 
@@ -258,10 +262,13 @@ export function App() {
             <SessionPicker
               sessions={picker.sessions}
               loading={picker.loading}
+              loadingMore={picker.loadingMore}
+              hasMore={picker.hasMore}
               searchQuery={picker.searchQuery}
               selectedIndex={pickerSelected}
               onSelectSession={handleSelectSession}
               onSearchChange={picker.setSearchQuery}
+              onReachEnd={picker.loadMore}
             />
           )}
 

@@ -2552,6 +2552,11 @@ body {
   padding: 0 5px;
   font-size: 11px;
 }
+.sidebar-tree__loading-more {
+  padding: 8px 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
 .sidebar-tree__session {
   display: flex;
   flex-direction: column;
@@ -2817,6 +2822,14 @@ body {
   gap: 8px;
   padding: 24px;
   color: var(--text-dim);
+}
+.picker__loading-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  color: var(--text-dim);
+  font-size: 12px;
 }
 
 /* Turn list */

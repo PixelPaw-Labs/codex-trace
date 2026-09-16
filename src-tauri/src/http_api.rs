@@ -422,6 +422,12 @@ async fn api_whoami(identity: Option<Extension<auth::ClientIdentity>>) -> Respon
 #[derive(Deserialize)]
 struct DiscoverBody {
     dir: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    query: Option<String>,
 }
 
 async fn api_discover_sessions(
@@ -434,7 +440,12 @@ async fn api_discover_sessions(
         Err(e) => return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     app_state.apply_watched_ongoing(&mut sessions);
-    ok_json(&sessions)
+    ok_json(&crate::parser::discover::page_of(
+        sessions,
+        body.query.as_deref(),
+        body.offset.unwrap_or(0),
+        body.limit,
+    ))
 }
 
 #[derive(Deserialize)]

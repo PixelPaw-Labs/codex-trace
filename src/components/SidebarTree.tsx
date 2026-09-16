@@ -1,15 +1,22 @@
-import { useCallback, useMemo, useState } from "react";
-import type { CodexSessionInfo } from "../../shared/types";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CodexSessionInfo, DateGroupCount } from "../../shared/types";
 import { timeAgo } from "../../shared/format";
 import { sessionDisplayName } from "../lib/sessionDisplay";
 import { OngoingDots } from "./OngoingDots";
+import { isNearEnd } from "./SessionPicker";
 
 interface SidebarTreeProps {
   sessions: CodexSessionInfo[];
   selectedPath: string | null;
   collapsedDates: Set<string>;
+  /** How many sessions each date really has, counted across the whole directory rather
+   * than across the batches fetched so far. */
+  groupCounts?: DateGroupCount[];
+  loadingMore?: boolean;
+  hasMore?: boolean;
   onSelectSession: (info: CodexSessionInfo) => void;
   onToggleDate: (dateGroup: string) => void;
+  onReachEnd?: () => void;
 }
 
 /** Map each parent session id → its resolved inline worker sessions. */
@@ -43,13 +50,36 @@ export function SidebarTree({
   sessions,
   selectedPath,
   collapsedDates,
+  groupCounts,
+  loadingMore = false,
+  hasMore = false,
   onSelectSession,
   onToggleDate,
+  onReachEnd,
 }: SidebarTreeProps) {
   const [expandedWorkers, setExpandedWorkers] = useState<Set<string>>(new Set());
+  const treeRef = useRef<HTMLDivElement>(null);
 
   const workerMap = useMemo(() => buildWorkerMap(sessions), [sessions]);
   const grouped = useMemo(() => groupByDate(sessions), [sessions]);
+  const totalByDate = useMemo(
+    () => new Map((groupCounts ?? []).map((g) => [g.date_group, g.count])),
+    [groupCounts],
+  );
+
+  const handleScroll = useCallback(() => {
+    const el = treeRef.current;
+    if (el && isNearEnd(el)) onReachEnd?.();
+  }, [onReachEnd]);
+
+  // Re-checked whenever the number of rows changes: a batch that does not fill the
+  // sidebar leaves nothing to scroll, so no scroll event would ever arrive to ask for
+  // the rest and the tree would strand at one batch.
+  useEffect(() => {
+    const el = treeRef.current;
+    if (!el || !hasMore) return;
+    if (sessions.length === 0 || isNearEnd(el)) onReachEnd?.();
+  }, [hasMore, sessions.length, onReachEnd]);
 
   const handleToggleDate = useCallback(
     (e: React.MouseEvent, dateGroup: string) => {
@@ -78,7 +108,7 @@ export function SidebarTree({
   }
 
   return (
-    <div className="sidebar-tree">
+    <div ref={treeRef} className="sidebar-tree" onScroll={handleScroll}>
       {Array.from(grouped.entries()).map(([dateGroup, group]) => {
         const collapsed = collapsedDates.has(dateGroup);
         return (
@@ -94,7 +124,9 @@ export function SidebarTree({
             >
               <span className="sidebar-tree__chevron">{collapsed ? "▶" : "▼"}</span>
               <span className="sidebar-tree__date">{dateGroup}</span>
-              <span className="sidebar-tree__count">{group.length}</span>
+              <span className="sidebar-tree__count">
+                {totalByDate.get(dateGroup) ?? group.length}
+              </span>
             </div>
 
             {!collapsed &&
@@ -185,6 +217,12 @@ export function SidebarTree({
           </div>
         );
       })}
+
+      {hasMore && (
+        <div className="sidebar-tree__loading-more">
+          {loadingMore ? "Loading more…" : "Scroll for more"}
+        </div>
+      )}
     </div>
   );
 }

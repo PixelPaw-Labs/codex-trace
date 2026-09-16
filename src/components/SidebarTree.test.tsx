@@ -249,4 +249,129 @@ describe("SidebarTree", () => {
     );
     expect(screen.getByText("worker")).toBeInTheDocument();
   });
+
+  it("shows the count for the whole date, not just the sessions loaded so far", () => {
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        groupCounts={[{ date_group: "2026/04/26", count: 312 }]}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+    // One row is loaded; the day really holds 312. Showing "1" would be a lie.
+    expect(screen.getByText("312")).toBeInTheDocument();
+  });
+
+  it("falls back to counting the loaded rows when no counts were given", () => {
+    render(
+      <SidebarTree
+        sessions={[makeSession(), makeSession({ id: "b", path: "/b.jsonl" })]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("2")).toBeInTheDocument();
+  });
+
+  it("asks for more when the tree is scrolled near its end", () => {
+    const onReachEnd = vi.fn();
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        hasMore
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+        onReachEnd={onReachEnd}
+      />,
+    );
+    const tree = document.querySelector(".sidebar-tree") as HTMLElement;
+    Object.defineProperty(tree, "scrollHeight", { value: 5000, configurable: true });
+    Object.defineProperty(tree, "clientHeight", { value: 800, configurable: true });
+    tree.scrollTop = 4000;
+
+    fireEvent.scroll(tree);
+
+    expect(onReachEnd).toHaveBeenCalled();
+  });
+
+  it("does not ask for more while the user is still near the top", () => {
+    const onReachEnd = vi.fn();
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        hasMore
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+        onReachEnd={onReachEnd}
+      />,
+    );
+    onReachEnd.mockClear();
+    const tree = document.querySelector(".sidebar-tree") as HTMLElement;
+    Object.defineProperty(tree, "scrollHeight", { value: 5000, configurable: true });
+    Object.defineProperty(tree, "clientHeight", { value: 800, configurable: true });
+    tree.scrollTop = 100;
+
+    fireEvent.scroll(tree);
+
+    expect(onReachEnd).not.toHaveBeenCalled();
+  });
+
+  it("says there is more to come while batches are still outstanding", () => {
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        hasMore
+        loadingMore
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Loading more\u2026")).toBeInTheDocument();
+  });
+
+  it("asks for more on its own when the batch does not fill the sidebar", () => {
+    const onReachEnd = vi.fn();
+    // Nothing to scroll means no scroll event, so the tree has to ask by itself or it
+    // would strand at one batch forever.
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        hasMore
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+        onReachEnd={onReachEnd}
+      />,
+    );
+
+    expect(onReachEnd).toHaveBeenCalled();
+  });
+
+  it("does not ask on its own once the whole tree is loaded", () => {
+    const onReachEnd = vi.fn();
+    render(
+      <SidebarTree
+        sessions={[makeSession()]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+        onReachEnd={onReachEnd}
+      />,
+    );
+
+    expect(onReachEnd).not.toHaveBeenCalled();
+  });
 });

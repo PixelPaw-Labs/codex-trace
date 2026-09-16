@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use super::compression::open_session_reader;
-use super::entry::{extract_session_id, RawEntry};
+use super::entry::{extract_session_id, parse_line_value, RawEntry};
 use super::mentions::referenced_thread_ids;
 use super::spawn::parse_spawn_agent_output;
 
@@ -211,7 +211,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         .filter(|l| !l.trim().is_empty());
 
     let first_line = lines.next()?;
-    let first: Value = serde_json::from_str(&first_line).ok()?;
+    let first: Value = parse_line_value(&first_line)?;
 
     // Skip state placeholders
     if first.get("record_type").and_then(|t| t.as_str()) == Some("state") {
@@ -365,9 +365,8 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(v) = parse_line_value(&line) else {
+            continue;
         };
 
         let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");

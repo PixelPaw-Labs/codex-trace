@@ -3,6 +3,7 @@ import type { ViewState, CodexSessionInfo, CodexToolCall } from "../shared/types
 import { useSession } from "./hooks/useSession";
 import { usePicker, resolveSessionsDir } from "./hooks/usePicker";
 import { useToggleSet } from "./hooks/useToggleSet";
+import { useFontScale } from "./hooks/useFontScale";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { SidebarTree } from "./components/SidebarTree";
 import { SessionPicker } from "./components/SessionPicker";
@@ -40,6 +41,7 @@ export function App() {
   const [showKeybinds, setShowKeybinds] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [showSettings, setShowSettings] = useState(false);
+  const [fontScale, setFontScale] = useFontScale();
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
   const [workerPanelWidth, setWorkerPanelWidth] = useState(380);
   const [workerPanelCallId, setWorkerPanelCallId] = useState<string | null>(null);
@@ -269,6 +271,10 @@ export function App() {
 
           {view === "list" && !session.loading && session.session && (
             <TurnList
+              // Root CSS zoom invalidates Virtuoso's cached row geometry.
+              // Remount at the new scale so its first measurements all use one
+              // coordinate space.
+              key={fontScale}
               summaries={summaries}
               selectedIndex={selectedTurn}
               onSelectTurn={(i) => {
@@ -318,6 +324,8 @@ export function App() {
 
       {showSettings && (
         <SettingsModal
+          fontScale={fontScale}
+          onFontScaleChange={setFontScale}
           onClose={() => setShowSettings(false)}
           onSaved={(dir) => {
             discoverSessions(dir);

@@ -1,6 +1,9 @@
-import type { ViewState } from "../../shared/types";
+import type { IndexProgress, ViewState } from "../../shared/types";
+import { IndexProgressBar } from "./IndexProgressBar";
 
 interface KeybindBarProps {
+  /** How far the backend has got reading the sessions directory. */
+  index: IndexProgress;
   view: ViewState;
   showHints?: boolean;
   onToggle?: () => void;
@@ -41,26 +44,29 @@ function getKeys(view: ViewState): KeyHint[] {
   }
 }
 
-export function KeybindBar({ view, showHints = true, onToggle }: KeybindBarProps) {
+export function KeybindBar({ index, view, showHints = true, onToggle }: KeybindBarProps) {
   const keys = getKeys(view);
   return (
     <div className="keybind-bar">
-      {showHints &&
-        keys.map((hint) => (
-          <span key={hint.key} className="keybind-bar__item">
-            <span className="keybind-bar__key">{hint.key}</span>
-            <span className="keybind-bar__label">{hint.label}</span>
-          </span>
-        ))}
-      {onToggle && (
-        <button
-          className="keybind-bar__toggle"
-          onClick={onToggle}
-          title={showHints ? "Hide keybinds" : "Show keybinds"}
-        >
-          ?
-        </button>
-      )}
+      <IndexProgressBar progress={index} />
+      <div className="keybind-bar__hints">
+        {showHints &&
+          keys.map((hint) => (
+            <span key={hint.key} className="keybind-bar__item">
+              <span className="keybind-bar__key">{hint.key}</span>
+              <span className="keybind-bar__label">{hint.label}</span>
+            </span>
+          ))}
+        {onToggle && (
+          <button
+            className="keybind-bar__toggle"
+            onClick={onToggle}
+            title={showHints ? "Hide keybinds" : "Show keybinds"}
+          >
+            ?
+          </button>
+        )}
+      </div>
     </div>
   );
 }

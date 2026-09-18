@@ -6,7 +6,6 @@ import { useToggleSet } from "./hooks/useToggleSet";
 import { useFontScale } from "./hooks/useFontScale";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { SidebarTree } from "./components/SidebarTree";
-import { IndexProgressBar } from "./components/IndexProgressBar";
 import { SessionPicker } from "./components/SessionPicker";
 import { TurnList } from "./components/TurnList";
 import { TurnDetail } from "./components/TurnDetail";
@@ -242,7 +241,6 @@ export function App() {
           <div className="app__sidebar-header">
             <span className="app__sidebar-title">SESSIONS</span>
           </div>
-          <IndexProgressBar progress={picker.index} />
           <SidebarTree
             sessions={picker.allSessions}
             selectedPath={session.sessionPath || null}
@@ -327,6 +325,7 @@ export function App() {
 
       {/* Bottom keybind bar */}
       <KeybindBar
+        index={picker.index}
         view={view}
         showHints={showKeybinds}
         onToggle={() => setShowKeybinds((p) => !p)}

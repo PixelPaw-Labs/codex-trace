@@ -19,6 +19,7 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     is_ongoing: false,
     is_external_worker: false,
     is_inline_worker: false,
+    parent_session_id: null,
     is_headless: false,
     is_archived: false,
     approval_mode: null,

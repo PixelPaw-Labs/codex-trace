@@ -20,6 +20,7 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     is_ongoing: false,
     is_external_worker: false,
     is_inline_worker: false,
+    parent_session_id: null,
     is_headless: false,
     is_archived: false,
     approval_mode: null,
@@ -39,6 +40,7 @@ function renderPicker(props: Partial<Parameters<typeof SessionPicker>[0]> = {}) 
   render(
     <SessionPicker
       sessions={[makeSession()]}
+      index={{ files_read: 1, total_files: 1, bytes_read: 1, total_bytes: 1, done: true }}
       loading={false}
       searchQuery=""
       selectedIndex={-1}

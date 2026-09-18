@@ -3,6 +3,7 @@ import { invoke } from "../lib/invoke";
 import type {
   CodexSessionInfo,
   DateGroupCount,
+  IndexProgress,
   SessionPage,
   SettingsResponse,
 } from "../../shared/types";
@@ -24,7 +25,17 @@ interface PickerState {
   loadingMore: boolean;
   searchQuery: string;
   sessionsDir: string;
+  /** How far the backend has got through the directory. */
+  index: IndexProgress;
 }
+
+const indexNotStarted: IndexProgress = {
+  files_read: 0,
+  total_files: 0,
+  bytes_read: 0,
+  total_bytes: 0,
+  done: true,
+};
 
 const emptyState: PickerState = {
   sessions: [],
@@ -34,6 +45,7 @@ const emptyState: PickerState = {
   loadingMore: false,
   searchQuery: "",
   sessionsDir: "",
+  index: indexNotStarted,
 };
 
 /**
@@ -87,6 +99,7 @@ export function usePicker() {
           groups: page.groups,
           loading: false,
           loadingMore: false,
+          index: page.index,
         }));
         return true;
       } catch (err) {
@@ -174,6 +187,20 @@ export function usePicker() {
     await fetchBatch(0, requestedRef.current || SESSION_BATCH, "replace");
   });
 
+  // How far the backend has got walking the directory, several times a second while it
+  // runs. Only the bar moves on these: the walk sends a `picker-refresh` of its own
+  // whenever it has actually read more sessions, so fetching rows here too would put the
+  // whole visible list on the wire four times a second for minutes.
+  useTauriEvent<IndexProgress>("index-progress", (progress) => {
+    setState((prev) =>
+      prev.index.files_read === progress.files_read &&
+      prev.index.total_files === progress.total_files &&
+      prev.index.done === progress.done
+        ? prev
+        : { ...prev, index: progress },
+    );
+  });
+
   useEffect(() => {
     return () => {
       clearTimeout(searchTimerRef.current);
@@ -186,6 +213,7 @@ export function usePicker() {
     allSessions: state.sessions,
     total: state.total,
     groups: state.groups,
+    index: state.index,
     loading: state.loading,
     loadingMore: state.loadingMore,
     hasMore: state.sessions.length < state.total,

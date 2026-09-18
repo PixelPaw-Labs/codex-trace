@@ -143,6 +143,7 @@ function makeSessionInfo(): CodexSessionInfo {
     is_ongoing: false,
     is_external_worker: false,
     is_inline_worker: false,
+    parent_session_id: null,
     is_headless: false,
     is_archived: false,
     approval_mode: null,
@@ -222,6 +223,7 @@ describe("App worker panel", () => {
             sessions: [makeSessionInfo()],
             total: 1,
             groups: [{ date_group: "2026/04/26", count: 1 }],
+            index: { files_read: 1, total_files: 1, bytes_read: 1, total_bytes: 1, done: true },
           };
         // The session load carries only the turn index; bodies arrive per turn.
         case "load_session":

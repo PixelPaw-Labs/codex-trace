@@ -1686,8 +1686,7 @@ mod tests {
         // a complete turn.
         let esc = '\x1b';
         let corrupted_user_msg = format!(
-            r#"{{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {}[31m red text"}}}}"#,
-            esc
+            r#"{{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {esc}[31m red text"}}}}"#
         );
         let lines = [
             r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-corrupt-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,

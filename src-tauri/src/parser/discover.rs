@@ -31,6 +31,15 @@ pub struct CodexSessionInfo {
     pub is_external_worker: bool,
     /// true when this session's id appears in another session's spawned_worker_ids (inline collab worker)
     pub is_inline_worker: bool,
+    /// The session that spawned this one, so the sidebar can draw it underneath its
+    /// orchestrator instead of alongside it. Two sources, because neither covers every
+    /// Codex version: the orchestrator's own `spawn_agent` output (`spawned_worker_ids`),
+    /// and this session's `session_meta.parent_thread_id`. Multi-agent v2 (Codex v0.153.x)
+    /// returns only a task path such as `{"task_name":"/root/batch_1"}` from `spawn_agent`,
+    /// so for those the child's own metadata is the only link back to the orchestrator.
+    /// The scan fills this in from metadata alone; `discover_sessions` then clears it when
+    /// no scanned session has that id, leaving an orphan at the top level.
+    pub parent_session_id: Option<String>,
     pub worker_nickname: Option<String>,
     pub worker_role: Option<String>,
     pub spawned_worker_ids: Vec<String>,
@@ -109,38 +118,138 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
         return Ok(Vec::new());
     }
 
-    let mut infos: Vec<CodexSessionInfo> = Vec::new();
-    let mut seen: Vec<std::path::PathBuf> = Vec::new();
-    collect_jsonl_files(sessions_dir, &mut infos, &mut seen)?;
-    // Forget files this walk did not find, and keep what it did across restarts.
-    super::scan_cache::retain_and_persist(sessions_dir, &seen);
+    discover_sessions_streaming(sessions_dir, |_| true)
+}
 
-    // Sort newest first (ISO timestamp in filename is lexicographically sortable)
-    infos.sort_by(|a, b| {
-        let fa = Path::new(&a.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let fb = Path::new(&b.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        fb.cmp(fa)
-    });
+/// What a walk in progress has to show for itself.
+pub struct ScanUpdate<'a> {
+    /// Every session read so far, ordered and linked as the picker wants them, so a
+    /// caller can put them on screen before the walk reaches the end.
+    ///
+    /// Unchanged between the updates that arrive part-way through a single file.
+    pub sessions: &'a [CodexSessionInfo],
+    /// Session files finished so far, including any that turned out not to parse.
+    pub files_read: usize,
+    /// Bytes read so far. The honest measure of how much work is left: one session
+    /// file can be tens of gigabytes and thousands of others a few kilobytes each.
+    pub bytes_read: u64,
+}
 
-    // Second pass: mark inline workers — sessions whose id appears in any parent's spawned_worker_ids.
-    use std::collections::HashSet;
-    let inline_worker_ids: HashSet<String> = infos
-        .iter()
-        .flat_map(|s| s.spawned_worker_ids.iter().cloned())
-        .collect();
-    for info in &mut infos {
-        if inline_worker_ids.contains(&info.id) {
-            info.is_inline_worker = true;
-        }
+/// [`discover_sessions`], reporting each file as it goes.
+///
+/// A cold walk of a real sessions directory runs for minutes, and until it finished the
+/// picker had nothing to show. `on_file` is called after every file with everything read
+/// up to that point; the caller decides how often to act on it, and returns false to stop
+/// the walk. Directories are walked newest-day-first, so the sessions a user is most
+/// likely looking for arrive first.
+pub fn discover_sessions_streaming(
+    sessions_dir: &Path,
+    mut on_file: impl FnMut(ScanUpdate<'_>) -> bool,
+) -> Result<Vec<CodexSessionInfo>, String> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
     }
 
-    Ok(infos)
+    let mut scanned: Vec<CodexSessionInfo> = Vec::new();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let mut counted = ScanCounts::default();
+    let completed = collect_jsonl_files(
+        sessions_dir,
+        &mut scanned,
+        &mut seen,
+        &mut |sessions, counted: &ScanCounts| {
+            on_file(ScanUpdate {
+                sessions,
+                files_read: counted.files,
+                bytes_read: counted.bytes,
+            })
+        },
+        &mut counted,
+    )?;
+    // Forget files this walk did not find, and keep what it did across restarts. Only a
+    // walk that ran to the end knows what is missing; pruning after a stopped one would
+    // drop every entry it had not reached yet.
+    if completed {
+        super::scan_cache::retain_and_persist(sessions_dir, &seen);
+    }
+
+    Ok(finalize(&scanned))
+}
+
+/// Put a set of scanned sessions in the order the picker draws them, and hang each one
+/// off the session that spawned it.
+///
+/// Takes a copy rather than reordering in place: a walk still in progress keeps calling
+/// this on what it has so far, and resolving lineage consumes the raw parent id recorded
+/// on each session — a child whose orchestrator has not been reached yet has to keep it.
+pub fn finalize(scanned: &[CodexSessionInfo]) -> Vec<CodexSessionInfo> {
+    let mut infos = scanned.to_vec();
+
+    // Sort newest first (ISO timestamp in filename is lexicographically sortable)
+    infos.sort_by(|a, b| file_name_of(&b.path).cmp(file_name_of(&a.path)));
+
+    // Second pass: hang every session off the one that spawned it. An orchestrator names
+    // its inline collab workers in `spawned_worker_ids`; a subagent names its orchestrator
+    // in its own `session_meta`. The first link wins where both exist, and a parent this
+    // scan never saw is dropped so the child stays at the top level.
+    use std::collections::{HashMap, HashSet};
+    let known_ids: HashSet<String> = infos.iter().map(|s| s.id.clone()).collect();
+    let spawn_parents: HashMap<String, String> = infos
+        .iter()
+        .flat_map(|parent| {
+            parent
+                .spawned_worker_ids
+                .iter()
+                .map(|worker_id| (worker_id.clone(), parent.id.clone()))
+        })
+        .collect();
+    for info in &mut infos {
+        let id = info.id.clone();
+        info.is_inline_worker = spawn_parents.contains_key(&id);
+        let from_meta = info.parent_session_id.take();
+        info.parent_session_id = spawn_parents
+            .get(&id)
+            .cloned()
+            .or(from_meta)
+            .filter(|parent| *parent != id && known_ids.contains(parent));
+    }
+
+    infos
+}
+
+fn file_name_of(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+}
+
+/// How many session files `sessions_dir` holds and how many bytes they come to,
+/// without opening any of them.
+///
+/// Reading a session file is the expensive part of discovery; listing directory entries
+/// and asking their size is not, so this is what gives a progress bar something to count
+/// against. Bytes matter as much as files: a directory of three thousand small sessions
+/// and one 22GB one is most of the way through by file count while almost none of the
+/// reading is done.
+pub fn measure_session_files(sessions_dir: &Path) -> (usize, u64) {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return (0, 0);
+    };
+    let mut files = 0;
+    let mut bytes = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let (sub_files, sub_bytes) = measure_session_files(&path);
+            files += sub_files;
+            bytes += sub_bytes;
+        } else if is_session_file(&path) {
+            files += 1;
+            bytes += file_len(&path);
+        }
+    }
+    (files, bytes)
 }
 
 /// How many top-level sessions a date has, for the sidebar's group headers. Counted over
@@ -151,6 +260,28 @@ pub struct DateGroupCount {
     pub count: usize,
 }
 
+/// How far the background walk of the sessions directory has got.
+///
+/// A cold walk of a large directory runs for minutes. The picker draws what has been
+/// read so far and shows a progress bar from these numbers, rather than sitting blank
+/// until the end.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexProgress {
+    /// Session files read so far.
+    pub files_read: usize,
+    /// Session files the directory holds, counted before any of them were read. Zero
+    /// until the count finishes, which takes milliseconds.
+    pub total_files: usize,
+    /// Bytes read so far. How full the bar is, because file counts lie: one session can
+    /// be 22GB and three thousand others a few kilobytes each, so a walk can be 90% of
+    /// the way through by files with almost all the reading still ahead of it.
+    pub bytes_read: u64,
+    /// Bytes the directory's session files come to.
+    pub total_bytes: u64,
+    /// False while a walk is still running. The picker hides the progress bar on true.
+    pub done: bool,
+}
+
 /// A slice of the discovered sessions, described well enough that the UI can show a
 /// correct header and know how much more there is without holding the rest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +290,10 @@ pub struct SessionPage {
     /// How many sessions match, not how many are in `sessions`.
     pub total: usize,
     pub groups: Vec<DateGroupCount>,
+    /// How much of the directory these sessions came from. `sessions` is everything
+    /// matching that has been read so far, which is not the whole directory until
+    /// `index.done`.
+    pub index: IndexProgress,
 }
 
 /// Whether `session` matches what the user typed. Name, id and working directory, the
@@ -183,6 +318,7 @@ pub fn page_of(
     query: Option<&str>,
     offset: usize,
     limit: Option<usize>,
+    index: IndexProgress,
 ) -> SessionPage {
     let needle = query.map(|q| q.trim().to_lowercase()).unwrap_or_default();
     let matched: Vec<CodexSessionInfo> = if needle.is_empty() {
@@ -194,12 +330,12 @@ pub fn page_of(
             .collect()
     };
 
-    // Inline workers are drawn under their parent rather than as rows of their own, so
+    // Sessions with a parent are drawn under it rather than as rows of their own, so
     // counting them here would make every group header read higher than the tree shows.
     // Keyed rather than run-length counted, to match the tree: it groups through a Map,
     // so a date that turns up again further down the list lands in the same group.
     let mut counts: indexmap::IndexMap<&str, usize> = indexmap::IndexMap::new();
-    for session in matched.iter().filter(|s| !s.is_inline_worker) {
+    for session in matched.iter().filter(|s| s.parent_session_id.is_none()) {
         let date_group = if session.date_group.is_empty() {
             "unknown"
         } else {
@@ -226,48 +362,71 @@ pub fn page_of(
         sessions: taken,
         total,
         groups,
+        index,
     }
 }
 
+/// Whether `path` is a session rollout this scanner should read.
+///
+/// Codex's background rollout compression worker (codex-rs/rollout/src/compression.rs,
+/// present since v0.137.0 and still active as of v0.146.0's #34566) replaces a cold
+/// `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
+/// file. Without recognizing the compressed suffix, discovery silently drops any
+/// session Codex has compressed — it just vanishes from the list with no indication.
+fn is_session_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !name.starts_with("rollout-") {
+        return false;
+    }
+    match name
+        .strip_suffix(".jsonl.zst")
+        .map(|stem| format!("{stem}.jsonl"))
+    {
+        // A plain sibling briefly coexists with its compressed copy while Codex
+        // materializes it back for append; skip the compressed copy in that case so
+        // the session isn't counted twice.
+        Some(plain_name) => !path.with_file_name(plain_name).exists(),
+        None => name.ends_with(".jsonl"),
+    }
+}
+
+/// Directory entries newest first, so a walk reaches today's sessions before last
+/// month's and a picker drawn mid-walk shows the rows a user actually came for.
+/// Both date directories and rollout filenames lead with an ISO date, which sorts
+/// lexicographically.
+fn entries_newest_first(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths
+        .sort_by(|a, b| file_name_of(&b.to_string_lossy()).cmp(file_name_of(&a.to_string_lossy())));
+    paths
+}
+
+/// How much of a walk is done.
+#[derive(Debug, Clone, Copy, Default)]
+struct ScanCounts {
+    files: usize,
+    bytes: u64,
+}
+
+/// Walk `dir`, returning false when `on_progress` asked to stop before the end.
 fn collect_jsonl_files(
     dir: &Path,
     infos: &mut Vec<CodexSessionInfo>,
     seen: &mut Vec<std::path::PathBuf>,
-) -> Result<(), String> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
+    on_progress: &mut impl FnMut(&[CodexSessionInfo], &ScanCounts) -> bool,
+    counted: &mut ScanCounts,
+) -> Result<bool, String> {
+    for path in entries_newest_first(dir) {
         if path.is_dir() {
-            collect_jsonl_files(&path, infos, seen)?;
-            continue;
-        }
-
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with("rollout-") {
-            continue;
-        }
-
-        // Codex's background rollout compression worker (codex-rs/rollout/src/compression.rs,
-        // present since v0.137.0 and still active as of v0.146.0's #34566) replaces a cold
-        // `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
-        // file. Without recognizing the compressed suffix, discovery silently drops any
-        // session Codex has compressed — it just vanishes from the list with no indication.
-        if let Some(plain_name) = name
-            .strip_suffix(".jsonl.zst")
-            .map(|s| format!("{s}.jsonl"))
-        {
-            // A plain sibling briefly coexists with its compressed copy while Codex
-            // materializes it back for append; skip the compressed copy in that case so
-            // the session isn't counted twice.
-            let plain_sibling = path.with_file_name(plain_name);
-            if plain_sibling.exists() {
-                continue;
+            if !collect_jsonl_files(&path, infos, seen, on_progress, counted)? {
+                return Ok(false);
             }
-        } else if !name.ends_with(".jsonl") {
+            continue;
+        }
+        if !is_session_file(&path) {
             continue;
         }
 
@@ -275,17 +434,64 @@ fn collect_jsonl_files(
 
         // Reading the file is the whole cost of discovery, so anything that has
         // not changed since it was last scanned is served without opening it.
-        if let Some(info) = super::scan_cache::get(&path) {
+        let mut stop = false;
+        if let Some(cached) = super::scan_cache::get(&path) {
+            let mut info = cached.info;
+            if cached.needs_lineage {
+                info.parent_session_id = scan_parent_thread_id(&path);
+                super::scan_cache::put_lineage(&path, info.parent_session_id.clone());
+            }
+            // Nothing was read, but the bar counts a cached file as covered ground.
+            counted.bytes += file_len(&path);
             infos.push(info);
-            continue;
+        } else {
+            // Reported from inside the read: one session file can be tens of gigabytes,
+            // and waiting until it is finished leaves the bar frozen for minutes.
+            let mut read_bytes = 0u64;
+            let scanned = {
+                let counted_bytes = counted.bytes;
+                let mut report = |delta: u64| {
+                    read_bytes += delta;
+                    counted.bytes = counted_bytes + read_bytes;
+                    stop = stop || !on_progress(infos, counted);
+                };
+                scan_session_file(&path, &mut report)
+            };
+            if let Some(info) = scanned {
+                super::scan_cache::put(&path, &info);
+                infos.push(info);
+            }
         }
-        if let Some(info) = scan_session_file(&path) {
-            super::scan_cache::put(&path, &info);
-            infos.push(info);
+
+        counted.files += 1;
+        if stop || !on_progress(infos, counted) {
+            return Ok(false);
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Read just the orchestrator link off a session's first line.
+///
+/// For a session cached by a build that never looked for one. A full rescan would
+/// answer the same question by reading every line of a file that can be hundreds of
+/// megabytes; `session_meta` is line one, so this stops there.
+fn scan_parent_thread_id(path: &Path) -> Option<String> {
+    let reader = open_session_reader(path).ok()?;
+    let first = reader
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| !line.trim().is_empty())?;
+    let entry = RawEntry::parse(&first)?;
+    if entry.entry_type != "session_meta" {
+        return None;
+    }
+    parent_thread_id(&entry.payload)
 }
 
 /// Extract date group (YYYY/MM/DD) from the file path.
@@ -306,7 +512,13 @@ fn date_group_from_path(path: &Path) -> String {
 /// Streams the file line-by-line (decompressing zstd transparently) so peak
 /// memory stays bounded to a single line — session files can be hundreds of
 /// megabytes, and slurping every file into memory during discovery spiked RSS.
-fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
+/// How much of a file to read between calls to a scan's progress callback. Session
+/// files run to tens of gigabytes; reporting only once a file is finished leaves a
+/// progress bar frozen for minutes on one of those, and gives a throttle nothing to
+/// hold back in between.
+const SCAN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+
+fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<CodexSessionInfo> {
     let reader = open_session_reader(path).ok()?;
     let mut lines = reader
         .lines()
@@ -342,6 +554,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         approval_mode,
         history_base_thread_id,
         forked_from_thread_id,
+        parent_thread_id,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -410,6 +623,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            let parent_thread_id = parent_thread_id(payload);
             (
                 id,
                 start_time,
@@ -427,6 +641,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 approval_mode,
                 history_base_thread_id,
                 forked_from_thread_id,
+                parent_thread_id,
             )
         }
         "session_meta_root" => {
@@ -439,7 +654,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false, None, None, None,
+                false, None, None, None, None,
             )
         }
         _ => return None,
@@ -464,7 +679,16 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
     // Codex v0.136.0: track archived state; initialised from session_meta.archived.
     let mut is_archived = meta_archived;
 
+    // The metadata line was read before this loop, so its bytes start the tally.
+    let mut unreported_bytes = first_line.len() as u64 + 1;
     for line in lines {
+        // Counted before anything else, so a run of lines this scanner ignores still
+        // moves the bar and still earns the walk its pause.
+        unreported_bytes += line.len() as u64 + 1;
+        if unreported_bytes >= SCAN_REPORT_BYTES {
+            on_bytes(unreported_bytes);
+            unreported_bytes = 0;
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -673,6 +897,10 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         }
     }
 
+    if unreported_bytes > 0 {
+        on_bytes(unreported_bytes);
+    }
+
     let date_group = date_group_from_path(path);
 
     Some(CodexSessionInfo {
@@ -691,6 +919,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         is_ongoing,
         is_external_worker,
         is_inline_worker: false, // set by discover_sessions second pass
+        parent_session_id: parent_thread_id, // resolved by discover_sessions second pass
         is_headless,
         is_archived,
         worker_nickname,
@@ -702,6 +931,21 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         history_base_thread_id,
         forked_from_thread_id,
         mentioned_thread_ids,
+    })
+}
+
+/// The orchestrator that spawned this session, as the session itself records it.
+///
+/// Codex writes it twice on a subagent's `session_meta`: once at the top level, once
+/// inside `source.subagent.thread_spawn`. Older subagent kinds (guardian review, memory
+/// consolidation) only carry the top-level one, so both are read.
+fn parent_thread_id(payload: &Value) -> Option<String> {
+    opt_str(payload, "parent_thread_id").or_else(|| {
+        payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .and_then(|subagent| subagent.get("thread_spawn"))
+            .and_then(|spawn| opt_str(spawn, "parent_thread_id"))
     })
 }
 
@@ -873,8 +1117,256 @@ mod tests {
         assert_eq!(parent.spawned_worker_ids, vec!["worker"]);
         assert!(child.is_external_worker);
         assert!(child.is_inline_worker);
+        assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(child.worker_nickname.as_deref(), Some("Parfit"));
         assert_eq!(child.worker_role.as_deref(), Some("worker"));
+    }
+
+    /// Two days of sessions, one file each, named so the walk order is checkable.
+    fn sessions_over_two_days(tmp: &Path) {
+        for (day, stamp) in [
+            ("2026/09/17", "2026-09-17T09-00-00"),
+            ("2026/09/18", "2026-09-18T09-00-00"),
+        ] {
+            let dir = tmp.join(day);
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = day.replace('/', "-");
+            std::fs::write(
+                dir.join(format!("rollout-{stamp}-{id}.jsonl")),
+                format!(
+                    r#"{{"timestamp":"{stamp}Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-09-18T09:00:00Z","cwd":"/tmp"}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_walk_reaches_the_newest_day_first() {
+        // The picker draws what has been read so far, so a walk that started with 2024
+        // would leave a user staring at ancient sessions while today's were still coming.
+        let tmp = tempdir().unwrap();
+        sessions_over_two_days(tmp.path());
+
+        let mut order: Vec<String> = Vec::new();
+        discover_sessions_streaming(tmp.path(), |update| {
+            if let Some(newest) = update.sessions.last() {
+                if order.last() != Some(&newest.id) {
+                    order.push(newest.id.clone());
+                }
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(order, vec!["2026-09-18", "2026-09-17"]);
+    }
+
+    #[test]
+    fn a_walk_reports_each_file_as_it_reads_it() {
+        let tmp = tempdir().unwrap();
+        sessions_over_two_days(tmp.path());
+
+        let mut files: Vec<usize> = Vec::new();
+        let mut bytes: Vec<u64> = Vec::new();
+        let sessions = discover_sessions_streaming(tmp.path(), |update| {
+            files.push(update.files_read);
+            bytes.push(update.bytes_read);
+            true
+        })
+        .unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        // Reports also arrive part-way through a file, so a file count can repeat; it
+        // must never go backwards, and must end on every file read.
+        assert!(files.windows(2).all(|w| w[0] <= w[1]), "{files:?}");
+        assert_eq!(files.last(), Some(&2));
+        assert!(bytes.windows(2).all(|w| w[0] <= w[1]), "{bytes:?}");
+        assert!(bytes.last().is_some_and(|&b| b > 0));
+    }
+
+    #[test]
+    fn a_walk_stops_when_asked_and_keeps_what_it_read() {
+        // Changing the sessions directory supersedes a walk; it must not spend minutes
+        // finishing one nobody is waiting for.
+        let tmp = tempdir().unwrap();
+        sessions_over_two_days(tmp.path());
+
+        let sessions = discover_sessions_streaming(tmp.path(), |_| false).unwrap();
+
+        assert_eq!(sessions.len(), 1, "stopped after the first file");
+    }
+
+    #[test]
+    fn counting_files_matches_what_a_walk_reads() {
+        let tmp = tempdir().unwrap();
+        sessions_over_two_days(tmp.path());
+        // Neither of these is a session file, so neither should be counted or read.
+        std::fs::write(tmp.path().join("2026/09/18/notes.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("2026/09/18/rollout-half.jsonl.tmp"), "x").unwrap();
+
+        let (counted, bytes) = measure_session_files(tmp.path());
+        let read = discover_sessions_streaming(tmp.path(), |_| true)
+            .unwrap()
+            .len();
+
+        assert_eq!(counted, 2);
+        assert_eq!(counted, read);
+        assert!(
+            bytes > 0,
+            "the bar fills by bytes, so they have to be counted"
+        );
+    }
+
+    #[test]
+    fn a_compressed_session_is_counted_once_even_beside_its_plain_copy() {
+        // Codex briefly keeps both while it materializes a rollout back for append. The
+        // count has to agree with the walk or the progress bar never reaches the end.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"timestamp":"2026-09-18T09:00:00Z","type":"session_meta","payload":{"id":"both","timestamp":"2026-09-18T09:00:00Z","cwd":"/tmp"}}"#;
+        std::fs::write(dir.join("rollout-2026-09-18T09-00-00-both.jsonl"), body).unwrap();
+        std::fs::write(dir.join("rollout-2026-09-18T09-00-00-both.jsonl.zst"), body).unwrap();
+
+        assert_eq!(measure_session_files(tmp.path()).0, 1);
+        assert_eq!(
+            discover_sessions_streaming(tmp.path(), |_| true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn discover_sessions_nests_a_multi_agent_v2_subagent_under_its_orchestrator() {
+        // Codex v0.153.x: spawn_agent answers with a task path and no agent id, so the
+        // orchestrator's own file never names the sessions it started. Without reading the
+        // subagent's parent_thread_id these all sat beside the orchestrator in the sidebar.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let orchestrator_path = day_dir.join("rollout-2026-09-18T14-53-52-orchestrator.jsonl");
+        std::fs::write(
+            &orchestrator_path,
+            [
+                r#"{"timestamp":"2026-09-18T02:53:52Z","type":"session_meta","payload":{"id":"orchestrator","timestamp":"2026-09-18T02:53:52Z","source":"exec"}}"#,
+                r#"{"timestamp":"2026-09-18T02:55:10Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-09-18T02:55:11Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"task_name\":\"batch_1\"}","call_id":"call_spawn"}}"#,
+                r#"{"timestamp":"2026-09-18T02:55:12Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn","output":"{\"task_name\":\"/root/batch_1\"}"}}"#,
+                r#"{"timestamp":"2026-09-18T02:55:13Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789700113.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let subagent_path = day_dir.join("rollout-2026-09-18T14-55-13-subagent.jsonl");
+        std::fs::write(
+            &subagent_path,
+            r#"{"timestamp":"2026-09-18T02:55:13Z","type":"session_meta","payload":{"id":"subagent","parent_thread_id":"orchestrator","timestamp":"2026-09-18T02:55:13Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"orchestrator","depth":1,"agent_nickname":"Mill","agent_role":null}}}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let orchestrator = sessions.iter().find(|s| s.id == "orchestrator").unwrap();
+        let subagent = sessions.iter().find(|s| s.id == "subagent").unwrap();
+
+        assert!(orchestrator.spawned_worker_ids.is_empty());
+        assert!(orchestrator.parent_session_id.is_none());
+        assert_eq!(subagent.parent_session_id.as_deref(), Some("orchestrator"));
+        assert!(!subagent.is_inline_worker);
+        assert!(subagent.is_external_worker);
+    }
+
+    #[test]
+    fn discover_sessions_nests_a_guardian_review_under_the_session_it_reviews() {
+        // Guardian review and memory-consolidation subagents carry no thread_spawn block,
+        // only the top-level parent_thread_id.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-09-08T15-26-47-desktop.jsonl"),
+            r#"{"timestamp":"2026-09-08T15:26:47Z","type":"session_meta","payload":{"id":"desktop","timestamp":"2026-09-08T15:26:47Z","cwd":"/tmp"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T09-23-12-guardian.jsonl"),
+            r#"{"timestamp":"2026-09-18T09:23:12Z","type":"session_meta","payload":{"id":"guardian","parent_thread_id":"desktop","timestamp":"2026-09-18T09:23:12Z","source":{"subagent":{"other":"guardian"}}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let guardian = sessions.iter().find(|s| s.id == "guardian").unwrap();
+
+        assert_eq!(guardian.parent_session_id.as_deref(), Some("desktop"));
+    }
+
+    #[test]
+    fn a_session_cached_before_lineage_scanning_is_nested_without_re_reading_it() {
+        // Upgrading must not force a re-read of every session file — that is minutes of
+        // pegged CPU on a real sessions directory. The parent is on line one, so a cached
+        // entry only needs its head read.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let orchestrator_path = day_dir.join("rollout-2026-09-18T14-53-52-orchestrator.jsonl");
+        std::fs::write(
+            &orchestrator_path,
+            r#"{"timestamp":"2026-09-18T02:53:52Z","type":"session_meta","payload":{"id":"cached-orchestrator","timestamp":"2026-09-18T02:53:52Z","source":"exec"}}"#,
+        )
+        .unwrap();
+        let subagent_path = day_dir.join("rollout-2026-09-18T14-55-13-subagent.jsonl");
+        std::fs::write(
+            &subagent_path,
+            r#"{"timestamp":"2026-09-18T02:55:13Z","type":"session_meta","payload":{"id":"cached-subagent","parent_thread_id":"cached-orchestrator","timestamp":"2026-09-18T02:55:13Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"cached-orchestrator","depth":1,"agent_nickname":"Mill"}}}}}"#,
+        )
+        .unwrap();
+
+        // A turn count no real scan of this file would produce, so the assertion below can
+        // tell a cache hit from a rescan.
+        let mut stale = scan_session_file(&subagent_path, &mut |_| {}).unwrap();
+        stale.turn_count = 999;
+        super::super::scan_cache::put(&subagent_path, &stale);
+        super::super::scan_cache::forget_lineage(&subagent_path);
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let subagent = sessions.iter().find(|s| s.id == "cached-subagent").unwrap();
+
+        assert_eq!(
+            subagent.turn_count, 999,
+            "served from the cache, not re-read"
+        );
+        assert_eq!(
+            subagent.parent_session_id.as_deref(),
+            Some("cached-orchestrator")
+        );
+    }
+
+    #[test]
+    fn discover_sessions_leaves_a_subagent_at_the_top_level_when_its_parent_is_missing() {
+        // The orchestrator's rollout can be deleted, archived elsewhere, or simply live
+        // outside the directory being scanned. An unresolvable parent must not hide the row.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T14-55-13-subagent.jsonl"),
+            r#"{"timestamp":"2026-09-18T02:55:13Z","type":"session_meta","payload":{"id":"subagent","parent_thread_id":"gone","timestamp":"2026-09-18T02:55:13Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"gone","depth":1,"agent_nickname":"Mill"}}}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let subagent = sessions.iter().find(|s| s.id == "subagent").unwrap();
+
+        assert!(subagent.parent_session_id.is_none());
+        assert_eq!(
+            page_of(sessions, None, 0, None, IndexProgress::default()).groups[0].count,
+            1
+        );
     }
 
     #[test]
@@ -2223,7 +2715,7 @@ mod tests {
             .map(|i| info(&i.to_string(), "2026/09/16"))
             .collect();
 
-        let page = page_of(all, None, 4, Some(3));
+        let page = page_of(all, None, 4, Some(3), IndexProgress::default());
 
         assert_eq!(
             page.sessions
@@ -2241,7 +2733,10 @@ mod tests {
             .collect();
 
         // Without this the list has no way to know whether to ask for more.
-        assert_eq!(page_of(all, None, 0, Some(3)).total, 10);
+        assert_eq!(
+            page_of(all, None, 0, Some(3), IndexProgress::default()).total,
+            10
+        );
     }
 
     #[test]
@@ -2249,7 +2744,7 @@ mod tests {
         let all: Vec<CodexSessionInfo> =
             (0..3).map(|i| info(&i.to_string(), "2026/09/16")).collect();
 
-        let page = page_of(all, None, 99, Some(10));
+        let page = page_of(all, None, 99, Some(10), IndexProgress::default());
 
         assert!(page.sessions.is_empty());
         assert_eq!(page.total, 3);
@@ -2260,7 +2755,12 @@ mod tests {
         let all: Vec<CodexSessionInfo> =
             (0..5).map(|i| info(&i.to_string(), "2026/09/16")).collect();
 
-        assert_eq!(page_of(all, None, 2, None).sessions.len(), 3);
+        assert_eq!(
+            page_of(all, None, 2, None, IndexProgress::default())
+                .sessions
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -2272,7 +2772,7 @@ mod tests {
 
         // The UI only ever holds a batch at a time, so a search that looked at what was
         // already fetched would never find this one.
-        let page = page_of(all, Some("needle"), 0, Some(10));
+        let page = page_of(all, Some("needle"), 0, Some(10), IndexProgress::default());
 
         assert_eq!(page.total, 1);
         assert_eq!(page.sessions.len(), 1);
@@ -2288,9 +2788,32 @@ mod tests {
         let by_id = info("c-unique-id", "2026/09/16");
         let all = vec![named, located, by_id];
 
-        assert_eq!(page_of(all.clone(), Some("refactor"), 0, None).total, 1);
-        assert_eq!(page_of(all.clone(), Some("WIDGET"), 0, None).total, 1);
-        assert_eq!(page_of(all, Some("c-unique"), 0, None).total, 1);
+        assert_eq!(
+            page_of(
+                all.clone(),
+                Some("refactor"),
+                0,
+                None,
+                IndexProgress::default()
+            )
+            .total,
+            1
+        );
+        assert_eq!(
+            page_of(
+                all.clone(),
+                Some("WIDGET"),
+                0,
+                None,
+                IndexProgress::default()
+            )
+            .total,
+            1
+        );
+        assert_eq!(
+            page_of(all, Some("c-unique"), 0, None, IndexProgress::default()).total,
+            1
+        );
     }
 
     #[test]
@@ -2298,7 +2821,10 @@ mod tests {
         let all: Vec<CodexSessionInfo> =
             (0..4).map(|i| info(&i.to_string(), "2026/09/16")).collect();
 
-        assert_eq!(page_of(all, Some("   "), 0, None).total, 4);
+        assert_eq!(
+            page_of(all, Some("   "), 0, None, IndexProgress::default()).total,
+            4
+        );
     }
 
     #[test]
@@ -2309,7 +2835,7 @@ mod tests {
 
         // The sidebar shows these on its date headers, so a count of what happens to be
         // loaded would read far too low until the user scrolled to the bottom.
-        let page = page_of(all, None, 0, Some(2));
+        let page = page_of(all, None, 0, Some(2), IndexProgress::default());
 
         assert_eq!(
             page.groups,
@@ -2327,19 +2853,26 @@ mod tests {
     }
 
     #[test]
-    fn group_counts_leave_out_inline_workers() {
+    fn group_counts_leave_out_sessions_drawn_under_a_parent() {
         let mut all = vec![info("parent", "2026/09/16"), info("worker", "2026/09/16")];
         all[1].is_inline_worker = true;
+        all[1].parent_session_id = Some("parent".to_string());
 
-        // The tree draws an inline worker under its parent, not as a row of its own.
-        assert_eq!(page_of(all, None, 0, None).groups[0].count, 1);
+        // The tree draws a spawned session under its parent, not as a row of its own.
+        assert_eq!(
+            page_of(all, None, 0, None, IndexProgress::default()).groups[0].count,
+            1
+        );
     }
 
     #[test]
     fn a_session_with_no_date_is_grouped_as_unknown() {
         let all = vec![info("a", "")];
 
-        assert_eq!(page_of(all, None, 0, None).groups[0].date_group, "unknown");
+        assert_eq!(
+            page_of(all, None, 0, None, IndexProgress::default()).groups[0].date_group,
+            "unknown"
+        );
     }
 
     #[test]
@@ -2351,7 +2884,7 @@ mod tests {
         ];
 
         // The tree groups through a Map, so it would merge these; the counts have to agree.
-        let page = page_of(all, None, 0, None);
+        let page = page_of(all, None, 0, None, IndexProgress::default());
         assert_eq!(page.groups.len(), 2);
         assert_eq!(page.groups[0].count, 2);
     }

@@ -1,5 +1,5 @@
 use super::redact::redact_secrets;
-use super::spawn::parse_spawn_agent_output;
+use super::spawn::{parse_spawn_agent_output, parse_spawn_task_name};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1255,8 +1255,15 @@ fn exec_tool_call_from_pending(
     }
 }
 
+/// Whether a `spawn_agent` call got its agent started.
+///
+/// Two success shapes, because the output changed shape with multi-agent v2 (Codex
+/// v0.153.x): the older `{"agent_id":...,"nickname":...}` and the newer
+/// `{"task_name":"/root/batch_1"}`. Reading only the older one painted every v2 spawn as
+/// failed. Empty output means Codex suppressed the metadata (hide_spawn_agent_metadata,
+/// default true since v0.137.0), which says nothing about the outcome.
 fn spawn_agent_status(output: &str) -> String {
-    if parse_spawn_agent_output(output).is_some() {
+    if parse_spawn_agent_output(output).is_some() || parse_spawn_task_name(output).is_some() {
         "completed"
     } else if output.trim().is_empty() {
         "unknown"
@@ -2241,6 +2248,43 @@ mod tests {
         let tool = &builder.finalized[0];
         assert_eq!(tool.kind, ToolKind::ImageGeneration);
         assert!(tool.image_prompt.is_none());
+    }
+
+    #[test]
+    fn v0153_spawn_agent_returning_only_a_task_name_is_completed() {
+        // Multi-agent v2 answers a successful spawn with just the new agent's task path.
+        // Reading only the older {"agent_id":...} shape marked every one of these failed.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_spawn_v2".to_string(),
+            "spawn_agent".to_string(),
+            r#"{"task_name":"batch_1","fork_turns":"all"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_spawn_v2", r#"{"task_name":"/root/batch_1"}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::SpawnAgent);
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn spawn_agent_with_an_error_message_is_still_failed() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_spawn_err".to_string(),
+            "spawn_agent".to_string(),
+            r#"{"task_name":"batch_1"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_spawn_err", "spawn failed: no capacity", None);
+
+        assert_eq!(builder.finalized[0].status, "failed");
     }
 
     #[test]

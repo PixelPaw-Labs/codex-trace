@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   contextRemainingPercent,
   formatDuration,
+  formatBytes,
   formatTokens,
   isLikelySandboxDenied,
   shortPath,
@@ -39,6 +40,16 @@ describe("formatDuration", () => {
   it("formats minutes with remaining seconds", () => {
     expect(formatDuration(90000)).toBe("1m 30s");
     expect(formatDuration(125000)).toBe("2m 5s");
+  });
+});
+
+describe("formatBytes", () => {
+  it("scales from bytes to gigabytes", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(999)).toBe("999 B");
+    expect(formatBytes(1_536)).toBe("1.5 KB");
+    expect(formatBytes(3_700_000)).toBe("3.7 MB");
+    expect(formatBytes(22_000_000_000)).toBe("22.0 GB");
   });
 });
 

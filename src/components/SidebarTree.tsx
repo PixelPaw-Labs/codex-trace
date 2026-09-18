@@ -19,31 +19,131 @@ interface SidebarTreeProps {
   onReachEnd?: () => void;
 }
 
-/** Map each parent session id → its resolved inline worker sessions. */
-function buildWorkerMap(sessions: CodexSessionInfo[]): Map<string, CodexSessionInfo[]> {
-  const byId = new Map(sessions.map((s) => [s.id, s]));
-  const map = new Map<string, CodexSessionInfo[]>();
-  for (const s of sessions) {
-    if (s.spawned_worker_ids.length === 0) continue;
-    const workers = s.spawned_worker_ids.flatMap((wid) => {
-      const w = byId.get(wid);
-      return w ? [w] : [];
-    });
-    if (workers.length > 0) map.set(s.id, workers);
-  }
-  return map;
+interface Lineage {
+  /** Each orchestrator's session id → the loaded sessions it spawned, newest first. */
+  workers: Map<string, CodexSessionInfo[]>;
+  /** Sessions drawn under an orchestrator, so the date groups can leave them out. */
+  nested: Set<string>;
 }
 
-/** Group top-level sessions (non-inline-workers) by date_group, preserving order. */
-function groupByDate(sessions: CodexSessionInfo[]): Map<string, CodexSessionInfo[]> {
+function buildLineage(sessions: CodexSessionInfo[]): Lineage {
+  const loaded = new Set(sessions.map((s) => s.id));
+  const workers = new Map<string, CodexSessionInfo[]>();
+  const nested = new Set<string>();
+  for (const s of sessions) {
+    const parentId = s.parent_session_id;
+    // A session whose orchestrator has not been fetched yet stays at the top level rather
+    // than vanishing — the orchestrator can be thousands of rows further down the list.
+    if (!parentId || !loaded.has(parentId)) continue;
+    const siblings = workers.get(parentId);
+    if (siblings) siblings.push(s);
+    else workers.set(parentId, [s]);
+    nested.add(s.id);
+  }
+  return { workers, nested };
+}
+
+/** Group top-level sessions by date_group, preserving order. */
+function groupByDate(
+  sessions: CodexSessionInfo[],
+  nested: Set<string>,
+): Map<string, CodexSessionInfo[]> {
   const map = new Map<string, CodexSessionInfo[]>();
   for (const s of sessions) {
-    if (s.is_inline_worker) continue;
+    if (nested.has(s.id)) continue;
     const dg = s.date_group || "unknown";
     if (!map.has(dg)) map.set(dg, []);
     map.get(dg)!.push(s);
   }
   return map;
+}
+
+interface SessionRowProps {
+  session: CodexSessionInfo;
+  /** 0 for a top-level session, one more for each orchestrator above it. */
+  depth: number;
+  workers: Map<string, CodexSessionInfo[]>;
+  expandedWorkers: Set<string>;
+  selectedPath: string | null;
+  onSelectSession: (info: CodexSessionInfo) => void;
+  onToggleWorkers: (e: React.MouseEvent, sessionId: string) => void;
+}
+
+function SessionRow({
+  session,
+  depth,
+  workers,
+  expandedWorkers,
+  selectedPath,
+  onSelectSession,
+  onToggleWorkers,
+}: SessionRowProps) {
+  const spawned = workers.get(session.id);
+  const expanded = expandedWorkers.has(session.id);
+  const isChild = depth > 0;
+
+  return (
+    <div>
+      <div
+        className={[
+          "sidebar-tree__session",
+          isChild ? "sidebar-tree__session--child" : "",
+          session.path === selectedPath ? "sidebar-tree__session--selected" : "",
+          session.is_ongoing ? "sidebar-tree__session--ongoing" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        style={isChild ? ({ "--tree-depth": depth } as React.CSSProperties) : undefined}
+        onClick={() => onSelectSession(session)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onSelectSession(session);
+        }}
+      >
+        <div className="sidebar-tree__session-row">
+          {isChild && (
+            <span className="sidebar-tree__badge sidebar-tree__badge--worker">worker</span>
+          )}
+          <span className="sidebar-tree__session-label">{sessionDisplayName(session)}</span>
+          {session.is_ongoing && <OngoingDots count={1} />}
+          <span className="sidebar-tree__time">{timeAgo(session.start_time)}</span>
+        </div>
+        {((!isChild && session.is_external_worker) || spawned) && (
+          <div className="sidebar-tree__session-meta">
+            {!isChild && session.is_external_worker && (
+              <span className="sidebar-tree__badge sidebar-tree__badge--external-worker">
+                worker
+              </span>
+            )}
+            {spawned && (
+              <button
+                className="sidebar-tree__workers-toggle"
+                onClick={(e) => onToggleWorkers(e, session.id)}
+              >
+                {expanded ? "▼" : "▶"} {spawned.length} workers
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {spawned &&
+        expanded &&
+        spawned.map((w) => (
+          <SessionRow
+            key={w.path}
+            session={w}
+            depth={depth + 1}
+            workers={workers}
+            expandedWorkers={expandedWorkers}
+            selectedPath={selectedPath}
+            onSelectSession={onSelectSession}
+            onToggleWorkers={onToggleWorkers}
+          />
+        ))}
+    </div>
+  );
 }
 
 export function SidebarTree({
@@ -60,8 +160,8 @@ export function SidebarTree({
   const [expandedWorkers, setExpandedWorkers] = useState<Set<string>>(new Set());
   const treeRef = useRef<HTMLDivElement>(null);
 
-  const workerMap = useMemo(() => buildWorkerMap(sessions), [sessions]);
-  const grouped = useMemo(() => groupByDate(sessions), [sessions]);
+  const lineage = useMemo(() => buildLineage(sessions), [sessions]);
+  const grouped = useMemo(() => groupByDate(sessions, lineage.nested), [sessions, lineage]);
   const totalByDate = useMemo(
     () => new Map((groupCounts ?? []).map((g) => [g.date_group, g.count])),
     [groupCounts],
@@ -130,90 +230,18 @@ export function SidebarTree({
             </div>
 
             {!collapsed &&
-              group.map((s) => {
-                const isSelected = s.path === selectedPath;
-                const workers = workerMap.get(s.id);
-                const workersExpanded = expandedWorkers.has(s.id);
-
-                return (
-                  <div key={s.path}>
-                    <div
-                      className={[
-                        "sidebar-tree__session",
-                        isSelected ? "sidebar-tree__session--selected" : "",
-                        s.is_ongoing ? "sidebar-tree__session--ongoing" : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onClick={() => onSelectSession(s)}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") onSelectSession(s);
-                      }}
-                    >
-                      <div className="sidebar-tree__session-row">
-                        <span className="sidebar-tree__session-label">{sessionDisplayName(s)}</span>
-                        {s.is_ongoing && <OngoingDots count={1} />}
-                        <span className="sidebar-tree__time">{timeAgo(s.start_time)}</span>
-                      </div>
-                      {(s.is_external_worker || workers) && (
-                        <div className="sidebar-tree__session-meta">
-                          {s.is_external_worker && (
-                            <span className="sidebar-tree__badge sidebar-tree__badge--external-worker">
-                              worker
-                            </span>
-                          )}
-                          {workers && (
-                            <button
-                              className="sidebar-tree__workers-toggle"
-                              onClick={(e) => handleToggleWorkers(e, s.id)}
-                            >
-                              {workersExpanded ? "▼" : "▶"} {workers.length} workers
-                            </button>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    {workers &&
-                      workersExpanded &&
-                      workers.map((w) => {
-                        const wSelected = w.path === selectedPath;
-                        return (
-                          <div
-                            key={w.path}
-                            className={[
-                              "sidebar-tree__session",
-                              "sidebar-tree__session--child",
-                              wSelected ? "sidebar-tree__session--selected" : "",
-                              w.is_ongoing ? "sidebar-tree__session--ongoing" : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" ")}
-                            onClick={() => onSelectSession(w)}
-                            role="button"
-                            tabIndex={0}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") onSelectSession(w);
-                            }}
-                          >
-                            <div className="sidebar-tree__session-row">
-                              <span className="sidebar-tree__badge sidebar-tree__badge--worker">
-                                worker
-                              </span>
-                              <span className="sidebar-tree__session-label">
-                                {sessionDisplayName(w)}
-                              </span>
-                              {w.is_ongoing && <OngoingDots count={1} />}
-                              <span className="sidebar-tree__time">{timeAgo(w.start_time)}</span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                  </div>
-                );
-              })}
+              group.map((s) => (
+                <SessionRow
+                  key={s.path}
+                  session={s}
+                  depth={0}
+                  workers={lineage.workers}
+                  expandedWorkers={expandedWorkers}
+                  selectedPath={selectedPath}
+                  onSelectSession={onSelectSession}
+                  onToggleWorkers={handleToggleWorkers}
+                />
+              ))}
           </div>
         );
       })}

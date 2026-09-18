@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, State};
 
+use crate::indexer::Indexer;
 use crate::parser::discover::{page_of, SessionPage};
 use crate::state::AppState;
 use crate::watcher::start_picker_watcher;
@@ -12,15 +13,17 @@ pub async fn list_sessions(
     offset: Option<usize>,
     limit: Option<usize>,
     query: Option<String>,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SessionPage, String> {
-    let mut sessions = state.discover_sessions_cached(&sessions_dir)?;
+    let (mut sessions, index) = Indexer::snapshot(&state.indexer, &sessions_dir, Some(app));
     state.apply_watched_ongoing(&mut sessions);
     Ok(page_of(
         sessions,
         query.as_deref(),
         offset.unwrap_or(0),
         limit,
+        index,
     ))
 }
 

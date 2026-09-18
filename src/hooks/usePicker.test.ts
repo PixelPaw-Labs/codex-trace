@@ -22,6 +22,7 @@ function info(i: number, overrides: Partial<CodexSessionInfo> = {}): CodexSessio
     path: `/sessions/rollout-${i}.jsonl`,
     date_group: "2026/09/16",
     is_inline_worker: false,
+    parent_session_id: null,
     is_ongoing: false,
     spawned_worker_ids: [],
     ...overrides,
@@ -35,6 +36,8 @@ function requests() {
     .map(([, args]) => args as { offset: number; limit: number; query: string | null });
 }
 
+const indexed = { files_read: 0, total_files: 0, bytes_read: 0, total_bytes: 0, done: true };
+
 /** A backend holding `total` sessions, answering whatever slice is asked for. */
 function mockBackend(total: number) {
   invoke.mockImplementation(async (cmd: string, args?: unknown) => {
@@ -45,6 +48,7 @@ function mockBackend(total: number) {
       sessions: Array.from({ length: Math.max(0, end - offset) }, (_, i) => info(offset + i)),
       total,
       groups: [{ date_group: "2026/09/16", count: total }],
+      index: indexed,
     };
   });
 }
@@ -273,5 +277,50 @@ describe("usePicker", () => {
 
     expect(result.current.sessions).toHaveLength(5);
     expect(result.current.total).toBe(5);
+  });
+});
+
+describe("indexing progress", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    handlers.clear();
+  });
+
+  it("follows the walk without asking for the list again", async () => {
+    const result = await loaded(3);
+    const before = requests().length;
+
+    act(() => {
+      handlers.get("index-progress")?.({
+        files_read: 120,
+        total_files: 3375,
+        bytes_read: 500,
+        total_bytes: 9000,
+        done: false,
+      });
+    });
+
+    expect(result.current.index).toEqual({
+      files_read: 120,
+      total_files: 3375,
+      bytes_read: 500,
+      total_bytes: 9000,
+      done: false,
+    });
+    // The walk sends its own picker-refresh when it has read more sessions; a fetch per
+    // progress tick would put the whole visible list on the wire four times a second.
+    expect(requests()).toHaveLength(before);
+  });
+
+  it("fetches rows when the walk says it has read more of the directory", async () => {
+    const result = await loaded(3);
+    const before = requests().length;
+
+    await act(async () => {
+      await handlers.get("picker-refresh")?.({});
+    });
+
+    expect(requests().length).toBeGreaterThan(before);
+    expect(result.current.sessions).toHaveLength(3);
   });
 });

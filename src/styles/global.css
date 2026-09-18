@@ -2508,6 +2508,36 @@ body {
 }
 
 /* Sidebar tree */
+/* Indexing progress — shown while the backend is still reading the sessions directory */
+.index-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.index-progress__track {
+  flex: 1;
+  height: 4px;
+  min-width: 0;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.index-progress__fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 200ms linear;
+}
+.index-progress__count {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .sidebar-tree {
   overflow-y: auto;
   flex: 1 1 0;
@@ -2634,7 +2664,7 @@ body {
   opacity: 0.8;
 }
 .sidebar-tree__session--child {
-  padding-left: 32px;
+  padding-left: calc(20px + var(--tree-depth, 1) * 12px);
   opacity: 0.85;
 }
 .sidebar-tree__session--child .sidebar-tree__session-label {

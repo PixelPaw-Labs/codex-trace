@@ -10,6 +10,14 @@ export function formatTokens(n: number): string {
   return String(n);
 }
 
+/** Formats a byte count: 1536 -> "1.5 KB", 22_000_000_000 -> "22.0 GB" */
+export function formatBytes(n: number): string {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + " KB";
+  return n + " B";
+}
+
 const CODEX_CONTEXT_BASELINE_TOKENS = 12_000;
 
 /** Matches Codex TUI's "Context XX% left" calculation. */

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
 use crate::auth::{AuthMode, ClientIdentity, ResolvedAuth};
 use crate::clients::{self, Client, ClientRegistry};
+use crate::indexer::Indexer;
 use crate::jwt::Claims;
 use crate::parser::discover::CodexSessionInfo;
 use crate::parser::session::CodexSession;
@@ -20,17 +20,9 @@ pub struct SseEvent {
     pub data: String,
 }
 
-struct SessionsCache {
-    dir: String,
-    cached_at: Instant,
-    sessions: Vec<CodexSessionInfo>,
-}
-
 /// Prefix of the error returned when a turn index is past the end of the
 /// session. `http_api` matches on it to answer 404 rather than 500.
 pub const NO_TURN_AT_INDEX: &str = "no turn at index";
-
-const SESSIONS_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// The most recently parsed session, so opening turn after turn in the detail
 /// view re-reads the file only when it has actually changed on disk. One entry:
@@ -69,7 +61,8 @@ pub struct AppState {
     config_root: RwLock<Option<PathBuf>>,
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
-    sessions_cache: Mutex<Option<SessionsCache>>,
+    /// The background walk of the sessions directory, and what it has read so far.
+    pub indexer: Arc<Indexer>,
     parsed_session: Mutex<Option<ParsedSession>>,
 }
 
@@ -78,6 +71,7 @@ impl AppState {
     /// construction itself never touches the filesystem.
     pub fn new(resolved: ResolvedAuth) -> Self {
         let (event_tx, _) = broadcast::channel(64);
+        let event_tx_for_indexer = event_tx.clone();
         Self {
             session_watcher: Mutex::new(None),
             picker_watcher: Mutex::new(None),
@@ -88,7 +82,7 @@ impl AppState {
             config_root: RwLock::new(resolved.config_root),
             watched_session_ongoing: Mutex::new(None),
             event_tx,
-            sessions_cache: Mutex::new(None),
+            indexer: Arc::new(Indexer::new(event_tx_for_indexer)),
             parsed_session: Mutex::new(None),
         }
     }
@@ -357,25 +351,6 @@ impl AppState {
                 s.is_ongoing = ongoing;
             }
         }
-    }
-
-    /// Discover sessions for `dir`, returning a cached result if fresh enough.
-    /// Multiple concurrent callers within the TTL window share one disk scan.
-    pub fn discover_sessions_cached(&self, dir: &str) -> Result<Vec<CodexSessionInfo>, String> {
-        let mut cache = self.sessions_cache.lock().map_err(|e| e.to_string())?;
-        if let Some(ref c) = *cache {
-            if c.dir == dir && c.cached_at.elapsed() < SESSIONS_CACHE_TTL {
-                return Ok(c.sessions.clone());
-            }
-        }
-        let path = std::path::Path::new(dir);
-        let sessions = crate::parser::discover::discover_sessions(path)?;
-        *cache = Some(SessionsCache {
-            dir: dir.to_string(),
-            cached_at: Instant::now(),
-            sessions: sessions.clone(),
-        });
-        Ok(sessions)
     }
 
     /// Mtime of `path`, or `None` when it cannot be read. A `None` on either
@@ -693,120 +668,5 @@ mod tests {
         state.clear_parsed_session();
 
         assert_eq!(state.load_session_index(&plain).unwrap().summaries.len(), 2);
-    }
-
-    #[test]
-    fn discover_sessions_cached_returns_empty_for_nonexistent_dir() {
-        // discover_sessions returns Ok(empty) for nonexistent dirs (not an error).
-        let state = make_state();
-        let result = state.discover_sessions_cached("/nonexistent/path/that/does/not/exist");
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
-    }
-
-    #[test]
-    fn discover_sessions_cached_hits_cache_on_second_call() {
-        let state = make_state();
-        // Use a real empty temp dir so the first call succeeds and populates cache
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-
-        let first = state.discover_sessions_cached(path).unwrap();
-        assert!(first.is_empty());
-
-        // Prime the cache with a fake entry by directly writing to the cache lock
-        {
-            let mut cache = state.sessions_cache.lock().unwrap();
-            *cache = Some(SessionsCache {
-                dir: path.to_string(),
-                cached_at: Instant::now(),
-                sessions: vec![CodexSessionInfo {
-                    id: "cached-session".to_string(),
-                    path: "/fake/path.jsonl".to_string(),
-                    cwd: None,
-                    git_branch: None,
-                    originator: None,
-                    model: None,
-                    cli_version: None,
-                    thread_name: None,
-                    turn_count: 0,
-                    start_time: String::new(),
-                    end_time: None,
-                    total_tokens: None,
-                    is_ongoing: false,
-                    is_external_worker: false,
-                    is_inline_worker: false,
-                    is_headless: false,
-                    is_archived: false,
-                    worker_nickname: None,
-                    worker_role: None,
-                    spawned_worker_ids: vec![],
-                    date_group: String::new(),
-                    ai_title: None,
-                    approval_mode: None,
-                    history_base_thread_id: None,
-                    forked_from_thread_id: None,
-                    mentioned_thread_ids: vec![],
-                }],
-            });
-        }
-
-        // Second call must return the cached fake entry, not re-scan the dir
-        let second = state.discover_sessions_cached(path).unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].id, "cached-session");
-    }
-
-    #[test]
-    fn discover_sessions_cached_invalidates_cache_for_different_dir() {
-        let state = make_state();
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-
-        // Populate cache for dir_a with a fake entry
-        {
-            let mut cache = state.sessions_cache.lock().unwrap();
-            *cache = Some(SessionsCache {
-                dir: dir_a.path().to_str().unwrap().to_string(),
-                cached_at: Instant::now(),
-                sessions: vec![CodexSessionInfo {
-                    id: "dir-a-session".to_string(),
-                    path: "/fake/a.jsonl".to_string(),
-                    cwd: None,
-                    git_branch: None,
-                    originator: None,
-                    model: None,
-                    cli_version: None,
-                    thread_name: None,
-                    turn_count: 0,
-                    start_time: String::new(),
-                    end_time: None,
-                    total_tokens: None,
-                    is_ongoing: false,
-                    is_external_worker: false,
-                    is_inline_worker: false,
-                    is_headless: false,
-                    is_archived: false,
-                    worker_nickname: None,
-                    worker_role: None,
-                    spawned_worker_ids: vec![],
-                    date_group: String::new(),
-                    ai_title: None,
-                    approval_mode: None,
-                    history_base_thread_id: None,
-                    forked_from_thread_id: None,
-                    mentioned_thread_ids: vec![],
-                }],
-            });
-        }
-
-        // Requesting dir_b must bypass the cache and return the real (empty) scan
-        let result = state
-            .discover_sessions_cached(dir_b.path().to_str().unwrap())
-            .unwrap();
-        assert!(
-            result.is_empty(),
-            "different dir must not return dir_a cached data"
-        );
     }
 }

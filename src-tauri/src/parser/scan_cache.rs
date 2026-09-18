@@ -53,11 +53,29 @@ impl FileStamp {
 struct Entry {
     stamp: FileStamp,
     info: CodexSessionInfo,
+    /// False for entries written before the scanner recorded which session spawned
+    /// this one. Absent from those entries' JSON, so it defaults to false and the
+    /// caller knows to fill the link in.
+    #[serde(default)]
+    lineage_scanned: bool,
+}
+
+/// What the cache hands back, and whether that scan knew about session lineage.
+pub struct CachedScan {
+    pub info: CodexSessionInfo,
+    /// True when the entry predates lineage scanning, so the caller should read the
+    /// session's first line and report the parent through `put_lineage`.
+    pub needs_lineage: bool,
 }
 
 /// Bumped whenever the scanner starts reporting a field differently, so entries
 /// written by an older build are discarded rather than served as though the new
 /// field had been absent from the file.
+///
+/// Deliberately *not* bumped for `parent_session_id`: throwing the cache away costs
+/// every existing install a full re-read of its whole sessions directory, minutes of
+/// pegged CPU on a large one. That field lives on the session's first line, so
+/// `needs_lineage` lets the next scan fill it in from the head of each file instead.
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -101,11 +119,14 @@ fn load_from(path: &Path) -> HashMap<PathBuf, Entry> {
 
 /// The scan result for `path`, if the file is byte-for-byte what was scanned
 /// before.
-pub fn get(path: &Path) -> Option<CodexSessionInfo> {
+pub fn get(path: &Path) -> Option<CachedScan> {
     let stamp = FileStamp::of(path)?;
     let guard = cache().lock().ok()?;
     let entry = guard.get(path)?;
-    (entry.stamp == stamp).then(|| entry.info.clone())
+    (entry.stamp == stamp).then(|| CachedScan {
+        info: entry.info.clone(),
+        needs_lineage: !entry.lineage_scanned,
+    })
 }
 
 /// Record what scanning `path` produced.
@@ -119,8 +140,54 @@ pub fn put(path: &Path, info: &CodexSessionInfo) {
             Entry {
                 stamp,
                 info: info.clone(),
+                lineage_scanned: true,
             },
         );
+    }
+}
+
+/// Record the session that spawned `path`, for an entry cached before the scanner
+/// looked for one. Leaves the rest of the entry alone — the point is to avoid
+/// re-reading a file that has not changed.
+pub fn put_lineage(path: &Path, parent_session_id: Option<String>) {
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(entry) = guard.get_mut(path) {
+            entry.info.parent_session_id = parent_session_id;
+            entry.lineage_scanned = true;
+        }
+    }
+}
+
+/// Make an entry look like one written before the scanner recorded lineage, so a test
+/// can exercise the backfill without hand-building a cache file.
+#[cfg(test)]
+pub fn forget_lineage(path: &Path) {
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(entry) = guard.get_mut(path) {
+            entry.info.parent_session_id = None;
+            entry.lineage_scanned = false;
+        }
+    }
+}
+
+/// Write the cache out mid-walk, without pruning anything.
+///
+/// A cold walk of a large sessions directory runs for minutes, and it used to save
+/// nothing until it reached the end — close the window early and every file read was
+/// thrown away, so the next launch started from zero again. Pruning is deliberately not
+/// done here: the walk has not finished, so "files this walk did not find" is not yet
+/// knowable and would delete entries the walk simply has not reached.
+pub fn persist_progress() {
+    if cfg!(test) {
+        return;
+    }
+    let Ok(guard) = cache().lock() else {
+        return;
+    };
+    let snapshot = guard.clone();
+    drop(guard);
+    if let Some(path) = cache_path() {
+        persist_to(&path, &snapshot);
     }
 }
 
@@ -196,7 +263,9 @@ mod tests {
 
         put(&file, &info_for(&file, 7));
 
-        assert_eq!(get(&file).map(|i| i.turn_count), Some(7));
+        let cached = get(&file).unwrap();
+        assert_eq!(cached.info.turn_count, 7);
+        assert!(!cached.needs_lineage);
     }
 
     #[test]
@@ -246,6 +315,7 @@ mod tests {
             Entry {
                 stamp,
                 info: info_for(&file, 11),
+                lineage_scanned: true,
             },
         );
         persist_to(&on_disk, &entries);
@@ -253,6 +323,49 @@ mod tests {
         // What a fresh process would read back.
         let reloaded = load_from(&on_disk);
         assert_eq!(reloaded.get(&file).map(|e| e.info.turn_count), Some(11));
+    }
+
+    #[test]
+    fn an_entry_cached_before_lineage_scanning_asks_for_its_parent() {
+        // The cache file a released build wrote has no lineage_scanned flag. Serving those
+        // entries as though the scan had looked for a parent would leave every session
+        // already on disk sitting at the top level forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("rollout-lineage.jsonl");
+        write(&file, "one\n");
+        let stamp = FileStamp::of(&file).unwrap();
+        let on_disk = tmp.path().join("scan-cache.json");
+        let older = format!(
+            r#"{{"version":1,"entries":{{{path:?}:{{"stamp":{{"modified_secs":{secs},"len":{len}}},"info":{info}}}}}}}"#,
+            path = file.to_string_lossy(),
+            secs = stamp.modified_secs,
+            len = stamp.len,
+            info = serde_json::to_string(&info_for(&file, 3)).unwrap(),
+        );
+        fs::write(&on_disk, older).unwrap();
+
+        let reloaded = load_from(&on_disk);
+        let entry = reloaded.get(&file).unwrap();
+        assert_eq!(entry.info.turn_count, 3, "the scan itself is still usable");
+        assert!(!entry.lineage_scanned);
+    }
+
+    #[test]
+    fn recording_a_parent_leaves_the_rest_of_the_entry_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("rollout-put-lineage.jsonl");
+        write(&file, "one\n");
+        put(&file, &info_for(&file, 5));
+
+        put_lineage(&file, Some("orchestrator".to_string()));
+
+        let cached = get(&file).unwrap();
+        assert_eq!(cached.info.turn_count, 5);
+        assert_eq!(
+            cached.info.parent_session_id.as_deref(),
+            Some("orchestrator")
+        );
+        assert!(!cached.needs_lineage);
     }
 
     #[test]

@@ -20,6 +20,7 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     is_ongoing: false,
     is_external_worker: false,
     is_inline_worker: false,
+    parent_session_id: null,
     is_headless: false,
     is_archived: false,
     approval_mode: null,
@@ -180,12 +181,13 @@ describe("SidebarTree", () => {
     expect(screen.getByText("Session B")).toBeInTheDocument();
   });
 
-  it("hides inline workers from the top-level list", () => {
+  it("hides spawned sessions from the top-level list", () => {
     const worker = makeSession({
       id: "worker1",
       path: "/sessions/2026/04/26/rollout-worker.jsonl",
       thread_name: "Worker Session",
       is_inline_worker: true,
+      parent_session_id: "parent1",
     });
     const parent = makeSession({
       id: "parent1",
@@ -206,13 +208,14 @@ describe("SidebarTree", () => {
     expect(screen.queryByText("Worker Session")).not.toBeInTheDocument();
   });
 
-  it("shows inline workers nested under parent when toggle is clicked", () => {
+  it("shows spawned sessions nested under parent when toggle is clicked", () => {
     const worker = makeSession({
       id: "worker1",
       path: "/sessions/2026/04/26/rollout-worker.jsonl",
       thread_name: "Parent Session",
       is_inline_worker: true,
       worker_nickname: "Parfit",
+      parent_session_id: "parent1",
     });
     const parent = makeSession({
       id: "parent1",
@@ -235,6 +238,101 @@ describe("SidebarTree", () => {
       screen.getByText("Parfit (worker1)").closest(".sidebar-tree__session--child"),
     ).toBeTruthy();
     expect(screen.queryAllByText("Parent Session")).toHaveLength(1);
+  });
+
+  it("nests a subagent under the orchestrator it names, whatever date that is on", () => {
+    // Multi-agent v2: the orchestrator's own file never lists the sessions it spawned, so
+    // the link comes from the subagent's parent_session_id.
+    const orchestrator = makeSession({
+      id: "orch1",
+      path: "/sessions/2026/09/18/rollout-orchestrator.jsonl",
+      thread_name: "orgknow-retrieval-result",
+      date_group: "2026/09/18",
+      spawned_worker_ids: [],
+    });
+    const subagent = makeSession({
+      id: "sub1",
+      path: "/sessions/2026/09/19/rollout-subagent.jsonl",
+      is_external_worker: true,
+      worker_nickname: "Curie",
+      date_group: "2026/09/19",
+      parent_session_id: "orch1",
+    });
+    render(
+      <SidebarTree
+        sessions={[subagent, orchestrator]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("2026/09/19")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(/1 workers/));
+    expect(screen.getByText("Curie (sub1)").closest(".sidebar-tree__session--child")).toBeTruthy();
+  });
+
+  it("keeps a subagent at the top level while its orchestrator is not loaded", () => {
+    // The orchestrator can be thousands of rows further down the list; dropping the row
+    // until it arrives would make the session look like it never happened.
+    const subagent = makeSession({
+      id: "sub1",
+      path: "/sessions/2026/09/18/rollout-subagent.jsonl",
+      is_external_worker: true,
+      worker_nickname: "Curie",
+      parent_session_id: "not-fetched-yet",
+    });
+    render(
+      <SidebarTree
+        sessions={[subagent]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+
+    const row = screen.getByText("Curie (sub1)").closest(".sidebar-tree__session");
+    expect(row).toBeTruthy();
+    expect(row).not.toHaveClass("sidebar-tree__session--child");
+  });
+
+  it("indents a subagent of a subagent one level further", () => {
+    const orchestrator = makeSession({ id: "orch1", path: "/s/orch.jsonl" });
+    const worker = makeSession({
+      id: "w1",
+      path: "/s/worker.jsonl",
+      worker_nickname: "Curie",
+      is_external_worker: true,
+      parent_session_id: "orch1",
+    });
+    const grandchild = makeSession({
+      id: "g1",
+      path: "/s/grandchild.jsonl",
+      worker_nickname: "Bacon",
+      is_external_worker: true,
+      parent_session_id: "w1",
+    });
+    render(
+      <SidebarTree
+        sessions={[grandchild, worker, orchestrator]}
+        selectedPath={null}
+        collapsedDates={new Set()}
+        onSelectSession={vi.fn()}
+        onToggleDate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/1 workers/));
+    // The worker's own toggle only exists once it has been drawn under the orchestrator.
+    fireEvent.click(screen.getAllByText(/1 workers/)[1]);
+    expect(screen.getByText("Curie (w1)").closest(".sidebar-tree__session")).toHaveStyle({
+      "--tree-depth": "1",
+    });
+    expect(screen.getByText("Bacon (g1)").closest(".sidebar-tree__session")).toHaveStyle({
+      "--tree-depth": "2",
+    });
   });
 
   it("shows worker badge on external worker sessions", () => {

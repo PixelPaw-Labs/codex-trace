@@ -22,6 +22,21 @@ pub fn parse_spawn_agent_output(output: &str) -> Option<SpawnAgentOutput> {
     Some(SpawnAgentOutput { agent_id, nickname })
 }
 
+/// The task path a multi-agent v2 `spawn_agent` call returns, e.g. `/root/batch_1` from
+/// `{"task_name":"/root/batch_1"}`.
+///
+/// Codex v0.153.x spawns report only where the new agent sits in the task tree — no
+/// `agent_id`, no nickname — so this is the only sign the spawn went through. The spawned
+/// session's own `session_meta.parent_thread_id` is what links it back to its parent.
+pub fn parse_spawn_task_name(output: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(output).ok()?;
+    let task_name = parsed.get("task_name")?.as_str()?;
+    if task_name.is_empty() {
+        return None;
+    }
+    Some(task_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,6 +50,25 @@ mod tests {
 
         assert_eq!(parsed.agent_id, "019dcd48-57d3-7a42-9952-bb488d179d0f");
         assert_eq!(parsed.nickname, "Parfit");
+    }
+
+    #[test]
+    fn parses_multi_agent_v2_task_name() {
+        // Codex v0.153.x spawn_agent output — a task path and nothing else.
+        assert_eq!(
+            parse_spawn_task_name(r#"{"task_name":"/root/batch_1"}"#).as_deref(),
+            Some("/root/batch_1")
+        );
+    }
+
+    #[test]
+    fn ignores_spawn_output_without_task_name() {
+        assert!(
+            parse_spawn_task_name(r#"{"agent_id":"019dcd48-57d3-7a42-9952-bb488d179d0f"}"#)
+                .is_none()
+        );
+        assert!(parse_spawn_task_name(r#"{"task_name":""}"#).is_none());
+        assert!(parse_spawn_task_name("spawn failed: no capacity").is_none());
     }
 
     #[test]

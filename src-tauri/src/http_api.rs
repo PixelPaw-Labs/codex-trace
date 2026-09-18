@@ -434,17 +434,17 @@ async fn api_discover_sessions(
     State(state): State<Arc<HttpState>>,
     Json(body): Json<DiscoverBody>,
 ) -> Response {
-    let app_state = app_state(&state);
-    let mut sessions = match app_state.discover_sessions_cached(&body.dir) {
-        Ok(s) => s,
-        Err(e) => return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-    app_state.apply_watched_ongoing(&mut sessions);
+    // Never waits for the directory walk: the browser gets whatever has been read so
+    // far plus how far it has got, and the indexer pushes `index-progress` as it goes.
+    let (mut sessions, index) =
+        crate::indexer::Indexer::snapshot(&state.app_state.indexer, &body.dir, state.app.clone());
+    state.app_state.apply_watched_ongoing(&mut sessions);
     ok_json(&crate::parser::discover::page_of(
         sessions,
         body.query.as_deref(),
         body.offset.unwrap_or(0),
         body.limit,
+        index,
     ))
 }
 

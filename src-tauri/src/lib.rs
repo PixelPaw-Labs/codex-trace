@@ -4,6 +4,7 @@ mod auth;
 mod clients;
 mod commands;
 mod http_api;
+mod indexer;
 mod jwt;
 mod parser;
 mod settings;
@@ -74,6 +75,23 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(http_api::start_http_server(handle));
+
+            // Start reading the sessions directory before anything asks for it. A cold
+            // walk takes minutes, and waiting for the first `list_sessions` to kick it
+            // off wasted the seconds the window spends starting up.
+            let indexed_state: Arc<state::AppState> =
+                app.state::<Arc<state::AppState>>().inner().clone();
+            let sessions_dir = indexed_state
+                .settings
+                .lock()
+                .ok()
+                .and_then(|s| s.sessions_dir.clone())
+                .unwrap_or_else(commands::settings::platform_default_dir);
+            indexer::Indexer::start(
+                &indexed_state.indexer,
+                sessions_dir,
+                Some(app.handle().clone()),
+            );
 
             if web_only {
                 if no_open {

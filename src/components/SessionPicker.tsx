@@ -1,16 +1,19 @@
 import { useRef, useMemo, useCallback, useEffect } from "react";
-import type { CodexSessionInfo } from "../../shared/types";
+import type { CodexSessionInfo, IndexProgress } from "../../shared/types";
 import { formatTokens, truncate } from "../../shared/format";
 import { shortModel, formatExactTime } from "../lib/format";
 import { sessionDisplayName } from "../lib/sessionDisplay";
 import { getModelColor } from "../lib/theme";
 import { OngoingDots } from "./OngoingDots";
+import { IndexProgressBar } from "./IndexProgressBar";
 import { useScrollToSelected } from "../hooks/useScrollToSelected";
 import { TokensIcon, ForwardIcon } from "./Icons";
 import { VscTerminal } from "react-icons/vsc";
 
 interface SessionPickerProps {
   sessions: CodexSessionInfo[];
+  /** How far the backend has got reading the sessions directory. */
+  index: IndexProgress;
   loading: boolean;
   loadingMore?: boolean;
   hasMore?: boolean;
@@ -48,6 +51,7 @@ function groupByDate(
 
 export function SessionPicker({
   sessions,
+  index,
   loading,
   loadingMore = false,
   hasMore = false,
@@ -103,12 +107,13 @@ export function SessionPicker({
           onChange={(e) => onSearchChange(e.target.value)}
           spellCheck={false}
         />
+        <IndexProgressBar progress={index} />
       </div>
 
       <div ref={listRef} className="picker__list" onScroll={handleScroll}>
-        {loading && <div className="picker__loading">Loading…</div>}
+        {loading && sessions.length === 0 && <div className="picker__loading">Loading…</div>}
 
-        {!loading && sessions.length === 0 && (
+        {!loading && sessions.length === 0 && index.done && (
           <div className="picker__empty">
             {searchQuery ? "No matching sessions" : "No sessions found"}
           </div>

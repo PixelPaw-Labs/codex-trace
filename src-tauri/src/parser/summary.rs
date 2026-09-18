@@ -234,15 +234,17 @@ mod tests {
 
     #[test]
     fn the_index_drops_every_turn_body_but_keeps_the_metadata() {
-        let mut session = CodexSession::default();
-        session.id = "sess-1".into();
-        session.turns = vec![
-            turn_with(
-                vec![agent("a", None, false, "t")],
-                vec![ToolCall::default()],
-            ),
-            turn_with(vec![], vec![]),
-        ];
+        let session = CodexSession {
+            id: "sess-1".into(),
+            turns: vec![
+                turn_with(
+                    vec![agent("a", None, false, "t")],
+                    vec![ToolCall::default()],
+                ),
+                turn_with(vec![], vec![]),
+            ],
+            ..Default::default()
+        };
 
         let index = SessionIndex::of(session);
 
@@ -260,10 +262,14 @@ mod tests {
 
     #[test]
     fn the_index_is_much_smaller_than_the_session_it_came_from() {
-        let mut session = CodexSession::default();
-        let mut tool = ToolCall::default();
-        tool.output = Some("x".repeat(200_000));
-        session.turns = vec![turn_with(vec![], vec![tool])];
+        let tool = ToolCall {
+            output: Some("x".repeat(200_000)),
+            ..Default::default()
+        };
+        let session = CodexSession {
+            turns: vec![turn_with(vec![], vec![tool])],
+            ..Default::default()
+        };
 
         let full = serde_json::to_string(&session).unwrap().len();
         let index = serde_json::to_string(&SessionIndex::of(session))

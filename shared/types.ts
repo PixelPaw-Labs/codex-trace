@@ -321,6 +321,13 @@ export interface CodexSessionInfo {
   is_external_worker: boolean;
   /** true when this session's id appears in another session's spawned_worker_ids */
   is_inline_worker: boolean;
+  /** The session that spawned this one, so the sidebar can draw it underneath its
+   * orchestrator instead of alongside it. Resolved by the backend from the orchestrator's
+   * `spawned_worker_ids` or from this session's own `session_meta.parent_thread_id` —
+   * multi-agent v2 (Codex v0.153.x) `spawn_agent` returns only a task path, so for those
+   * the child's metadata is the only link back. Null for top-level sessions and for
+   * children whose orchestrator was not found. */
+  parent_session_id: string | null;
   worker_nickname: string | null;
   worker_role: string | null;
   spawned_worker_ids: string[];
@@ -398,12 +405,33 @@ export interface DateGroupCount {
   count: number;
 }
 
+/** How far the backend's walk of the sessions directory has got. A cold walk of a large
+ * directory takes minutes, so the picker draws what has been read so far and shows a
+ * progress bar from these numbers instead of sitting blank. */
+export interface IndexProgress {
+  /** Session files read so far. */
+  files_read: number;
+  /** Session files the directory holds, counted before any were read. Zero until that
+   * count finishes, which takes milliseconds. */
+  total_files: number;
+  /** Bytes read so far. How full the bar is, because file counts lie: one session can be
+   * 22GB and three thousand others a few kilobytes each. */
+  bytes_read: number;
+  /** Bytes the directory's session files come to. */
+  total_bytes: number;
+  /** False while a walk is still running. The progress bar hides on true. */
+  done: boolean;
+}
+
 /** One batch of the session list. `total` and `groups` describe the whole match, not the
  * batch, so the UI knows how much more there is to ask for. */
 export interface SessionPage {
   sessions: CodexSessionInfo[];
   total: number;
   groups: DateGroupCount[];
+  /** How much of the directory this batch came from — not the whole of it until
+   * `index.done`. */
+  index: IndexProgress;
 }
 
 export type ViewState = "picker" | "list" | "detail";

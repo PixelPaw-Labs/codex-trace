@@ -40,7 +40,7 @@ describe("IndexProgressBar", () => {
     });
   });
 
-  it("disappears once the walk has finished", () => {
+  it("empties its box once the walk has finished, without removing it", () => {
     render(
       <IndexProgressBar
         progress={{
@@ -53,7 +53,10 @@ describe("IndexProgressBar", () => {
       />,
     );
 
+    // The box stays so the strip it sits in never changes height, but there is nothing
+    // in it to read.
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(document.querySelector(".index-progress")).toBeEmptyDOMElement();
   });
 
   it("never reads over 100% when the directory grew while it was walked", () => {

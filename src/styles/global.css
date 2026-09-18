@@ -803,13 +803,19 @@ body {
 
 .keybind-bar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
+  flex-direction: column;
+  gap: 4px;
   padding: 4px 16px;
   background: var(--bg-surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
   font-size: 11px;
+}
+
+.keybind-bar__hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
 }
 
 .keybind-bar__item {
@@ -2508,13 +2514,14 @@ body {
 }
 
 /* Sidebar tree */
-/* Indexing progress — shown while the backend is still reading the sessions directory */
+/* Indexing progress — shown in the strip along the bottom while the backend is still
+   reading the sessions directory. The box keeps its height whether a walk is running or
+   not, so the strip never changes size and nothing above it jumps. */
 .index-progress {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 12px;
-  border-bottom: 1px solid var(--border);
+  height: 14px;
   flex-shrink: 0;
 }
 .index-progress__track {

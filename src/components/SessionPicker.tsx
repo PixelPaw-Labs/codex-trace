@@ -5,7 +5,6 @@ import { shortModel, formatExactTime } from "../lib/format";
 import { sessionDisplayName } from "../lib/sessionDisplay";
 import { getModelColor } from "../lib/theme";
 import { OngoingDots } from "./OngoingDots";
-import { IndexProgressBar } from "./IndexProgressBar";
 import { useScrollToSelected } from "../hooks/useScrollToSelected";
 import { TokensIcon, ForwardIcon } from "./Icons";
 import { VscTerminal } from "react-icons/vsc";
@@ -107,7 +106,6 @@ export function SessionPicker({
           onChange={(e) => onSearchChange(e.target.value)}
           spellCheck={false}
         />
-        <IndexProgressBar progress={index} />
       </div>
 
       <div ref={listRef} className="picker__list" onScroll={handleScroll}>

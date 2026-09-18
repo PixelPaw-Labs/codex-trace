@@ -11,9 +11,12 @@ interface IndexProgressBarProps {
  * Reading every session file takes minutes on a large directory. The list fills in as
  * the walk goes, newest day first, and this says how much is still to come so a
  * half-filled list does not read as the whole of it.
+ *
+ * Lives in the strip along the bottom, and keeps its box there whether a walk is running
+ * or not: a container that came and went would shift everything above it each time.
  */
 export function IndexProgressBar({ progress }: IndexProgressBarProps) {
-  if (progress.done) return null;
+  if (progress.done) return <div className="index-progress" />;
 
   // Measured in bytes, not files: one 22GB session and three thousand small ones would
   // otherwise show a bar at 99% with nearly all the reading still to do. The label says

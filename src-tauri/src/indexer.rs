@@ -31,6 +31,16 @@ use crate::state::SseEvent;
 /// a warm re-walk is stat-only and costs almost nothing.
 const REFRESH_AFTER: Duration = Duration::from_secs(2);
 
+/// How long the very first request for a directory waits on the walk before answering
+/// with whatever it has. A small sessions directory finishes well inside this, so the
+/// picker is complete on its first draw: a walk that fast publishes its refresh signal
+/// before the page is even listening for one, and an empty first answer would then stay
+/// empty until something else happened to ask again.
+const FIRST_WAIT: Duration = Duration::from_millis(400);
+
+/// How often that wait looks to see whether the walk has finished.
+const FIRST_WAIT_POLL: Duration = Duration::from_millis(5);
+
 /// How often a running walk says how far it has got.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -125,7 +135,30 @@ impl Indexer {
             }
             None => {
                 Self::start(indexer, dir.to_string(), app);
-                (Vec::new(), IndexProgress::default())
+                Self::wait_briefly(indexer, dir)
+            }
+        }
+    }
+
+    /// What the walk has for `dir`, giving it up to [`FIRST_WAIT`] to finish first.
+    /// Returns the moment it is done, so a small directory costs a few milliseconds
+    /// rather than the whole wait.
+    fn wait_briefly(indexer: &Arc<Self>, dir: &str) -> (Vec<CodexSessionInfo>, IndexProgress) {
+        let deadline = Instant::now() + FIRST_WAIT;
+        loop {
+            let held = match indexer.indexed.lock() {
+                Ok(indexed) => indexed
+                    .as_ref()
+                    .filter(|i| i.dir == dir)
+                    .map(|i| (i.sessions.clone(), i.progress.clone())),
+                Err(_) => None,
+            };
+            match held {
+                Some((sessions, progress)) if progress.done => return (sessions, progress),
+                _ if Instant::now() >= deadline => {
+                    return held.unwrap_or_else(|| (Vec::new(), IndexProgress::default()))
+                }
+                _ => std::thread::sleep(FIRST_WAIT_POLL),
             }
         }
     }
@@ -355,24 +388,59 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_answers_before_the_directory_has_been_read() {
-        // The whole point: the first call comes back at once with a walk running behind
-        // it, rather than sitting on the caller until every file has been read.
+    fn a_small_directory_is_complete_on_the_first_ask() {
+        // A walk this quick publishes its refresh signal before a page is listening for
+        // one, so an empty first answer would stay empty until something else happened
+        // to ask again.
         let indexer = indexer();
         let dir = sessions_dir(5);
         let path = dir.path().to_string_lossy().to_string();
 
         let (sessions, progress) = Indexer::snapshot(&indexer, &path, None);
-        assert!(sessions.is_empty(), "nothing read yet");
-        assert!(!progress.done);
 
-        let progress = wait_for_index(&indexer, &path);
-        let (sessions, _) = Indexer::snapshot(&indexer, &path, None);
+        assert!(progress.done);
         assert_eq!(sessions.len(), 5);
         assert_eq!(progress.files_read, 5);
         assert_eq!(progress.total_files, 5);
         assert!(progress.bytes_read > 0);
         assert_eq!(progress.bytes_read, progress.total_bytes);
+    }
+
+    #[test]
+    fn the_first_ask_gives_up_waiting_rather_than_holding_the_caller() {
+        // The whole point of the background walk: a directory too big to read in the
+        // moment must not sit on the caller until every file has been read. Nothing ever
+        // publishes for this one, standing in for a walk that runs for minutes.
+        let indexer = indexer();
+
+        let started = Instant::now();
+        let (sessions, progress) = Indexer::wait_briefly(&indexer, "/no/such/sessions/dir");
+        let waited = started.elapsed();
+
+        assert!(sessions.is_empty());
+        assert!(!progress.done);
+        assert!(
+            waited < FIRST_WAIT * 4,
+            "the first ask waited {waited:?}, well past the {FIRST_WAIT:?} cap"
+        );
+    }
+
+    #[test]
+    fn a_later_ask_answers_from_what_the_walk_has_read_so_far() {
+        let indexer = indexer();
+        let dir = sessions_dir(5);
+        let path = dir.path().to_string_lossy().to_string();
+
+        Indexer::snapshot(&indexer, &path, None);
+        wait_for_index(&indexer, &path);
+        let started = Instant::now();
+        let (sessions, progress) = Indexer::snapshot(&indexer, &path, None);
+
+        // Only the first ask ever waits: every refresh after it is served from what the
+        // walk has already read.
+        assert!(started.elapsed() < FIRST_WAIT);
+        assert_eq!(sessions.len(), 5);
+        assert!(progress.done);
     }
 
     #[test]
@@ -393,23 +461,21 @@ mod tests {
         let indexer = indexer();
         let dir = sessions_dir(3);
         let path = dir.path().to_string_lossy().to_string();
+        // A walk already under way over this directory, which real timing makes awkward
+        // to hold still: a directory small enough for a test finishes in milliseconds.
+        *indexer.run.lock().unwrap() = Some(Run {
+            dir: path.clone(),
+            generation: 7,
+        });
 
-        Indexer::snapshot(&indexer, &path, None);
-        let generation = indexer.run.lock().unwrap().as_ref().unwrap().generation;
-        Indexer::snapshot(&indexer, &path, None);
+        Indexer::start(&indexer, path.clone(), None);
 
+        let generation = indexer.run.lock().unwrap().as_ref().map(|r| r.generation);
         assert_eq!(
-            indexer
-                .run
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|r| r.generation)
-                .unwrap_or(generation),
             generation,
+            Some(7),
             "a rival walk was started over the same directory"
         );
-        wait_for_index(&indexer, &path);
     }
 
     #[test]

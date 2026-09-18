@@ -280,6 +280,15 @@ describe("usePicker", () => {
   });
 });
 
+/** One progress report from part-way through a single large session file. */
+const tick = (bytes_read: number) => ({
+  files_read: 1,
+  total_files: 3375,
+  bytes_read,
+  total_bytes: 9000,
+  done: false,
+});
+
 describe("indexing progress", () => {
   beforeEach(() => {
     invoke.mockReset();
@@ -310,6 +319,26 @@ describe("indexing progress", () => {
     // The walk sends its own picker-refresh when it has read more sessions; a fetch per
     // progress tick would put the whole visible list on the wire four times a second.
     expect(requests()).toHaveLength(before);
+  });
+
+  it("follows a big file being read even while the file count stands still", async () => {
+    const result = await loaded(3);
+
+    act(() => handlers.get("index-progress")?.(tick(500)));
+    act(() => handlers.get("index-progress")?.(tick(4500)));
+
+    // One 22GB session reports its bytes as it is read, with the file count standing
+    // still the whole time. Ignoring those freezes the bar for as long as that takes.
+    expect(result.current.index.bytes_read).toBe(4500);
+  });
+
+  it("holds the same state object when a tick repeats itself", async () => {
+    const result = await loaded(3);
+    act(() => handlers.get("index-progress")?.(tick(500)));
+    const first = result.current.index;
+    act(() => handlers.get("index-progress")?.(tick(500)));
+
+    expect(result.current.index).toBe(first);
   });
 
   it("fetches rows when the walk says it has read more of the directory", async () => {

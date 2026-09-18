@@ -49,6 +49,21 @@ const emptyState: PickerState = {
 };
 
 /**
+ * Whether two progress reports say the same thing. Bytes are part of it: a single huge
+ * session file reports its bytes as it is read while the file count stands still, and
+ * dropping those would freeze the bar for as long as that file takes.
+ */
+function sameProgress(a: IndexProgress, b: IndexProgress): boolean {
+  return (
+    a.files_read === b.files_read &&
+    a.total_files === b.total_files &&
+    a.bytes_read === b.bytes_read &&
+    a.total_bytes === b.total_bytes &&
+    a.done === b.done
+  );
+}
+
+/**
  * The session list, fetched a batch at a time.
  *
  * Searching and counting happen on the backend, over every session it discovered, so a
@@ -192,13 +207,7 @@ export function usePicker() {
   // whenever it has actually read more sessions, so fetching rows here too would put the
   // whole visible list on the wire four times a second for minutes.
   useTauriEvent<IndexProgress>("index-progress", (progress) => {
-    setState((prev) =>
-      prev.index.files_read === progress.files_read &&
-      prev.index.total_files === progress.total_files &&
-      prev.index.done === progress.done
-        ? prev
-        : { ...prev, index: progress },
-    );
+    setState((prev) => (sameProgress(prev.index, progress) ? prev : { ...prev, index: progress }));
   });
 
   useEffect(() => {

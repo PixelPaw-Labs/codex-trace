@@ -4,6 +4,70 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.6.0] — 2026-09-18
+
+Two things this release is about: the app now draws its first session card in seconds
+rather than minutes, and installing it on macOS is a single line you paste into a
+terminal. Opening codex-trace against a large sessions directory used to mean staring at
+a blank window while every file was read; that work now happens in the background, behind
+a progress bar, and survives you quitting early. Sessions spawned by another session are
+also drawn underneath their orchestrator instead of scattered through the list.
+
+### Added
+
+- **A one-line macOS installer**
+  ([`7025c91`](https://github.com/PixelPaw-Labs/codex-trace/commit/7025c91)). One paste
+  downloads the latest release and puts **Codex Trace.app** in `/Applications`, ready to
+  open from Spotlight:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/PixelPaw-Labs/codex-trace/main/script/install-macos.sh | bash
+  ```
+
+  No clone, no Rust toolchain, and no `xattr -cr`. The app is unsigned, and macOS only
+  quarantines what a browser downloaded, so fetching it with `curl` sidesteps Gatekeeper
+  entirely. Apple Silicon only, and it detects a Rosetta shell rather than wrongly
+  concluding there is no build for your machine. `CODEXTRACE_VERSION` pins a release and
+  `CODEXTRACE_INSTALL_DIR` picks a different destination.
+
+- **Session indexing runs in the background**
+  ([`92d3cb8`](https://github.com/PixelPaw-Labs/codex-trace/commit/92d3cb8)). The startup
+  scan moved onto its own thread, so the window opens immediately and fills in as files
+  are read. A progress bar reports bytes as well as files, updating from inside the read
+  of a single file — one rollout in a real directory is 22GB, and reporting only between
+  files left the bar frozen on it for minutes. The walk takes the newest day first, so the
+  sessions you opened the app for arrive in the first seconds, holds itself to roughly a
+  fifth of a core so it does not compete with the UI, and saves every ten seconds, so
+  quitting early no longer throws the whole scan away.
+
+- **Subagent sessions nest under the session that spawned them**
+  ([`92d3cb8`](https://github.com/PixelPaw-Labs/codex-trace/commit/92d3cb8)). A session
+  started by another session is now drawn underneath it in the sidebar, recursively.
+  Neither end of that link is trustworthy alone — multi-agent v2 answers `spawn_agent`
+  with a task path and no agent id, so an orchestrator's own rollout never names what it
+  started, while older sessions only carry `spawned_worker_ids` — so both are read. A
+  child whose orchestrator cannot be found stays at the top level rather than
+  disappearing.
+
+### Fixed
+
+- **`spawn_agent` calls no longer show up as failures**
+  ([`92d3cb8`](https://github.com/PixelPaw-Labs/codex-trace/commit/92d3cb8)). The status
+  check only recognised the older `{"agent_id": ...}` reply, so every multi-agent v2 spawn
+  was marked failed even though it had worked. Both reply shapes are now understood.
+
+### Changed
+
+- **macOS releases ship a `.app.tar.gz` and no `.dmg`**
+  ([`7025c91`](https://github.com/PixelPaw-Labs/codex-trace/commit/7025c91)). A
+  browser-downloaded `.dmg` of an unsigned app is quarantined and refuses to open without
+  `xattr -cr`, which made it the worse of the two artifacts to publish. If you previously
+  grabbed the `.dmg` from the releases page, use the installer above, or download the
+  tarball and unpack it into `/Applications` yourself. Linux and Windows artifacts are
+  unchanged.
+
+[0.6.0]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.6.0
+
 ## [0.5.0] — 2026-09-16
 
 The release that makes codex-trace usable against a real sessions directory. A cold start

@@ -11,6 +11,10 @@
 [![Tauri](https://img.shields.io/badge/tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](https://github.com/PixelPaw-Labs/codex-trace/releases)
 
+<p align="center">
+  <strong><a href="#install">⬇&#65039; Install Codex Trace</a></strong>
+</p>
+
 **Codex Trace** is an **OpenAI Codex CLI session log viewer** for local JSONL files stored in `~/.codex/sessions/`.
 
 Browse, search, live-tail, and inspect [Codex CLI](https://github.com/openai/codex) conversations in a native desktop app and web UI. Codex Trace renders Codex CLI JSONL session files as readable turns with tool calls, token counts, timestamps, collaboration chains, and live SSE tailing for ongoing sessions.
@@ -54,6 +58,32 @@ Unlike general observability platforms, Codex Trace focuses on local Codex CLI s
 Codex Trace is especially useful when building personal AI harnesses and local agent platforms. It helps inspect Codex CLI sessions, understand tool usage, follow collaboration chains, and debug the workflows that power projects like [DovePaw Lite](https://github.com/PixelPaw-Labs/DovePaw-Lite).
 
 ## Install
+
+### macOS — one-line install
+
+> [!TIP]
+> **No clone. No build tools. No `xattr`.** Paste this into your terminal:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/PixelPaw-Labs/codex-trace/main/script/install-macos.sh | bash
+> ```
+>
+> This downloads the latest release and installs **Codex Trace.app** into
+> `/Applications`, ready to open from Spotlight.
+>
+> macOS blocks unsigned apps that were flagged as downloaded, and `curl` never
+> sets that flag — so the app just opens, with no quarantine workaround. That is
+> why macOS releases ship a `.app.tar.gz` and no `.dmg`. Apple Silicon only.
+
+Pin a specific version, or install somewhere else, with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PixelPaw-Labs/codex-trace/main/script/install-macos.sh \
+  | CODEXTRACE_VERSION=v0.5.0 CODEXTRACE_INSTALL_DIR=~/Applications bash
+```
+
+Linux and Windows builds are on the
+[Releases](https://github.com/PixelPaw-Labs/codex-trace/releases) page.
 
 ### Build from source
 

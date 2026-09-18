@@ -26,7 +26,7 @@ sync — the skill does.
 
 Root + Cargo + `tauri.conf.json` move together because the desktop binary the user installs
 is built from all three — `tauri.conf.json`'s `version` field is what `tauri-action`
-templates into the released artifact filenames (`Codex.Trace_<version>_*.dmg`, etc., from
+templates into the released artifact filenames (`Codex.Trace_<version>_*.deb`, etc., from
 the `productName` "Codex Trace"). Missing this file silently ships a release whose
 artifacts are stamped with the previous version.
 

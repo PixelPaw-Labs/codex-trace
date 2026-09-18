@@ -15,7 +15,7 @@ Use the Edit tool with precise `old_string`/`new_string` (not sed):
 - `src-tauri/tauri.conf.json` — top-level `"version"` field
 
 All three must end up at `$NEXT_VERSION`. `tauri.conf.json` is the one `tauri-action`
-reads when stamping artifact filenames at build time (`Codex.Trace_<version>_*.dmg`, etc.,
+reads when stamping artifact filenames at build time (`Codex.Trace_<version>_*.deb`, etc.,
 from the `productName` "Codex Trace"). Skipping it produces a release whose artifacts are
 stamped with the previous version.
 

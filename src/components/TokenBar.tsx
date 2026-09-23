@@ -1,5 +1,5 @@
 import type { TokenInfo } from "../../shared/types";
-import { formatTokens } from "../../shared/format";
+import { contextRemainingPercent, formatTokens } from "../../shared/format";
 
 interface TokenBarProps {
   tokens: TokenInfo;
@@ -11,21 +11,28 @@ export function TokenBar({ tokens }: TokenBarProps) {
     cached_input_tokens,
     output_tokens,
     reasoning_output_tokens,
-    total_tokens,
+    context_window_tokens,
     model_context_window,
   } = tokens;
-  const pct =
-    model_context_window > 0 ? Math.min(100, (total_tokens / model_context_window) * 100) : 0;
+
+  // The fill shows how much of the context window the latest request occupies. That is
+  // `context_window_tokens` (from `last_token_usage`), not `total_tokens`, which is the
+  // cumulative session total and routinely exceeds the window. Same calculation as the
+  // context meter in TurnDetail, so the two can never disagree.
+  const remaining = contextRemainingPercent(context_window_tokens, model_context_window);
+  const usedPct = remaining === null ? null : 100 - remaining;
 
   return (
     <div
       className="token-bar"
-      title={`${formatTokens(total_tokens)} / ${formatTokens(model_context_window)} tokens`}
+      title={
+        context_window_tokens !== null
+          ? `${formatTokens(context_window_tokens)} / ${formatTokens(model_context_window)} context tokens`
+          : undefined
+      }
     >
       <div className="token-bar__track">
-        {model_context_window > 0 && (
-          <div className="token-bar__fill" style={{ width: `${pct.toFixed(1)}%` }} />
-        )}
+        {usedPct !== null && <div className="token-bar__fill" style={{ width: `${usedPct}%` }} />}
       </div>
       <div className="token-bar__stats">
         <span style={{ color: "var(--token-input)" }}>in {formatTokens(input_tokens)}</span>

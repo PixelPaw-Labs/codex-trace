@@ -1558,12 +1558,20 @@ fn parse_mcp_name(name: &str) -> (Option<String>, Option<String>) {
 /// Parse a namespace-qualified tool name from Codex v0.141.0+ format: "type:server/tool_name".
 /// Returns (tool_type, server, tool_name) or None if the name is not in this format.
 ///
+/// Codex v0.152.0 (PR #41700) allows MCP server names to contain package-style
+/// characters, including `/`, so a server name can itself embed slashes (e.g.
+/// `myorg/myserver`). Splitting the server/tool half on the *first* `/` would land
+/// inside the server name; splitting on the *last* `/` instead correctly treats
+/// everything before it as the server and the final segment as the tool name,
+/// since tool names don't contain `/`.
+///
 /// Examples:
-///   "mcp:my-server/my_tool"       → ("mcp", "my-server", "my_tool")
-///   "connector:plugin-1/do_thing" → ("connector", "plugin-1", "do_thing")
+///   "mcp:my-server/my_tool"           → ("mcp", "my-server", "my_tool")
+///   "connector:plugin-1/do_thing"     → ("connector", "plugin-1", "do_thing")
+///   "mcp:myorg/myserver/mytool"       → ("mcp", "myorg/myserver", "mytool")
 fn parse_namespaced_tool_name(name: &str) -> Option<(String, String, String)> {
     let (tool_type, rest) = name.split_once(':')?;
-    let (server, tool) = rest.split_once('/')?;
+    let (server, tool) = rest.rsplit_once('/')?;
     if tool_type.is_empty() || server.is_empty() || tool.is_empty() {
         return None;
     }
@@ -2624,6 +2632,24 @@ mod tests {
         assert_eq!(parse_namespaced_tool_name("my_tool"), None);
         assert_eq!(parse_namespaced_tool_name("exec_command"), None);
         assert_eq!(parse_namespaced_tool_name("mcp__my_server"), None);
+    }
+
+    #[test]
+    fn parse_namespaced_tool_name_package_style_server_keeps_full_server_name() {
+        // Codex v0.152.0 (PR #41700): MCP server names can contain '/' (e.g.
+        // scoped package-style names like "myorg/myserver"). The split must land
+        // at the last '/' so the whole server name is preserved and only the
+        // final segment is treated as the tool name.
+        use super::parse_namespaced_tool_name;
+        let result = parse_namespaced_tool_name("mcp:myorg/myserver/mytool");
+        assert_eq!(
+            result,
+            Some((
+                "mcp".to_string(),
+                "myorg/myserver".to_string(),
+                "mytool".to_string()
+            ))
+        );
     }
 
     #[test]

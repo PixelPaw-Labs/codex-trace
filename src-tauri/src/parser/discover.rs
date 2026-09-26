@@ -84,6 +84,17 @@ pub struct CodexSessionInfo {
     /// independently spawned task, not a child spawned by this session. Empty for sessions
     /// with no task mentions and for pre-v0.150.0 sessions.
     pub mentioned_thread_ids: Vec<String>,
+    /// Codex v0.156.0 (worktree support enabled by default; issue #302): the thread that
+    /// owns this session's Git worktree checkout, when `cwd` is one. Unlike every other
+    /// lineage field above, this is not read from `session_meta` — the app-server's
+    /// `SessionConfiguredEvent` carries no worktree field, so `session_meta` never gets one
+    /// either. Codex instead writes the owner into a `codex-thread.json` sidecar
+    /// (`{"version":_,"ownerThreadId":_}`) inside the worktree's own private git-dir, found
+    /// the same way plain `git` finds it for any linked worktree: `cwd`/`.git` is a file
+    /// (not a directory) whose content is `gitdir: <path>`. Folded into `parent_session_id`
+    /// by `finalize()` so a worktree session nests under its owner like any other child.
+    /// Null when `cwd` is not a worktree checkout, or its owner file cannot be read.
+    pub worktree_owner_thread_id: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -207,10 +218,12 @@ pub fn finalize(scanned: &[CodexSessionInfo]) -> Vec<CodexSessionInfo> {
         let id = info.id.clone();
         info.is_inline_worker = spawn_parents.contains_key(&id);
         let from_meta = info.parent_session_id.take();
+        let from_worktree = info.worktree_owner_thread_id.clone();
         info.parent_session_id = spawn_parents
             .get(&id)
             .cloned()
             .or(from_meta)
+            .or(from_worktree)
             .filter(|parent| *parent != id && known_ids.contains(parent));
     }
 
@@ -440,6 +453,11 @@ fn collect_jsonl_files(
             if cached.needs_lineage {
                 info.parent_session_id = scan_parent_thread_id(&path);
                 super::scan_cache::put_lineage(&path, info.parent_session_id.clone());
+            }
+            if cached.needs_worktree_scan {
+                info.worktree_owner_thread_id =
+                    resolve_worktree_owner_thread_id(info.cwd.as_deref());
+                super::scan_cache::put_worktree_owner(&path, info.worktree_owner_thread_id.clone());
             }
             // Nothing was read, but the bar counts a cached file as covered ground.
             counted.bytes += file_len(&path);
@@ -902,6 +920,7 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
     }
 
     let date_group = date_group_from_path(path);
+    let worktree_owner_thread_id = resolve_worktree_owner_thread_id(cwd.as_deref());
 
     Some(CodexSessionInfo {
         id,
@@ -931,7 +950,31 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
         history_base_thread_id,
         forked_from_thread_id,
         mentioned_thread_ids,
+        worktree_owner_thread_id,
     })
+}
+
+/// The thread that owns `cwd`'s Codex-managed Git worktree checkout, if it is one.
+///
+/// `session_meta` carries no worktree field to read this from directly — confirmed against
+/// the `codex` v0.156.1 binary's own `SessionConfiguredEvent` field list (`session_id`,
+/// `forked_from_id`, `parent_thread_id`, `thread_source`, `model_provider_id`,
+/// `permission_profile`; nothing else), the struct the rollout's `session_meta` line is
+/// built from. Codex instead writes ownership into a `codex-thread.json` sidecar
+/// (`struct OwnerRecord { version, ownerThreadId }`, per that same binary's
+/// `worktree/src/paths.rs` strings) inside the worktree's own private git-dir. That git-dir
+/// is found the same way plain `git` finds it for any linked worktree: `<cwd>/.git` is a
+/// file (not a directory) whose content is `gitdir: <path>`.
+fn resolve_worktree_owner_thread_id(cwd: Option<&str>) -> Option<String> {
+    let git_file = Path::new(cwd?).join(".git");
+    if !git_file.is_file() {
+        return None;
+    }
+    let pointer = fs::read_to_string(&git_file).ok()?;
+    let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let raw = fs::read_to_string(Path::new(git_dir).join("codex-thread.json")).ok()?;
+    let owner = parse_line_value(&raw)?;
+    opt_str(&owner, "ownerThreadId")
 }
 
 /// The orchestrator that spawned this session, as the session itself records it.
@@ -1343,6 +1386,97 @@ mod tests {
         assert_eq!(
             subagent.parent_session_id.as_deref(),
             Some("cached-orchestrator")
+        );
+    }
+
+    /// Lays out a fake linked Git worktree at `worktree_dir`: a `.git` gitdir-pointer file
+    /// plus the `codex-thread.json` sidecar it points to, exactly as Codex v0.156.0+ writes
+    /// them for a real `--worktree`/`/worktree` checkout.
+    fn write_fake_worktree(worktree_dir: &Path, git_dir: &Path, owner_thread_id: &str) {
+        std::fs::create_dir_all(worktree_dir).unwrap();
+        std::fs::create_dir_all(git_dir).unwrap();
+        std::fs::write(
+            worktree_dir.join(".git"),
+            format!("gitdir: {}\n", git_dir.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::write(
+            git_dir.join("codex-thread.json"),
+            format!(r#"{{"version":1,"ownerThreadId":"{owner_thread_id}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_worktree_owner_thread_id_reads_the_sidecar_through_the_gitdir_pointer() {
+        let tmp = tempdir().unwrap();
+        let worktree_dir = tmp.path().join("checkout");
+        let git_dir = tmp.path().join("main-repo/.git/worktrees/checkout");
+        write_fake_worktree(&worktree_dir, &git_dir, "owner-thread-abc");
+
+        assert_eq!(
+            resolve_worktree_owner_thread_id(Some(&worktree_dir.to_string_lossy())),
+            Some("owner-thread-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_worktree_owner_thread_id_is_none_for_a_plain_checkout() {
+        let tmp = tempdir().unwrap();
+        let plain_dir = tmp.path().join("plain-repo");
+        std::fs::create_dir_all(plain_dir.join(".git")).unwrap();
+
+        assert_eq!(
+            resolve_worktree_owner_thread_id(Some(&plain_dir.to_string_lossy())),
+            None,
+            ".git is a directory here, not a worktree gitdir pointer"
+        );
+        assert_eq!(resolve_worktree_owner_thread_id(None), None);
+    }
+
+    #[test]
+    fn discover_sessions_nests_a_worktree_session_under_its_owner_thread() {
+        // Codex v0.156.0 (issue #302): a session run in a `--worktree`/`/worktree` checkout
+        // has an unfamiliar `cwd` and no `parent_thread_id` in its own `session_meta` — the
+        // owner link only exists in the worktree's `codex-thread.json` sidecar.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T09-00-00-owner.jsonl"),
+            r#"{"timestamp":"2026-09-18T09:00:00Z","type":"session_meta","payload":{"id":"owner-thread","timestamp":"2026-09-18T09:00:00Z","cwd":"/main/repo"}}"#,
+        )
+        .unwrap();
+
+        let worktree_dir = tmp.path().join("worktree-checkout");
+        let git_dir = tmp
+            .path()
+            .join("main/repo/.git/worktrees/worktree-checkout");
+        write_fake_worktree(&worktree_dir, &git_dir, "owner-thread");
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T09-05-00-worktree.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-09-18T09:05:00Z","type":"session_meta","payload":{{"id":"worktree-session","timestamp":"2026-09-18T09:05:00Z","cwd":"{}"}}}}"#,
+                worktree_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let worktree_session = sessions
+            .iter()
+            .find(|s| s.id == "worktree-session")
+            .unwrap();
+
+        assert_eq!(
+            worktree_session.worktree_owner_thread_id.as_deref(),
+            Some("owner-thread")
+        );
+        assert_eq!(
+            worktree_session.parent_session_id.as_deref(),
+            Some("owner-thread"),
+            "a worktree session should nest under the thread that owns its checkout"
         );
     }
 

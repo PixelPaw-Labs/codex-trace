@@ -155,6 +155,7 @@ function makeSessionInfo(): CodexSessionInfo {
     date_group: "2026/08/20",
     ai_title: null,
     mentioned_thread_ids: [],
+    worktree_owner_thread_id: null,
   };
 }
 

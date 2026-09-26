@@ -58,6 +58,11 @@ struct Entry {
     /// caller knows to fill the link in.
     #[serde(default)]
     lineage_scanned: bool,
+    /// False for entries written before the scanner looked for a Codex-managed Git
+    /// worktree owner. Absent from those entries' JSON, so it defaults to false and the
+    /// caller knows to resolve it through `put_worktree_owner`.
+    #[serde(default)]
+    worktree_scanned: bool,
 }
 
 /// What the cache hands back, and whether that scan knew about session lineage.
@@ -66,16 +71,21 @@ pub struct CachedScan {
     /// True when the entry predates lineage scanning, so the caller should read the
     /// session's first line and report the parent through `put_lineage`.
     pub needs_lineage: bool,
+    /// True when the entry predates worktree-owner scanning, so the caller should resolve
+    /// it from the session's `cwd` and report it through `put_worktree_owner`.
+    pub needs_worktree_scan: bool,
 }
 
 /// Bumped whenever the scanner starts reporting a field differently, so entries
 /// written by an older build are discarded rather than served as though the new
 /// field had been absent from the file.
 ///
-/// Deliberately *not* bumped for `parent_session_id`: throwing the cache away costs
-/// every existing install a full re-read of its whole sessions directory, minutes of
-/// pegged CPU on a large one. That field lives on the session's first line, so
-/// `needs_lineage` lets the next scan fill it in from the head of each file instead.
+/// Deliberately *not* bumped for `parent_session_id` or `worktree_owner_thread_id`:
+/// throwing the cache away costs every existing install a full re-read of its whole
+/// sessions directory, minutes of pegged CPU on a large one. `parent_session_id` lives on
+/// the session's first line, so `needs_lineage` lets the next scan fill it in from the
+/// head of each file instead; `worktree_owner_thread_id` is derived from the already-cached
+/// `cwd`, so `needs_worktree_scan` fills it in without reopening the session file at all.
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -126,6 +136,7 @@ pub fn get(path: &Path) -> Option<CachedScan> {
     (entry.stamp == stamp).then(|| CachedScan {
         info: entry.info.clone(),
         needs_lineage: !entry.lineage_scanned,
+        needs_worktree_scan: !entry.worktree_scanned,
     })
 }
 
@@ -141,6 +152,7 @@ pub fn put(path: &Path, info: &CodexSessionInfo) {
                 stamp,
                 info: info.clone(),
                 lineage_scanned: true,
+                worktree_scanned: true,
             },
         );
     }
@@ -166,6 +178,30 @@ pub fn forget_lineage(path: &Path) {
         if let Some(entry) = guard.get_mut(path) {
             entry.info.parent_session_id = None;
             entry.lineage_scanned = false;
+        }
+    }
+}
+
+/// Record the Codex-managed Git worktree owner for `path`, for an entry cached before the
+/// scanner looked for one. Leaves the rest of the entry alone — the point is to avoid
+/// re-reading a file that has not changed.
+pub fn put_worktree_owner(path: &Path, worktree_owner_thread_id: Option<String>) {
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(entry) = guard.get_mut(path) {
+            entry.info.worktree_owner_thread_id = worktree_owner_thread_id;
+            entry.worktree_scanned = true;
+        }
+    }
+}
+
+/// Make an entry look like one written before the scanner recorded a worktree owner, so a
+/// test can exercise the backfill without hand-building a cache file.
+#[cfg(test)]
+pub fn forget_worktree_scan(path: &Path) {
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(entry) = guard.get_mut(path) {
+            entry.info.worktree_owner_thread_id = None;
+            entry.worktree_scanned = false;
         }
     }
 }
@@ -316,6 +352,7 @@ mod tests {
                 stamp,
                 info: info_for(&file, 11),
                 lineage_scanned: true,
+                worktree_scanned: true,
             },
         );
         persist_to(&on_disk, &entries);
@@ -348,6 +385,25 @@ mod tests {
         let entry = reloaded.get(&file).unwrap();
         assert_eq!(entry.info.turn_count, 3, "the scan itself is still usable");
         assert!(!entry.lineage_scanned);
+        assert!(!entry.worktree_scanned);
+    }
+
+    #[test]
+    fn recording_a_worktree_owner_leaves_the_rest_of_the_entry_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("rollout-put-worktree.jsonl");
+        write(&file, "one\n");
+        put(&file, &info_for(&file, 5));
+
+        put_worktree_owner(&file, Some("owner-thread".to_string()));
+
+        let cached = get(&file).unwrap();
+        assert_eq!(cached.info.turn_count, 5);
+        assert_eq!(
+            cached.info.worktree_owner_thread_id.as_deref(),
+            Some("owner-thread")
+        );
+        assert!(!cached.needs_worktree_scan);
     }
 
     #[test]

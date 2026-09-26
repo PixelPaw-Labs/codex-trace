@@ -162,6 +162,24 @@ export interface CodexToolCall {
   output_truncated: boolean | null;
 }
 
+/** Who spoke a `VoiceEvent` transcript segment in a realtime voice conversation. */
+export type VoiceSpeaker = "user" | "assistant";
+
+/** How a realtime voice conversation ended. */
+export type VoiceSessionOutcome = "ended" | "failed";
+
+/** One item from Codex's realtime voice conversation stream, persisted as a top-level
+ * `realtime_item` rollout entry (Codex v0.150.0+; voice conversations enabled by default in
+ * v0.156.0, PRs #44921/#46071). Successor to the flat `audio_transcript` list: carries session
+ * lifecycle and per-speaker attribution instead of bare transcript strings. */
+export type VoiceEvent =
+  | { kind: "session_started" }
+  | { kind: "transcript_segment"; speaker: VoiceSpeaker; text: string }
+  | { kind: "session_closed"; outcome: VoiceSessionOutcome }
+  /** An already-recorded agent item (`item_id`) was promoted into the realtime conversation
+   * for presentation (e.g. read aloud). Carries no text of its own. */
+  | { kind: "item_promoted"; item_id: string };
+
 export interface CodexTurn {
   turn_id: string;
   started_at: number | null;
@@ -200,6 +218,11 @@ export interface CodexTurn {
    * Codex v0.145.0+ live mid-turn V3 streaming audio). Empty for non-voice sessions.
    * Absent for cached data serialized before this field was added. */
   audio_transcript?: string[];
+  /** Realtime voice conversation items (Codex v0.150.0+, default-on since v0.156.0): session
+   * lifecycle and speaker-attributed transcript segments from the `realtime_item` rollout entry.
+   * Empty for non-voice sessions and for sessions predating this format.
+   * Absent for cached data serialized before this field was added. */
+  voice_events?: VoiceEvent[];
   /** Warning messages emitted during the turn (`EventMsg::Warning`), e.g. skill catalog
    * budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
    * Absent for cached data serialized before this field was added. */

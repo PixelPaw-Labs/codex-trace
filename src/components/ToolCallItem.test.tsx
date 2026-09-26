@@ -257,6 +257,51 @@ describe("ToolCallItem", () => {
     expect(body!.textContent).toContain("sample@openai-curated");
   });
 
+  it("renders request_user_input_async as a user_input_request tool call with its answer (issue #304)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "user_input_request",
+          name: "request_user_input_async",
+          arguments: {
+            question: "Which branch should I target?",
+            choices: ["main", "release/1.0"],
+          },
+          command: null,
+          exit_code: null,
+          output: "main",
+          status: "completed",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const body = container.querySelector(".tool-call__body");
+    expect(body).toBeInTheDocument();
+    expect(body!.textContent).toContain("Which branch should I target?");
+    expect(body!.textContent).toContain("main");
+  });
+
+  it("shows an unanswered notice when a request_user_input_async question got no answer (issue #304)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "user_input_request",
+          name: "request_user_input_async",
+          arguments: { question: "Should I proceed with the migration?" },
+          command: null,
+          exit_code: null,
+          output: null,
+          status: "unanswered",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const notice = container.querySelector(".tool-call__unanswered-notice");
+    expect(notice).toBeInTheDocument();
+  });
+
   it("renders web query when kind is web_search", () => {
     const { container } = render(
       <ToolCallItem
@@ -566,6 +611,25 @@ describe("ToolCallItem", () => {
         />,
       );
       expect(container.querySelector(".tool-call__summary")).not.toBeInTheDocument();
+    });
+
+    it("shows the question as summary for user_input_request (issue #304)", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({
+            kind: "user_input_request",
+            name: "request_user_input_async",
+            command: null,
+            exit_code: null,
+            arguments: { question: "Which branch should I target?", choices: ["main"] },
+          })}
+          expanded={false}
+          onToggle={vi.fn()}
+        />,
+      );
+      const summary = container.querySelector(".tool-call__summary");
+      expect(summary).toBeInTheDocument();
+      expect(summary!.textContent).toBe("Which branch should I target?");
     });
 
     it("shows no summary for exec_command with null command", () => {

@@ -122,6 +122,11 @@ export type ToolKind =
    * installing plugin/connector catalogs (`list_available_plugins_to_install`,
    * `request_plugin_install`). */
   | "agent_plugin"
+  /** Codex v0.157.0 (PRs #46985, #47028): the agent message-board collaboration tools,
+   * registered in the same multi-agent namespace as `spawn_agent`/`wait_agent`
+   * (`create_channel`, `get_channels`, `list_threads`, `search_posts`, `read_thread`,
+   * `read_post`, `subscribe`, `unsubscribe`, `post`). */
+  | "message_board"
   | "unknown";
 
 export interface CodexToolCall {

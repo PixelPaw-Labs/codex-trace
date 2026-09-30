@@ -37,6 +37,12 @@ pub enum ToolKind {
     /// `create_channel`, `get_channels`, `list_threads`, `search_posts`, `read_thread`,
     /// `read_post`, `subscribe`, `unsubscribe`, and `post`.
     MessageBoard,
+    /// Codex v0.153.0+ (PR #42178, issue #304): structured asynchronous question the model
+    /// asks the user mid-turn without ending the turn, via the `request_user_input_async`
+    /// tool. Carries the question/choices in `arguments` and the user's answer (selected
+    /// choice or custom text) in `output`. If the turn ends before the user answers
+    /// (v0.157.0, #47422/#47423), `output` is None and `status` is `"unanswered"`.
+    UserInputRequest,
     Unknown,
 }
 
@@ -453,6 +459,50 @@ impl ToolCallBuilder {
                     image_file_path: None,
                     worker_session: None,
                     status: "completed".to_string(),
+                    subagent_id: None,
+                    subagent_name: None,
+                    output_truncated: None,
+                });
+                return;
+            }
+
+            // Codex v0.153.0+ (PR #42178, issue #304): request_user_input_async is a
+            // built-in tool the model calls to ask the user a structured clarifying
+            // question (with suggested choices and/or free text) without ending the
+            // turn. function_call_output carries the user's answer; classify it as
+            // UserInputRequest instead of falling through to Unknown.
+            if pending.name == "request_user_input_async" {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::UserInputRequest,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    script_path: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    image_file_path: None,
+                    worker_session: None,
+                    status: if output.is_empty() {
+                        "unanswered".to_string()
+                    } else {
+                        "completed".to_string()
+                    },
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
@@ -1186,12 +1236,23 @@ impl ToolCallBuilder {
     }
 
     /// Drain any remaining pending calls as Unknown (no end event arrived).
+    ///
+    /// Codex v0.157.0 (#47422, #47423, issue #304): a `request_user_input_async` question
+    /// left unanswered when the turn ends never gets a `function_call_output`, so it is
+    /// still pending here. Surface it as `UserInputRequest`/`"unanswered"` instead of the
+    /// generic `Unknown`/`"unknown"` so the trace shows Codex asked a question the user
+    /// never answered, rather than hiding it behind an uninformative label.
     pub fn drain_pending(&mut self) {
         let pending: Vec<(String, PendingCall)> = self.pending.drain().collect();
         for (call_id, p) in pending {
+            let is_unanswered_question = p.name == "request_user_input_async";
             self.finalized.push(ToolCall {
                 call_id,
-                kind: ToolKind::Unknown,
+                kind: if is_unanswered_question {
+                    ToolKind::UserInputRequest
+                } else {
+                    ToolKind::Unknown
+                },
                 name: p.name,
                 arguments: p.arguments,
                 input_text: p.input_text,
@@ -1211,7 +1272,11 @@ impl ToolCallBuilder {
                 image_prompt: None,
                 image_file_path: None,
                 worker_session: None,
-                status: "unknown".to_string(),
+                status: if is_unanswered_question {
+                    "unanswered".to_string()
+                } else {
+                    "unknown".to_string()
+                },
                 subagent_id: None,
                 subagent_name: None,
                 output_truncated: None,
@@ -3198,6 +3263,90 @@ mod tests {
                 "{name} should classify as MessageBoard"
             );
         }
+    }
+
+    // Codex v0.153.0+ (PR #42178, issue #304): request_user_input_async is a built-in
+    // tool the model calls to ask the user a structured clarifying question mid-turn
+    // without ending the turn. It previously fell through to ToolKind::Unknown.
+
+    #[test]
+    fn request_user_input_async_answered_with_a_suggested_choice() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_ask_1".to_string(),
+            "request_user_input_async".to_string(),
+            r#"{"question":"Which branch should I target?","choices":["main","release/1.0"]}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_ask_1", "main", None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::UserInputRequest);
+        assert_eq!(tool.name, "request_user_input_async");
+        assert_eq!(
+            tool.arguments.get("question").and_then(|v| v.as_str()),
+            Some("Which branch should I target?")
+        );
+        assert_eq!(tool.output.as_deref(), Some("main"));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn request_user_input_async_answered_with_custom_text() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_ask_2".to_string(),
+            "request_user_input_async".to_string(),
+            r#"{"question":"Anything else I should know?","choices":["No"]}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_ask_2",
+            "Yes, skip the staging deploy this time.",
+            None,
+        );
+
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::UserInputRequest);
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("Yes, skip the staging deploy this time.")
+        );
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn request_user_input_async_left_unanswered_at_turn_end_is_not_dropped() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_ask_3".to_string(),
+            "request_user_input_async".to_string(),
+            r#"{"question":"Should I proceed with the migration?","choices":["Yes","No"]}"#,
+            None,
+            None,
+            None,
+        );
+
+        // No function_call_output arrives before the turn ends (Codex v0.157.0, #47422/#47423).
+        builder.drain_pending();
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::UserInputRequest);
+        assert_eq!(tool.name, "request_user_input_async");
+        assert_eq!(
+            tool.arguments.get("question").and_then(|v| v.as_str()),
+            Some("Should I proceed with the migration?")
+        );
+        assert_eq!(tool.output, None);
+        assert_eq!(tool.status, "unanswered");
     }
 
     // Codex v0.147.0 (#36893, #36908): Codex's own redaction only applies at its

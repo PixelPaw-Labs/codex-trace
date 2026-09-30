@@ -127,6 +127,12 @@ export type ToolKind =
    * (`create_channel`, `get_channels`, `list_threads`, `search_posts`, `read_thread`,
    * `read_post`, `subscribe`, `unsubscribe`, `post`). */
   | "message_board"
+  /** Codex v0.153.0+ (PR #42178, issue #304): a structured asynchronous question the
+   * model asks the user mid-turn without ending the turn, via `request_user_input_async`.
+   * `output` holds the user's answer (selected choice or custom text); if the turn ends
+   * before the user answers (v0.157.0, #47422/#47423), `output` is null and `status` is
+   * `"unanswered"`. */
+  | "user_input_request"
   | "unknown";
 
 export interface CodexToolCall {

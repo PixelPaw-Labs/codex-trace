@@ -966,13 +966,18 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
 /// is found the same way plain `git` finds it for any linked worktree: `<cwd>/.git` is a
 /// file (not a directory) whose content is `gitdir: <path>`.
 fn resolve_worktree_owner_thread_id(cwd: Option<&str>) -> Option<String> {
-    let git_file = Path::new(cwd?).join(".git");
+    let worktree_dir = Path::new(cwd?);
+    let git_file = worktree_dir.join(".git");
     if !git_file.is_file() {
         return None;
     }
     let pointer = fs::read_to_string(&git_file).ok()?;
     let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
-    let raw = fs::read_to_string(Path::new(git_dir).join("codex-thread.json")).ok()?;
+    // Git writes an absolute path by default, but `worktree.useRelativePaths` (Git 2.48+)
+    // writes one relative to the worktree itself, the way git resolves it. Joining onto the
+    // worktree dir covers both: `join` with an absolute path simply returns that path.
+    let git_dir = worktree_dir.join(git_dir);
+    let raw = fs::read_to_string(git_dir.join("codex-thread.json")).ok()?;
     let owner = parse_line_value(&raw)?;
     opt_str(&owner, "ownerThreadId")
 }
@@ -1417,6 +1422,26 @@ mod tests {
         assert_eq!(
             resolve_worktree_owner_thread_id(Some(&worktree_dir.to_string_lossy())),
             Some("owner-thread-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_worktree_owner_thread_id_follows_a_relative_gitdir_pointer() {
+        // `worktree.useRelativePaths` (Git 2.48+) writes the pointer relative to the
+        // worktree dir. It must resolve from there, not from the process's working dir.
+        let tmp = tempdir().unwrap();
+        let worktree_dir = tmp.path().join("checkout");
+        let git_dir = tmp.path().join("main-repo/.git/worktrees/checkout");
+        write_fake_worktree(&worktree_dir, &git_dir, "owner-thread-rel");
+        std::fs::write(
+            worktree_dir.join(".git"),
+            "gitdir: ../main-repo/.git/worktrees/checkout\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_worktree_owner_thread_id(Some(&worktree_dir.to_string_lossy())),
+            Some("owner-thread-rel".to_string())
         );
     }
 

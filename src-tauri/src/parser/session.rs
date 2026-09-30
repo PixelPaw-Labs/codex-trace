@@ -388,6 +388,7 @@ pub fn resolve_sessions_dir(configured: Option<&str>) -> Result<std::path::PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::turn::{VoiceEvent, VoiceSessionOutcome, VoiceSpeaker};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -1871,6 +1872,100 @@ mod tests {
             Some("Running the tests now."),
         );
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.156.0 (PRs #44921, #46071, issue #303): voice conversations enabled by default.
+    // The realtime voice stream is now persisted as top-level `realtime_item` rollout entries
+    // (superseding the older `realtime_transcript_text` event_msg), carrying session lifecycle
+    // and speaker-attributed transcript segments instead of a flat transcript string.
+    #[test]
+    fn v0156_default_voice_conversation_realtime_items_are_captured() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-09-20T10-00-00-v0156voice.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-09-20T10:00:00Z","type":"session_meta","payload":{"id":"v0156-voice-session","timestamp":"2026-09-20T10:00:00Z","cwd":"/project","cli_version":"0.156.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:02Z","type":"realtime_item","payload":{"id":"item-1","realtime_session_id":"rt-1","type":"realtime_session_started"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:03Z","type":"realtime_item","payload":{"id":"item-2","realtime_session_id":"rt-1","type":"transcript_segment","role":"user","text":"Hey Codex, run the tests"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:04Z","type":"realtime_item","payload":{"id":"item-3","realtime_session_id":"rt-1","type":"transcript_segment","role":"assistant","text":"Running the tests now."}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:05Z","type":"realtime_item","payload":{"id":"item-4","realtime_session_id":"rt-1","type":"realtime_session_closed","outcome":"ended"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"Running the tests now.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-v1","completed_at":1753520407.0}}"#,
+                r#"{"timestamp":"2026-09-20T10:00:08Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0156-voice-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].voice_events,
+            vec![
+                VoiceEvent::SessionStarted,
+                VoiceEvent::TranscriptSegment {
+                    speaker: VoiceSpeaker::User,
+                    text: "Hey Codex, run the tests".to_string(),
+                },
+                VoiceEvent::TranscriptSegment {
+                    speaker: VoiceSpeaker::Assistant,
+                    text: "Running the tests now.".to_string(),
+                },
+                VoiceEvent::SessionClosed {
+                    outcome: VoiceSessionOutcome::Ended,
+                },
+            ],
+            "realtime_item entries must be captured with speaker attribution and lifecycle, not dropped"
+        );
+        assert!(session.turns[0].audio_transcript.is_empty());
+        assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.156.0 (issue #303): a `realtime_item` promoting an already-recorded agent item
+    // into the voice conversation, and a trailing item written after task_complete closes the
+    // turn — the item carries its own `turn_id` (mirroring `realtime_transcript_text`'s trailing
+    // behavior, session.rs:1772) so it must still land on the closed turn, not be dropped.
+    #[test]
+    fn v0156_item_promoted_and_trailing_realtime_item_use_explicit_turn_id() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-09-20T11-00-00-v0156voicetrail.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-09-20T11:00:00Z","type":"session_meta","payload":{"id":"v0156-voice-trail-session","timestamp":"2026-09-20T11:00:00Z","cwd":"/project","cli_version":"0.156.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:02Z","type":"realtime_item","payload":{"id":"item-1","realtime_session_id":"rt-1","type":"item_promoted","item_id":"msg-42"}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-v1","completed_at":1753520444.0}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:05Z","type":"realtime_item","payload":{"id":"item-2","realtime_session_id":"rt-1","type":"realtime_session_closed","outcome":"ended","turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-09-20T11:00:06Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].voice_events,
+            vec![
+                VoiceEvent::ItemPromoted {
+                    item_id: "msg-42".to_string(),
+                },
+                VoiceEvent::SessionClosed {
+                    outcome: VoiceSessionOutcome::Ended,
+                },
+            ],
+            "an item_promoted event and a trailing realtime_item with an explicit turn_id \
+             must both be attributed to the turn they name, not silently dropped"
+        );
     }
 
     // Codex v0.146.0 (PRs #34621, #35220, issue #210): a paginated thread that forks or

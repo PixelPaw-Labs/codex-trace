@@ -84,6 +84,45 @@ pub struct CompactionMeta {
     pub lineage_id: Option<String>,
 }
 
+/// Who spoke a `VoiceEvent::TranscriptSegment` in a realtime voice conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSpeaker {
+    User,
+    Assistant,
+}
+
+/// How a realtime voice conversation ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionOutcome {
+    Ended,
+    Failed,
+}
+
+/// One item from Codex's realtime voice conversation stream, persisted as a top-level
+/// `realtime_item` rollout entry (Codex v0.150.0+; voice conversations enabled by default in
+/// v0.156.0, PRs #44921/#46071). This is the successor to the flat `audio_transcript` list
+/// (pre-v0.150.0 `realtime_transcript_text` events): it carries session lifecycle and
+/// per-speaker attribution instead of bare transcript strings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VoiceEvent {
+    SessionStarted,
+    TranscriptSegment {
+        speaker: VoiceSpeaker,
+        text: String,
+    },
+    SessionClosed {
+        outcome: VoiceSessionOutcome,
+    },
+    /// An already-recorded agent item (from `item_id`) was promoted into the realtime
+    /// conversation for presentation (e.g. read aloud). Carries no text of its own.
+    ItemPromoted {
+        item_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollabSpawn {
     pub call_id: String,
@@ -152,6 +191,11 @@ pub struct CodexTurn {
     /// Empty for non-voice sessions.
     #[serde(default)]
     pub audio_transcript: Vec<String>,
+    /// Realtime voice conversation items (Codex v0.150.0+, default-on since v0.156.0): session
+    /// lifecycle and speaker-attributed transcript segments from the `realtime_item` rollout
+    /// entry. Empty for non-voice sessions and for sessions predating this format.
+    #[serde(default)]
+    pub voice_events: Vec<VoiceEvent>,
     /// Warning messages emitted during the turn (Codex `EventMsg::Warning`), e.g. skill
     /// catalog budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
     #[serde(default)]
@@ -191,6 +235,7 @@ impl CodexTurn {
             compaction_meta: None,
             memories: Vec::new(),
             audio_transcript: Vec::new(),
+            voice_events: Vec::new(),
             warnings: Vec::new(),
             task_mentions: Vec::new(),
         }
@@ -260,6 +305,9 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             }
             "turn_context" => {
                 handle_turn_context(entry, &mut turns, &current_turn_id);
+            }
+            "realtime_item" => {
+                handle_realtime_item(entry, &mut turns, &current_turn_id);
             }
             "compacted" => {
                 if let Some(ref tid) = current_turn_id {
@@ -1351,6 +1399,69 @@ fn handle_turn_context(
             if !memories.is_empty() {
                 turn.memories = memories;
             }
+        }
+    }
+}
+
+/// Handle a top-level `realtime_item` rollout entry (Codex v0.150.0+): a single item from a
+/// live voice conversation. Like the older `realtime_transcript_text` event_msg it supersedes,
+/// it may carry an explicit `turn_id`; when absent, the item is attributed to whichever turn
+/// is currently open.
+fn handle_realtime_item(
+    entry: &RawEntry,
+    turns: &mut indexmap::IndexMap<String, CodexTurn>,
+    current_turn_id: &Option<String>,
+) {
+    let payload = &entry.payload;
+    let Some(item_type) = payload.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
+    let event = match item_type {
+        "realtime_session_started" => VoiceEvent::SessionStarted,
+        "transcript_segment" => {
+            let text = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() {
+                return;
+            }
+            let speaker = match payload.get("role").and_then(|v| v.as_str()) {
+                Some("assistant") => VoiceSpeaker::Assistant,
+                _ => VoiceSpeaker::User,
+            };
+            VoiceEvent::TranscriptSegment { speaker, text }
+        }
+        "realtime_session_closed" => {
+            let outcome = match payload.get("outcome").and_then(|v| v.as_str()) {
+                Some("failed") => VoiceSessionOutcome::Failed,
+                _ => VoiceSessionOutcome::Ended,
+            };
+            VoiceEvent::SessionClosed { outcome }
+        }
+        "item_promoted" => {
+            let item_id = payload
+                .get("item_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if item_id.is_empty() {
+                return;
+            }
+            VoiceEvent::ItemPromoted { item_id }
+        }
+        _ => return,
+    };
+    let target_id = payload
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| current_turn_id.clone());
+    if let Some(ref tid) = target_id {
+        if let Some(turn) = turns.get_mut(tid) {
+            turn.voice_events.push(event);
         }
     }
 }

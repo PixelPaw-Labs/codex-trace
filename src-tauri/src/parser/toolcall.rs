@@ -32,6 +32,11 @@ pub enum ToolKind {
     /// installing plugin/connector catalogs. Covers `list_available_plugins_to_install`
     /// and `request_plugin_install`.
     AgentPlugin,
+    /// Codex v0.157.0 (PRs #46985, #47028): the agent message-board collaboration tools,
+    /// registered in the same multi-agent namespace as `spawn_agent`/`wait_agent`. Covers
+    /// `create_channel`, `get_channels`, `list_threads`, `search_posts`, `read_thread`,
+    /// `read_post`, `subscribe`, `unsubscribe`, and `post`.
+    MessageBoard,
     /// Codex v0.153.0+ (PR #42178, issue #304): structured asynchronous question the model
     /// asks the user mid-turn without ending the turn, via the `request_user_input_async`
     /// tool. Carries the question/choices in `arguments` and the user's answer (selected
@@ -557,6 +562,26 @@ impl ToolCallBuilder {
                     // Accept both for backward compatibility with existing transcripts.
                     _ if pending.name == "close_agent" || pending.name == "interrupt_agent" => {
                         (ToolKind::InterruptAgent, None, None)
+                    }
+                    // Codex v0.157.0 (PRs #46985, #47028): agent message-board collaboration
+                    // tools. Registered as a `ResponsesApiNamespace` alongside the existing
+                    // multi-agent tools, but — like spawn_agent/wait_agent — emitted on the
+                    // wire as bare function names with no namespace field, so they are matched
+                    // here by name rather than via the `mcp__`-prefixed namespace branch above.
+                    _ if matches!(
+                        pending.name.as_str(),
+                        "create_channel"
+                            | "get_channels"
+                            | "list_threads"
+                            | "search_posts"
+                            | "read_thread"
+                            | "read_post"
+                            | "subscribe"
+                            | "unsubscribe"
+                            | "post"
+                    ) =>
+                    {
+                        (ToolKind::MessageBoard, None, None)
                     }
                     _ => {
                         // v0.141.0+ (PRs #27365, #27371): tool name may be namespace-qualified
@@ -3124,6 +3149,120 @@ mod tests {
             tool.arguments.get("tool_id").and_then(|v| v.as_str()),
             Some("sample@openai-curated")
         );
+    }
+
+    // Codex v0.157.0 (PRs #46985, #47028): the agent message-board collaboration tools
+    // (create_channel, get_channels, list_threads, search_posts, read_thread, read_post,
+    // subscribe, unsubscribe, post) are registered in the same multi-agent namespace as
+    // spawn_agent/wait_agent, but — per the real `spec.rs`/`tools.rs` sources in the
+    // upstream openai/codex PRs — emitted on the wire as bare function names with no
+    // namespace field. They previously fell through to ToolKind::Unknown.
+
+    #[test]
+    fn post_is_classified_as_message_board() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_post".to_string(),
+            "post".to_string(),
+            r#"{"text":"status update","channel_name":"general"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_post",
+            r#"{"message_id":"msg_1","thread_id":"thread_1","channel_name":"general"}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::MessageBoard);
+        assert_eq!(tool.name, "post");
+        assert_eq!(
+            tool.arguments.get("channel_name").and_then(|v| v.as_str()),
+            Some("general")
+        );
+    }
+
+    #[test]
+    fn create_channel_is_classified_as_message_board() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_create_channel".to_string(),
+            "create_channel".to_string(),
+            r#"{"channel_name":"incident-response"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_create_channel",
+            r#"{"channel_name":"incident-response","created":true}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].kind, ToolKind::MessageBoard);
+    }
+
+    #[test]
+    fn subscribe_and_unsubscribe_are_classified_as_message_board() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_sub".to_string(),
+            "subscribe".to_string(),
+            r#"{"channel_name":"general"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_sub", r#"{"subscribed":true}"#, None);
+
+        builder.add_function_call(
+            "call_unsub".to_string(),
+            "unsubscribe".to_string(),
+            r#"{"channel_name":"general"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_unsub", r#"{"subscribed":false}"#, None);
+
+        assert_eq!(builder.finalized.len(), 2);
+        assert_eq!(builder.finalized[0].kind, ToolKind::MessageBoard);
+        assert_eq!(builder.finalized[1].kind, ToolKind::MessageBoard);
+    }
+
+    #[test]
+    fn message_board_read_tools_are_classified_as_message_board() {
+        for name in [
+            "get_channels",
+            "list_threads",
+            "search_posts",
+            "read_thread",
+            "read_post",
+        ] {
+            let mut builder = ToolCallBuilder::new();
+            builder.add_function_call(
+                format!("call_{name}"),
+                name.to_string(),
+                "{}",
+                None,
+                None,
+                None,
+            );
+            builder.add_function_call_output(&format!("call_{name}"), r#"{"items":[]}"#, None);
+
+            assert_eq!(builder.finalized.len(), 1);
+            assert_eq!(
+                builder.finalized[0].kind,
+                ToolKind::MessageBoard,
+                "{name} should classify as MessageBoard"
+            );
+        }
     }
 
     // Codex v0.153.0+ (PR #42178, issue #304): request_user_input_async is a built-in

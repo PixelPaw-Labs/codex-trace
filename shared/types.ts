@@ -394,6 +394,14 @@ export interface CodexSessionInfo {
    * spawned task, not a child spawned by this session. Empty for sessions with no task
    * mentions and for pre-v0.150.0 sessions. */
   mentioned_thread_ids: string[];
+  /** Codex v0.156.0 (worktree support enabled by default): the thread that owns this
+   * session's Git worktree checkout, when `cwd` is one. Unlike every other lineage field
+   * above, this isn't read from `session_meta` — Codex has no worktree field there, and
+   * instead writes the owner into a `codex-thread.json` sidecar inside the worktree's own
+   * git-dir. Folded into `parent_session_id` on the backend, so a worktree session nests
+   * under its owner like any other child. Null when `cwd` is not a worktree checkout, or
+   * its owner file cannot be read. */
+  worktree_owner_thread_id: string | null;
 }
 
 /** A registered API client. Never carries a credential. */

@@ -31,6 +31,7 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     date_group: "2026/04/26",
     ai_title: null,
     mentioned_thread_ids: [],
+    worktree_owner_thread_id: null,
     ...overrides,
   };
 }

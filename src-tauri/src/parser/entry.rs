@@ -1659,15 +1659,20 @@ mod tests {
     }
 
     #[test]
-    fn v0163_response_incomplete_event_msg_parses_correctly() {
-        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses now terminate
-        // the turn immediately as this dedicated, non-retryable error event carrying the
-        // server's incomplete-reason, instead of a generic retryable stream error.
-        let line = r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens"}}"#;
-        let e = RawEntry::parse(line).expect("response_incomplete event_msg must parse");
+    fn v0163_response_incomplete_surfaces_as_generic_error_event_msg() {
+        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
+        // max_output_tokens) now terminate the turn immediately as a non-retryable
+        // `ResponseIncomplete` error instead of a generic, retryable stream error. There is
+        // no dedicated wire event for this — it is delivered as the existing generic
+        // `error` event_msg, with the reason embedded in the message text.
+        let line = r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#;
+        let e = RawEntry::parse(line).expect("error event_msg must parse");
         assert_eq!(e.entry_type, "event_msg");
-        assert_eq!(event_msg_type(&e.payload), Some("response_incomplete"));
-        assert_eq!(e.payload["incomplete_reason"], "max_output_tokens");
+        assert_eq!(event_msg_type(&e.payload), Some("error"));
+        assert_eq!(
+            e.payload["message"],
+            "Incomplete response returned, reason: max_output_tokens"
+        );
     }
 
     #[test]

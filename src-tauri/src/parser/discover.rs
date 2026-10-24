@@ -806,12 +806,22 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                     }
-                    "token_budget_abort" | "inference_stream_cancelled" | "response_incomplete" => {
+                    "token_budget_abort" | "inference_stream_cancelled" => {
                         // v0.142.0+: budget exhausted or inference cancelled — turn is done.
                         // v0.143.0 reliably preserves these on disk during shutdown.
-                        // v0.163.0 (PR openai/codex#53451): response_incomplete is a terminal,
-                        // non-retryable error — treat it the same as the other terminators so
-                        // the session doesn't linger as "ongoing" in the session list.
+                        is_ongoing = false;
+                        end_time = v
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    "error" => {
+                        // `EventMsg::Error` always ends the turn (unlike `Warning`, which
+                        // doesn't) — including Codex v0.163.0's non-retryable
+                        // `ResponseIncomplete` terminal error (PR openai/codex#53451),
+                        // which has no dedicated wire event and surfaces as this generic
+                        // `error`. Treat it as turn-terminating so the session doesn't
+                        // linger as "ongoing" in the session list.
                         is_ongoing = false;
                         end_time = v
                             .get("timestamp")
@@ -2456,11 +2466,13 @@ mod tests {
     }
 
     // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses now terminate the
-    // turn immediately as a non-retryable `response_incomplete` event instead of a generic,
-    // retryable stream error. discover_sessions must recognise this as turn-terminating too.
+    // turn immediately as a non-retryable `ResponseIncomplete` error instead of a generic,
+    // retryable stream error. There is no dedicated wire event for this — it is delivered
+    // as the existing generic `error` event_msg, which discover_sessions previously fell
+    // through to its catch-all arm without ending the scan's `is_ongoing` state.
 
     #[test]
-    fn v0163_response_incomplete_marks_session_not_ongoing() {
+    fn v0163_response_incomplete_error_marks_session_not_ongoing() {
         let tmp = tempdir().unwrap();
         let day_dir = tmp.path().join("2026/10/01");
         std::fs::create_dir_all(&day_dir).unwrap();
@@ -2471,7 +2483,7 @@ mod tests {
                 r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-disc","timestamp":"2026-10-01T10:00:00Z","cwd":"/project","cli_version":"0.163.0","model_provider":"openai"}}"#,
                 r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"timestamp":"2026-10-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
-                r#"{"timestamp":"2026-10-01T10:00:03Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens"}}"#,
+                r#"{"timestamp":"2026-10-01T10:00:03Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#,
             ]
             .join("\n"),
         )
@@ -2481,16 +2493,16 @@ mod tests {
         let session = sessions
             .iter()
             .find(|s| s.id == "v0163-incomplete-disc")
-            .expect("session terminated by response_incomplete must be discovered");
+            .expect("session terminated by a response-incomplete error must be discovered");
         assert_eq!(session.cli_version.as_deref(), Some("0.163.0"));
         assert!(
             !session.is_ongoing,
-            "response_incomplete must mark session as not ongoing"
+            "a terminal error event must mark session as not ongoing"
         );
         assert_eq!(
             session.end_time.as_deref(),
             Some("2026-10-01T10:00:03Z"),
-            "end_time must be set from response_incomplete timestamp"
+            "end_time must be set from the error event's timestamp"
         );
     }
 

@@ -16,6 +16,14 @@ use super::toolcall::{ToolCall, ToolCallBuilder};
 /// rendered as an assistant message.
 const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
+/// Codex v0.163.0 (PR openai/codex#53451): the upstream `Display` text for the
+/// non-retryable `ResponseIncomplete` error (`"Incomplete response returned, reason:
+/// {reason}"`), optionally behind a caller-supplied prefix such as `"Error running
+/// remote compact task: "`. There is no dedicated wire event for this error — it is
+/// delivered as a generic `error` event_msg, so this marker is the only way to tell it
+/// apart from other terminal errors and recover the server's incomplete-reason.
+const RESPONSE_INCOMPLETE_MARKER: &str = "Incomplete response returned, reason: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -712,47 +720,20 @@ fn handle_event_msg(
                         .unwrap_or("unknown error")
                         .to_string();
                     turn.status = TurnStatus::Error;
+                    // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses
+                    // (e.g. hitting max_output_tokens) are now a non-retryable terminal
+                    // `ResponseIncomplete` error instead of a generic, retryable stream
+                    // error. There is no dedicated wire event for this — it surfaces as
+                    // this same generic `error` event, with the reason embedded in the
+                    // message text (optionally behind a caller-supplied prefix, e.g.
+                    // "Error running remote compact task: Incomplete response returned,
+                    // reason: max_output_tokens"), so detect it by splitting on the
+                    // upstream Display text rather than a separate field.
+                    turn.incomplete_reason = msg
+                        .split_once(RESPONSE_INCOMPLETE_MARKER)
+                        .map(|(_, reason)| reason.to_string());
                     turn.error = Some(msg);
                 }
-            }
-        }
-
-        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
-        // max_output_tokens) were previously classified as generic stream errors and could be
-        // retried or trigger compaction fallback. They now surface as this dedicated,
-        // non-retryable terminal event carrying the server's incomplete-reason, so record it
-        // distinctly from a generic `error` instead of falling through to the catch-all arm.
-        "response_incomplete" => {
-            let turn_id_field = payload
-                .get("turn_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(current_turn_id.as_deref().unwrap_or(""))
-                .to_string();
-            let target_id = if !turn_id_field.is_empty() {
-                turn_id_field
-            } else {
-                current_turn_id.clone().unwrap_or_default()
-            };
-            if let Some(turn) = turns.get_mut(&target_id) {
-                let reason = payload
-                    .get("incomplete_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                turn.status = TurnStatus::Error;
-                turn.error = Some(
-                    match (&reason, payload.get("message").and_then(|v| v.as_str())) {
-                        (_, Some(msg)) => msg.to_string(),
-                        (Some(reason), None) => format!("Response incomplete: {reason}"),
-                        (None, None) => "Response incomplete".to_string(),
-                    },
-                );
-                turn.incomplete_reason = reason;
-                turn.completed_at = payload
-                    .get("completed_at")
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as u64)
-                    .or_else(|| entry.timestamp.as_deref().and_then(parse_timestamp_secs));
-                turn.duration_ms = payload.get("duration_ms").and_then(|v| v.as_u64());
             }
         }
 
@@ -3860,15 +3841,17 @@ mod tests {
     }
 
     // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
-    // max_output_tokens) are now a dedicated, non-retryable terminal `response_incomplete`
-    // event carrying the server's incomplete-reason, rather than a generic `error`.
+    // max_output_tokens) are now a non-retryable terminal `ResponseIncomplete` error
+    // instead of a generic, retryable stream error. There is no dedicated wire event for
+    // this — it is delivered as the existing generic `error` event_msg, with the reason
+    // embedded in the message text, so `incomplete_reason` must be recovered from there.
 
     #[test]
     fn v0163_response_incomplete_marks_turn_error_with_reason() {
         let entries = entries(&[
             r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-incomplete","timestamp":"2026-10-01T10:00:00Z","cli_version":"0.163.0"}}"#,
             r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens","completed_at":1759312802.0}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -3879,17 +3862,18 @@ mod tests {
         assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
         assert_eq!(
             turn.error.as_deref(),
-            Some("Response incomplete: max_output_tokens")
+            Some("Incomplete response returned, reason: max_output_tokens")
         );
-        assert_eq!(turn.completed_at, Some(1759312802));
     }
 
     #[test]
-    fn v0163_response_incomplete_prefers_explicit_message_over_synthesized_reason() {
+    fn v0163_response_incomplete_reason_recovered_behind_a_caller_prefix() {
+        // e.g. compaction wraps the same upstream error with "Error running remote
+        // compact task: " before the marker text.
         let entries = entries(&[
-            r#"{"timestamp":"2026-10-01T10:01:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-msg","timestamp":"2026-10-01T10:01:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-compact","timestamp":"2026-10-01T10:01:00Z","cli_version":"0.163.0"}}"#,
             r#"{"timestamp":"2026-10-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-10-01T10:01:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens","message":"The model response was cut off before completion."}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:02Z","type":"event_msg","payload":{"type":"error","message":"Error running remote compact task: Incomplete response returned, reason: max_output_tokens"}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -3898,10 +3882,23 @@ mod tests {
         let turn = &turns[0];
         assert_eq!(turn.status, TurnStatus::Error);
         assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
-        assert_eq!(
-            turn.error.as_deref(),
-            Some("The model response was cut off before completion.")
-        );
+    }
+
+    #[test]
+    fn generic_error_without_response_incomplete_marker_leaves_incomplete_reason_unset() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:02:00Z","type":"session_meta","payload":{"id":"v0163-generic-error","timestamp":"2026-10-01T10:02:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:02:02Z","type":"event_msg","payload":{"type":"error","message":"context window exceeded"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason, None);
+        assert_eq!(turn.error.as_deref(), Some("context window exceeded"));
     }
 
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured

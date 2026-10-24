@@ -664,8 +664,9 @@ describe("ToolCallItem", () => {
     });
   });
 
-  // Codex v0.145.0: bounded exec output — truncation notice in expanded view.
-  describe("output truncation notice (v0.145.0+)", () => {
+  // Codex v0.145.0 (runtime bound) and v0.162.0 (64 KiB rollout-persistence cap, PR
+  // openai/codex#50427) both surface through the same output_truncated flag.
+  describe("output truncation notice (v0.145.0+, v0.162.0+)", () => {
     it("shows truncation notice when output_truncated is true", () => {
       render(
         <ToolCallItem
@@ -674,7 +675,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(screen.getByText(/Output was truncated by the Codex runtime/)).toBeInTheDocument();
+      expect(screen.getByText(/Output was truncated by Codex/)).toBeInTheDocument();
     });
 
     it("does not show truncation notice when output_truncated is null", () => {
@@ -685,9 +686,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(
-        screen.queryByText(/Output was truncated by the Codex runtime/),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/Output was truncated by Codex/)).not.toBeInTheDocument();
     });
 
     it("does not show truncation notice when output_truncated is false", () => {
@@ -698,9 +697,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(
-        screen.queryByText(/Output was truncated by the Codex runtime/),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/Output was truncated by Codex/)).not.toBeInTheDocument();
     });
   });
 

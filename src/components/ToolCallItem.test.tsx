@@ -302,6 +302,48 @@ describe("ToolCallItem", () => {
     expect(notice).toBeInTheDocument();
   });
 
+  it("renders create_worktree as a managed_worktree tool call (issue #340)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "managed_worktree",
+          name: "create_worktree",
+          arguments: { ref: "feature/foo", allowAsync: true },
+          command: null,
+          exit_code: null,
+          output: '{"operationId":"op_1"}',
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const body = container.querySelector(".tool-call__body");
+    expect(body).toBeInTheDocument();
+    expect(body!.textContent).toContain("feature/foo");
+    expect(body!.textContent).toContain("op_1");
+  });
+
+  it("renders list_worktrees as a managed_worktree tool call with no summary for empty args (issue #340)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "managed_worktree",
+          name: "list_worktrees",
+          arguments: {},
+          command: null,
+          exit_code: null,
+          output: '{"worktrees":[]}',
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const summary = container.querySelector(".tool-call__summary");
+    expect(summary).not.toBeInTheDocument();
+    const body = container.querySelector(".tool-call__body");
+    expect(body!.textContent).toContain("worktrees");
+  });
+
   it("renders web query when kind is web_search", () => {
     const { container } = render(
       <ToolCallItem

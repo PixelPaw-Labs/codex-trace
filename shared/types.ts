@@ -133,6 +133,10 @@ export type ToolKind =
    * before the user answers (v0.157.0, #47422/#47423), `output` is null and `status` is
    * `"unanswered"`. */
   | "user_input_request"
+  /** Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools,
+   * registered in the same embedded dynamic-tools namespace as `spawn_agent`/`wait_agent`
+   * (`create_worktree`, `get_worktree_creation_status`, `list_worktrees`). */
+  | "managed_worktree"
   | "unknown";
 
 export interface CodexToolCall {

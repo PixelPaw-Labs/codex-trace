@@ -3001,6 +3001,44 @@ mod tests {
         assert_eq!(tool.exit_code, Some(0));
     }
 
+    // Codex v0.164.0 (issue #336, upstream openai/codex#54433): the TUI's compact
+    // output now uses neutral labels for nonzero exits — `Exited (status N)` instead
+    // of `Failed (exit N)` for a single command, and `nonzero exit`/`nonzero exits`
+    // instead of `failed` for exploration counts, with the red styling removed. This
+    // change lives entirely in `codex-rs/tui/src/exec_cell/{compact,render}.rs` — it
+    // only affects how the live, interactive TUI renders text to the terminal.
+    // codex-trace never reads that rendered text: it parses the on-disk rollout
+    // JSONL directly, where `exec_command_end` still carries the structured,
+    // numeric `exit_code` and the `status` string Codex core writes independently of
+    // the TUI's display choices. Verify a nonzero exit still parses to `exit_code`
+    // and `status` exactly as before, regardless of the TUI's relabeling.
+    #[test]
+    fn v0164_neutral_tui_exit_labels_do_not_affect_exec_command_status_parsing() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_neutral_exit".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cargo test","workdir":"/project"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_neutral_exit",
+            "aggregated_output": "test result: FAILED. 1 passed; 1 failed;\n",
+            "exit_code": 101,
+            "status": "failed",
+            "duration": {"secs": 2, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.exit_code, Some(101));
+        assert_eq!(tool.status, "failed");
+    }
+
     // Codex v0.146.0 (issue #223): exec_command_end may carry plugin_id/script_path when
     // the command was attributed to a trusted plugin script ("hardened plugin isolation").
 

@@ -170,6 +170,13 @@ pub struct CodexTurn {
     pub reasoning_effort: Option<String>,
     pub error: Option<String>,
     pub aborted_reason: Option<String>,
+    /// Codex v0.163.0 (PR openai/codex#53451): server-provided reason when the model's
+    /// response was cut off (e.g. "max_output_tokens") and the turn was terminated
+    /// immediately as a non-retryable `ResponseIncomplete` error rather than a generic
+    /// stream error. `None` for turns that didn't hit this condition and for sessions
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
     pub has_compaction: bool,
     pub thread_name: Option<String>,
     pub collab_spawns: Vec<CollabSpawn>,
@@ -227,6 +234,7 @@ impl CodexTurn {
             reasoning_effort: None,
             error: None,
             aborted_reason: None,
+            incomplete_reason: None,
             has_compaction: false,
             thread_name: None,
             collab_spawns: Vec::new(),
@@ -706,6 +714,45 @@ fn handle_event_msg(
                     turn.status = TurnStatus::Error;
                     turn.error = Some(msg);
                 }
+            }
+        }
+
+        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
+        // max_output_tokens) were previously classified as generic stream errors and could be
+        // retried or trigger compaction fallback. They now surface as this dedicated,
+        // non-retryable terminal event carrying the server's incomplete-reason, so record it
+        // distinctly from a generic `error` instead of falling through to the catch-all arm.
+        "response_incomplete" => {
+            let turn_id_field = payload
+                .get("turn_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(current_turn_id.as_deref().unwrap_or(""))
+                .to_string();
+            let target_id = if !turn_id_field.is_empty() {
+                turn_id_field
+            } else {
+                current_turn_id.clone().unwrap_or_default()
+            };
+            if let Some(turn) = turns.get_mut(&target_id) {
+                let reason = payload
+                    .get("incomplete_reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                turn.status = TurnStatus::Error;
+                turn.error = Some(
+                    match (&reason, payload.get("message").and_then(|v| v.as_str())) {
+                        (_, Some(msg)) => msg.to_string(),
+                        (Some(reason), None) => format!("Response incomplete: {reason}"),
+                        (None, None) => "Response incomplete".to_string(),
+                    },
+                );
+                turn.incomplete_reason = reason;
+                turn.completed_at = payload
+                    .get("completed_at")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u64)
+                    .or_else(|| entry.timestamp.as_deref().and_then(parse_timestamp_secs));
+                turn.duration_ms = payload.get("duration_ms").and_then(|v| v.as_u64());
             }
         }
 
@@ -3810,6 +3857,51 @@ mod tests {
         assert_eq!(tc.kind, ToolKind::ShellHook);
         assert_eq!(tc.name, "interrupt");
         assert_eq!(tc.output.as_deref(), Some("turn interrupted\n"));
+    }
+
+    // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
+    // max_output_tokens) are now a dedicated, non-retryable terminal `response_incomplete`
+    // event carrying the server's incomplete-reason, rather than a generic `error`.
+
+    #[test]
+    fn v0163_response_incomplete_marks_turn_error_with_reason() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-incomplete","timestamp":"2026-10-01T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens","completed_at":1759312802.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("Response incomplete: max_output_tokens")
+        );
+        assert_eq!(turn.completed_at, Some(1759312802));
+    }
+
+    #[test]
+    fn v0163_response_incomplete_prefers_explicit_message_over_synthesized_reason() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:01:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-msg","timestamp":"2026-10-01T10:01:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens","message":"The model response was cut off before completion."}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("The model response was cut off before completion.")
+        );
     }
 
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured

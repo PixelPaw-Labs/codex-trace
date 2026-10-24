@@ -1659,6 +1659,18 @@ mod tests {
     }
 
     #[test]
+    fn v0163_response_incomplete_event_msg_parses_correctly() {
+        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses now terminate
+        // the turn immediately as this dedicated, non-retryable error event carrying the
+        // server's incomplete-reason, instead of a generic retryable stream error.
+        let line = r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"response_incomplete","turn_id":"turn-1","incomplete_reason":"max_output_tokens"}}"#;
+        let e = RawEntry::parse(line).expect("response_incomplete event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("response_incomplete"));
+        assert_eq!(e.payload["incomplete_reason"], "max_output_tokens");
+    }
+
+    #[test]
     fn v0144_all_standard_entry_types_parse_correctly_with_mcp_auth_flow() {
         let lines = [
             r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,

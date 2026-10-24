@@ -713,6 +713,16 @@ fn handle_event_msg(
         // catalog is truncated or skills are omitted for budget reasons. `warning` is a
         // generic notice event (also used for e.g. model-reroute warnings), so surface
         // its message on the current turn rather than dropping it.
+        //
+        // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend
+        // (the zsh fork runtime, `codex-execve-wrapper`, `shell-escalation` crate) was
+        // deleted outright, and the retired `shell_zsh_fork`/`unified_exec_zsh_fork`
+        // config flags now surface a migration/deprecation notice plus a warning when
+        // managed requirements for those flags are ignored. codex-trace never parsed the
+        // removed zsh-fork approval/escalation event shapes and has no config schema of
+        // its own for these flags, so there is nothing version-specific to remove; the
+        // new notice/warning message lands here like any other `warning` event and is
+        // surfaced verbatim rather than being misread as an `error` event.
         "warning" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -2419,6 +2429,30 @@ mod tests {
             r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
             r#"{"timestamp":"2026-06-08T10:00:02Z","type":"event_msg","payload":{"type":"response.processed","response_id":"resp-abc","status":"complete"}}"#,
             r#"{"timestamp":"2026-06-08T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // Codex v0.163.0 (PRs #52160, #52213): the entire zsh-fork approval/escalation flow
+    // (previously in `core/src/guardian/approval_request.rs`, `core/src/tools/approvals.rs`)
+    // was deleted along with the patched-zsh shell backend. codex-trace never parsed those
+    // event shapes in the first place — it has no approval/escalation-specific handling at
+    // all, relying on the generic wildcard arm in handle_event_msg. This test guards against
+    // regressions that would require codex-trace to understand the now-deleted event shapes,
+    // and confirms old session files recorded before the removal still parse unaffected.
+    #[test]
+    fn v0163_removed_zsh_fork_approval_events_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0163","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_request","call_id":"call_zsh","command":"sudo apt-get update"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_response","call_id":"call_zsh","decision":"approved"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -4963,5 +4997,31 @@ mod tests {
             turns[0].agent_messages[0].order < turns[0].agent_messages[1].order,
             "each message must carry its own position in the stream"
         );
+    }
+
+    // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend and
+    // its `shell_zsh_fork`/`unified_exec_zsh_fork` config flags were retired in favor of a
+    // migration/deprecation notice. codex-trace has no config schema referencing those
+    // flags and never parsed the removed zsh-fork approval/escalation event shapes, so the
+    // notice simply arrives as a generic `warning` event like any other and must be
+    // captured as a warning, not misread as a turn-ending `error`.
+    #[test]
+    fn v0163_zsh_fork_deprecation_notice_captured_as_warning_not_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"v0163-zsh-fork","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"shell_zsh_fork and unified_exec_zsh_fork are deprecated and ignored; the patched-zsh shell backend was removed in v0.163.0."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].error.is_none());
+        assert_eq!(turns[0].warnings.len(), 1);
+        assert!(turns[0].warnings[0].contains("shell_zsh_fork"));
+        assert!(turns[0].warnings[0].contains("unified_exec_zsh_fork"));
     }
 }

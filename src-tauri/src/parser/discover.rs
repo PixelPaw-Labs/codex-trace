@@ -124,6 +124,20 @@ pub struct CodexSessionInfo {
 /// introduced (see the `history_base_thread_id` field above, issue #210). Neither PR
 /// touches `codex-rs/rollout` or adds any rollout field — confirmed by diffing both PRs'
 /// changed files — so this scanner needs no changes for it.
+///
+/// Note on Codex v0.160.0 projectless TUI sessions (issue #341): PR #49160 lets a session
+/// start in a directory that isn't a recognized Codex "project" (no saved trust decision,
+/// no `project_root_markers` match), applying workspace-write defaults instead of prompting.
+/// Confirmed against the upstream PR's changed-file list that this is purely a
+/// `codex-rs/tui`/config-layer concern — it touches no file under `codex-rs/rollout` or
+/// `codex-rs/protocol`, so a projectless session's `session_meta` line has the exact same
+/// shape as any other: `cwd` (required, never null) is still the real directory Codex was
+/// started in. This scanner never keyed discovery or `date_group` off a project directory
+/// in the first place — it walks `sessions_dir` by date, and `cwd` is read as `Option<String>`
+/// purely for display, search matching, and `resolve_worktree_owner_thread_id` below, which
+/// already treats a non-worktree `cwd` (including one with no `.git` at all) as "not a
+/// worktree" rather than an error. No code changes needed; see
+/// `discover_sessions_groups_a_projectless_session_like_any_other` for the regression check.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -1503,6 +1517,46 @@ mod tests {
             Some("owner-thread"),
             "a worktree session should nest under the thread that owns its checkout"
         );
+    }
+
+    #[test]
+    fn discover_sessions_groups_a_projectless_session_like_any_other() {
+        // Codex v0.160.0 (issue #341): a "projectless" TUI session runs in a directory that
+        // isn't a recognized Codex project (no saved trust decision, no root-marker match)
+        // and has no Git repo at all — just an ordinary scratch folder. Its `session_meta`
+        // line is shaped exactly like any other session's, since the upstream PR touches no
+        // rollout/protocol file. It should be discovered and date_group'd the same as a
+        // session anchored to a real project, with no worktree owner inferred from the lack
+        // of a `.git`.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/10/25");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let scratch_dir = tmp.path().join("scratch-no-project");
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-10-25T09-00-00-projectless.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-10-25T09:00:00Z","type":"session_meta","payload":{{"id":"projectless-session","timestamp":"2026-10-25T09:00:00Z","cwd":"{}"}}}}"#,
+                scratch_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "projectless-session")
+            .unwrap();
+
+        assert_eq!(session.date_group, "2026/10/25");
+        assert_eq!(
+            session.cwd.as_deref(),
+            Some(scratch_dir.to_string_lossy()).as_deref()
+        );
+        assert_eq!(session.worktree_owner_thread_id, None);
+        assert_eq!(session.parent_session_id, None);
     }
 
     #[test]

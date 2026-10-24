@@ -2517,6 +2517,61 @@ mod tests {
         assert_eq!(changes[0]["path"], "old.rs");
     }
 
+    // Codex v0.163.0 (PR #53444): `codex exec`'s human-readable terminal output now
+    // suppresses reprinting an unchanged file diff after an unrelated command — it only
+    // reprints when the diff actually changes, goes from empty to non-empty, or a new turn
+    // starts. codex-trace is unaffected because it never reads `codex exec` terminal
+    // stdout/stderr; it parses the structured JSONL rollout file, where each apply_patch
+    // call is a distinct patch_apply_end event keyed by call_id. There is no "one diff print
+    // per modifying command" assumption to break: two patches touching the same file,
+    // separated by an unrelated exec_command, still yield two independent PatchApply tool
+    // calls each with their own patch_changes.
+    #[test]
+    fn v0163_exec_diff_reprint_suppression_does_not_affect_patch_tracking() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-session","timestamp":"2026-10-01T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // First patch: modifies foo.rs.
+            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch_1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: foo.rs\n..."}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch_1","output":"{\"output\":\"Applied patch successfully\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:04Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_1","success":true,"changes":[{"path":"foo.rs","type":"modified"}]}}"#,
+            // Unrelated command in between — in printed terminal output this is where
+            // v0.163.0 suppresses reprinting the still-current foo.rs diff.
+            r#"{"timestamp":"2026-10-01T10:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo check\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:06Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec","aggregated_output":"Checking project\n","exit_code":0,"status":"completed"}}"#,
+            // Second patch: touches foo.rs again, producing the same resulting change.
+            r#"{"timestamp":"2026-10-01T10:00:07Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch_2","name":"apply_patch","input":"*** Begin Patch\n*** Update File: foo.rs\n..."}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch_2","output":"{\"output\":\"Applied patch successfully\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:09Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_2","success":true,"changes":[{"path":"foo.rs","type":"modified"}]}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1759312810.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        // Three distinct tool calls — both patches tracked independently, with no
+        // dependency on how many diff blocks `codex exec` would have printed to stdout.
+        assert_eq!(turns[0].tool_calls.len(), 3);
+
+        let patch_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::PatchApply)
+            .collect();
+        assert_eq!(patch_calls.len(), 2, "both patches tracked independently");
+        for patch in &patch_calls {
+            assert_eq!(patch.patch_success, Some(true));
+            assert_eq!(patch.patch_changes.as_ref().unwrap()[0]["path"], "foo.rs");
+        }
+
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(exec_calls.len(), 1, "unrelated command tracked separately");
+    }
+
     // Codex v0.129.0 (PRs #20502/#20682): persist_extended_history disabled; app-server
     // always returns a limited history window. codex-trace reads JSONL session files from
     // disk — it never fetches history from the app-server — so all turns recorded in the

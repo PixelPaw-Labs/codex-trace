@@ -43,6 +43,11 @@ pub enum ToolKind {
     /// choice or custom text) in `output`. If the turn ends before the user answers
     /// (v0.157.0, #47422/#47423), `output` is None and `status` is `"unanswered"`.
     UserInputRequest,
+    /// Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools
+    /// exposed through the same embedded dynamic-tools mechanism as `spawn_agent`/
+    /// `wait_agent`. Covers `create_worktree`, `get_worktree_creation_status`, and
+    /// `list_worktrees`.
+    ManagedWorktree,
     Unknown,
 }
 
@@ -86,9 +91,13 @@ pub struct ToolCall {
     /// Codex v0.134.0 (PR #22882): subagent human-readable name from hook input identity fields.
     /// Null for parent-agent tool calls and sessions from pre-v0.134.0.
     pub subagent_name: Option<String>,
-    /// Codex v0.145.0: exec_command_end may include a truncation indicator when the runtime
-    /// bounded command output to fix an unbounded-exec bug. True means `aggregated_output`
-    /// is partial; None means no truncation field was present (pre-v0.145.0 or unaffected run).
+    /// True when `aggregated_output` is known to be partial rather than the complete command
+    /// output. Set by either of two independent Codex mechanisms: Codex v0.145.0's runtime
+    /// output bound, signaled via an explicit `truncated`/`output_truncated`/`bytes_truncated`
+    /// field on `exec_command_end`; or Codex v0.162.0's 64 KiB rollout-persistence cap (PR
+    /// openai/codex#50427), signaled by an embedded truncation marker inside `aggregated_output`
+    /// itself with no separate indicator field. None means neither signal was present
+    /// (pre-v0.145.0 sessions, or a run whose output never hit either limit).
     #[serde(default)]
     pub output_truncated: Option<bool>,
 }
@@ -510,6 +519,49 @@ impl ToolCallBuilder {
                 return;
             }
 
+            // Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list
+            // tools, registered in the same embedded dynamic-tools namespace as
+            // spawn_agent/wait_agent and the message-board tools. Classify by name so
+            // they render as recognized worktree management calls instead of falling
+            // back to generic/unlabeled MCP tool rendering.
+            if matches!(
+                pending.name.as_str(),
+                "create_worktree" | "get_worktree_creation_status" | "list_worktrees"
+            ) {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::ManagedWorktree,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    script_path: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    image_file_path: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
+                    subagent_id: None,
+                    subagent_name: None,
+                    output_truncated: None,
+                });
+                return;
+            }
+
             // assign_task (Codex < v0.136.0, PR #25267) was renamed to followup_task
             // (Codex ≥ v0.136.0, PR #25636). Both represent the multi-agent v2 task
             // assignment tool and are classified as FollowupTask.
@@ -703,17 +755,23 @@ impl ToolCallBuilder {
         let duration_secs = parse_duration(payload);
         // aggregated_output carries the actual command output; stdout is often empty.
         // formatted_output was a legacy field removed in Codex v0.132.0 (PR #22706).
+        // Codex v0.164.0 (#54309, #54432, #56049, issue #335) masks credentials sourced
+        // from environment variables (e.g. `printf "$OPENAI_API_KEY"`) in the output of
+        // remote Bash and Zsh-snapshot exec sessions, not in the command text itself —
+        // redact here too, mirroring the command-field redaction below, as a fallback for
+        // sessions where that masking is unavailable and falls back to raw output.
         let output = ["aggregated_output", "stdout"].iter().find_map(|key| {
             payload
                 .get(*key)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
+                .map(redact_secrets)
         });
         let status = str_field(payload, "status");
-        // Codex v0.145.0: may include a truncation indicator when the runtime bounded
-        // command output to fix an unbounded-exec bug (bytes_truncated, truncated, or
-        // output_truncated). Parse it so the UI can warn users that output is partial.
+        // Codex v0.145.0 may include a truncation indicator when the runtime bounded command
+        // output (bytes_truncated, truncated, or output_truncated); Codex v0.162.0 instead
+        // embeds a truncation marker directly in aggregated_output when the rollout-persistence
+        // cap clipped it. Parse both so the UI can warn users that output is partial.
         let output_truncated = parse_output_truncated(payload);
 
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
@@ -1410,7 +1468,11 @@ fn session_id_from_arguments(arguments: &Value) -> Option<String> {
 }
 
 fn parse_exec_function_output(output: &str) -> ExecFunctionOutput {
-    let tool_output = display_output(output);
+    // Codex v0.164.0 (#54309, #54432, #56049, issue #335): exec output is where credentials
+    // sourced from environment variables actually leak (the command text the model wrote
+    // rarely contains the raw value) for remote Bash and Zsh-snapshot sessions, including
+    // write_stdin/PTY output merged in here. Redact the same patterns applied to `command`.
+    let tool_output = display_output(output).map(|s| redact_secrets(&s));
 
     // Exit code, duration, and running session id extraction only apply to the old
     // SDK-format output that contains an "Output:" marker line. v0.132.0 (PR #22706)
@@ -1717,18 +1779,29 @@ fn extract_mcp_result(payload: &Value) -> (Option<String>, bool) {
     (output, is_error)
 }
 
+/// Marker Codex v0.162.0 (PR openai/codex#50427, `truncate_middle_with_marker`) splices into
+/// the middle of `aggregated_output` when the rollout-persistence policy caps it at 64 KiB.
+/// Unlike the v0.145.0 indicator fields below, this mechanism carries no separate boolean or
+/// count field — the only signal is this literal text embedded in the output itself.
+const PERSISTED_OUTPUT_TRUNCATION_MARKER: &str = "command output truncated for persistence";
+
 /// Detect whether an exec_command_end payload signals truncated output.
 ///
-/// Codex v0.145.0 introduced bounded exec output to fix an unbounded-exec bug.
-/// When the runtime clips command output it may set one of three fields:
-/// - `truncated` (bool true) — primary indicator added in v0.145.0
-/// - `output_truncated` (bool true) — alternative spelling used in some builds
-/// - `bytes_truncated` (number > 0) — byte count of dropped output
+/// Two independent Codex mechanisms can clip `aggregated_output`:
+/// - Codex v0.145.0 bounded exec output at the runtime level to fix an unbounded-exec bug,
+///   and signals it via one of three fields:
+///   - `truncated` (bool true) — primary indicator added in v0.145.0
+///   - `output_truncated` (bool true) — alternative spelling used in some builds
+///   - `bytes_truncated` (number > 0) — byte count of dropped output
+/// - Codex v0.162.0 caps the *persisted* `aggregated_output` at 64 KiB (rollout recording,
+///   thread-store appends, and legacy-to-paginated migration) and signals it by splicing
+///   [`PERSISTED_OUTPUT_TRUNCATION_MARKER`] into the output text itself, with no separate
+///   indicator field.
 ///
-/// Returns `Some(true)` when any indicator is present and signals truncation,
-/// `Some(false)` when an indicator is explicitly present but false/zero (not
-/// truncated), and `None` when no indicator field exists (pre-v0.145.0 sessions
-/// or exec calls that completed without hitting the output limit).
+/// Returns `Some(true)` when any indicator or the marker text is present and signals
+/// truncation, `Some(false)` when an indicator is explicitly present but false/zero (not
+/// truncated), and `None` when no signal exists (pre-v0.145.0 sessions, or exec calls that
+/// completed without hitting either limit).
 fn parse_output_truncated(payload: &Value) -> Option<bool> {
     if let Some(v) = payload.get("truncated").and_then(|v| v.as_bool()) {
         return Some(v);
@@ -1738,6 +1811,11 @@ fn parse_output_truncated(payload: &Value) -> Option<bool> {
     }
     if let Some(n) = payload.get("bytes_truncated").and_then(|v| v.as_u64()) {
         return Some(n > 0);
+    }
+    if let Some(output) = payload.get("aggregated_output").and_then(|v| v.as_str()) {
+        if output.contains(PERSISTED_OUTPUT_TRUNCATION_MARKER) {
+            return Some(true);
+        }
     }
     None
 }
@@ -1816,6 +1894,50 @@ mod tests {
             tool.duration_secs.is_some(),
             "duration should be extracted from structured field"
         );
+    }
+
+    // Codex v0.162.0 (PR openai/codex#50402, issue #328): "Consolidate command execution
+    // output into aggregated_output" removes `stdout`, `stderr`, and `formatted_output`
+    // from CommandExecutionItem/ExecCommandEndEvent entirely (not just `formatted_output`,
+    // which v0.132.0 already removed) and clears `interaction_input` on migrated items.
+    // codex-trace already reads `aggregated_output` as the primary source (see the
+    // v0.132.0 test above) and never reads `stderr` or `interaction_input` anywhere, so
+    // this upstream change has no code path to affect here. Lock in that conclusion with
+    // a payload that has none of the four removed/cleared fields present at all.
+    #[test]
+    fn exec_command_end_v0162_reads_aggregated_output_with_stdout_stderr_formatted_output_and_interaction_input_absent(
+    ) {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None, // plugin_id
+        );
+
+        // v0.162.0 exec_command_end: only aggregated_output; stdout, stderr,
+        // formatted_output, and interaction_input are all absent from the payload.
+        let payload = json!({
+            "call_id": "call_1",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 120_000_000u64}
+        });
+        assert!(payload.get("stdout").is_none());
+        assert!(payload.get("stderr").is_none());
+        assert!(payload.get("formatted_output").is_none());
+        assert!(payload.get("interaction_input").is_none());
+
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
     }
 
     // Codex v0.139.0 (PR #26994): multi-agent v2 close_agent renamed to interrupt_agent.
@@ -3029,6 +3151,66 @@ mod tests {
         );
     }
 
+    // Codex v0.162.0 (PR openai/codex#50427): the rollout-persistence policy caps a
+    // completed command's `aggregated_output` at 64 KiB, splicing a truncation marker
+    // into the output text instead of setting a separate indicator field. The parser
+    // must recognize the marker and still surface output_truncated = true.
+    #[test]
+    fn v0162_persisted_output_truncation_marker_sets_output_truncated() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_persist_trunc".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat huge.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // No truncated/output_truncated/bytes_truncated field — the only signal is the
+        // marker text embedded in aggregated_output by truncate_middle_with_marker.
+        let payload = json!({
+            "call_id": "call_persist_trunc",
+            "aggregated_output": "head of output\n... command output truncated for persistence ...\ntail of output",
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output_truncated, Some(true));
+        assert!(tool
+            .output
+            .as_deref()
+            .unwrap()
+            .contains("truncated for persistence"));
+    }
+
+    #[test]
+    fn v0162_output_without_persisted_truncation_marker_yields_none() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_no_persist_trunc".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_no_persist_trunc",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert!(builder.finalized[0].output_truncated.is_none());
+    }
+
     #[test]
     fn v0145_truncation_propagated_to_backfill_exec_entry() {
         // When function_call_output arrives before exec_command_end (v0.132.0+ sessions),
@@ -3063,6 +3245,112 @@ mod tests {
         assert_eq!(tool.kind, ToolKind::ExecCommand);
         assert_eq!(tool.output_truncated, Some(true));
         assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.158.0 (PRs #47529, #47665, issue #342): a process that fails to launch now
+    // gets a normal exec_command_end instead of no end event at all. It reuses the existing
+    // failure shape (exit_code: -1, status: "failed", zero duration) with the launch diagnostic
+    // in aggregated_output, so the generic field extraction below already parses it correctly.
+
+    #[test]
+    fn v0158_exec_command_end_process_launch_failure_parses_as_failed_with_exit_code_neg1() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_launch_fail".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"/not/a/real/binary","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_launch_fail",
+            "aggregated_output": "No such file or directory (os error 2)",
+            "exit_code": -1,
+            "status": "failed",
+            "duration": {"secs": 0, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.exit_code, Some(-1));
+        assert_eq!(tool.status, "failed");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("No such file or directory (os error 2)")
+        );
+        assert_eq!(tool.duration_secs, Some(0.0));
+    }
+
+    #[test]
+    fn v0158_exec_command_end_early_output_is_captured_in_aggregated_output() {
+        // PR #47665: output produced before the streaming subscriber attached is now
+        // included in aggregated_output. No new field — the existing aggregated_output
+        // extraction already surfaces whatever text the runtime puts there.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_early_output".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo early && echo late","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_early_output",
+            "aggregated_output": "early\nlate\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 5_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("early\nlate\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.164.0 (issue #336, upstream openai/codex#54433): the TUI's compact
+    // output now uses neutral labels for nonzero exits — `Exited (status N)` instead
+    // of `Failed (exit N)` for a single command, and `nonzero exit`/`nonzero exits`
+    // instead of `failed` for exploration counts, with the red styling removed. This
+    // change lives entirely in `codex-rs/tui/src/exec_cell/{compact,render}.rs` — it
+    // only affects how the live, interactive TUI renders text to the terminal.
+    // codex-trace never reads that rendered text: it parses the on-disk rollout
+    // JSONL directly, where `exec_command_end` still carries the structured,
+    // numeric `exit_code` and the `status` string Codex core writes independently of
+    // the TUI's display choices. Verify a nonzero exit still parses to `exit_code`
+    // and `status` exactly as before, regardless of the TUI's relabeling.
+    #[test]
+    fn v0164_neutral_tui_exit_labels_do_not_affect_exec_command_status_parsing() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_neutral_exit".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cargo test","workdir":"/project"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_neutral_exit",
+            "aggregated_output": "test result: FAILED. 1 passed; 1 failed;\n",
+            "exit_code": 101,
+            "status": "failed",
+            "duration": {"secs": 2, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.exit_code, Some(101));
+        assert_eq!(tool.status, "failed");
     }
 
     // Codex v0.146.0 (issue #223): exec_command_end may carry plugin_id/script_path when
@@ -3329,6 +3617,76 @@ mod tests {
         }
     }
 
+    // Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools,
+    // registered in the same embedded dynamic-tools namespace as spawn_agent/wait_agent.
+    // They previously fell through to generic McpTool/Unknown classification.
+
+    #[test]
+    fn create_worktree_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_create_worktree".to_string(),
+            "create_worktree".to_string(),
+            r#"{"ref":"feature/foo","allowAsync":true}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_create_worktree", r#"{"operationId":"op_1"}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ManagedWorktree);
+        assert_eq!(tool.name, "create_worktree");
+        assert_eq!(
+            tool.arguments.get("ref").and_then(|v| v.as_str()),
+            Some("feature/foo")
+        );
+    }
+
+    #[test]
+    fn get_worktree_creation_status_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_status".to_string(),
+            "get_worktree_creation_status".to_string(),
+            r#"{"operationId":"op_1"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_status",
+            r#"{"status":"ready","workspaceRoot":"/tmp/worktree"}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].kind, ToolKind::ManagedWorktree);
+        assert_eq!(builder.finalized[0].name, "get_worktree_creation_status");
+    }
+
+    #[test]
+    fn list_worktrees_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_list_worktrees".to_string(),
+            "list_worktrees".to_string(),
+            "{}",
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_list_worktrees", r#"{"worktrees":[]}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].kind, ToolKind::ManagedWorktree);
+        assert_eq!(builder.finalized[0].name, "list_worktrees");
+    }
+
     // Codex v0.153.0+ (PR #42178, issue #304): request_user_input_async is a built-in
     // tool the model calls to ask the user a structured clarifying question mid-turn
     // without ending the turn. It previously fell through to ToolKind::Unknown.
@@ -3469,5 +3827,106 @@ mod tests {
             "redacted command must not contain the raw secret"
         );
         assert!(command[0].contains("[REDACTED_SECRET]"));
+    }
+
+    // Codex v0.164.0 (#54309, #54432, #56049, issue #335): remote Bash and Zsh-snapshot
+    // exec sessions can leak env-var-sourced credentials through command *output* (e.g.
+    // `printf "$OPENAI_API_KEY"`) rather than the command text itself, which #217's fix
+    // never covered. codex-trace must redact `aggregated_output`/`stdout` too.
+    #[test]
+    fn exec_command_end_aggregated_output_has_secrets_redacted() {
+        let fixture_token = format!("sk-proj-{}", "executor-only-0000000000000000000000000000");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret_output".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"printf '%s' \"$OPENAI_API_KEY\"","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_secret_output",
+            "command": ["printf", "%s", "$OPENAI_API_KEY"],
+            "aggregated_output": fixture_token,
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        let tool = &builder.finalized[0];
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn function_call_output_exec_output_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "sk-", "abcdefghijklmnopqrstuvwx");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret_output_arg".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"printf '%s' \"$OPENAI_API_KEY\"","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_secret_output_arg", &fixture_token, None);
+
+        let tool = &builder.finalized[0];
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn write_stdin_pty_merged_output_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "sk-", "abcdefghijklmnopqrstuvwx");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_pty".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"zsh -l","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output(
+            "call_pty",
+            "Chunk ID: abc123\nWall time: 0.1000 seconds\n\
+             Process running with session ID pty-1\nOriginal token count: 0\nOutput:\nstarted\n",
+            None,
+        );
+        builder.add_function_call(
+            "call_stdin".to_string(),
+            "write_stdin".to_string(),
+            r#"{"session_id":"pty-1","chars":"echo $OPENAI_API_KEY\n"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_stdin", &fixture_token, None);
+
+        let tool = builder
+            .finalized
+            .iter()
+            .find(|tc| tc.call_id == "call_pty")
+            .expect("original exec call should be present");
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted PTY output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
     }
 }

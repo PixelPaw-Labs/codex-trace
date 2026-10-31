@@ -51,7 +51,11 @@ function looksLikePatch(patch: string): boolean {
 export function parseApplyPatch(patch: string): PatchFile[] | null {
   if (!looksLikePatch(patch)) return null;
 
-  const lines = patch.split("\n");
+  // Codex v0.162.0+ preserves a file's original line endings when applying a
+  // patch, so context/removed/added lines copied from a CRLF file carry a
+  // trailing `\r` ahead of the body's own `\n` separators. Normalise those
+  // away first so the `\r` doesn't end up baked into the rendered diff text.
+  const lines = patch.replace(/\r\n/g, "\n").split("\n");
   // Drop a single trailing empty element from a terminal newline so it doesn't
   // surface as a spurious blank context line on the last file.
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();

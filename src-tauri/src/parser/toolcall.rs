@@ -43,6 +43,11 @@ pub enum ToolKind {
     /// choice or custom text) in `output`. If the turn ends before the user answers
     /// (v0.157.0, #47422/#47423), `output` is None and `status` is `"unanswered"`.
     UserInputRequest,
+    /// Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools
+    /// exposed through the same embedded dynamic-tools mechanism as `spawn_agent`/
+    /// `wait_agent`. Covers `create_worktree`, `get_worktree_creation_status`, and
+    /// `list_worktrees`.
+    ManagedWorktree,
     Unknown,
 }
 
@@ -507,6 +512,49 @@ impl ToolCallBuilder {
                     } else {
                         "completed".to_string()
                     },
+                    subagent_id: None,
+                    subagent_name: None,
+                    output_truncated: None,
+                });
+                return;
+            }
+
+            // Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list
+            // tools, registered in the same embedded dynamic-tools namespace as
+            // spawn_agent/wait_agent and the message-board tools. Classify by name so
+            // they render as recognized worktree management calls instead of falling
+            // back to generic/unlabeled MCP tool rendering.
+            if matches!(
+                pending.name.as_str(),
+                "create_worktree" | "get_worktree_creation_status" | "list_worktrees"
+            ) {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::ManagedWorktree,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    script_path: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    image_file_path: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
@@ -3503,6 +3551,76 @@ mod tests {
                 "{name} should classify as MessageBoard"
             );
         }
+    }
+
+    // Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools,
+    // registered in the same embedded dynamic-tools namespace as spawn_agent/wait_agent.
+    // They previously fell through to generic McpTool/Unknown classification.
+
+    #[test]
+    fn create_worktree_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_create_worktree".to_string(),
+            "create_worktree".to_string(),
+            r#"{"ref":"feature/foo","allowAsync":true}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_create_worktree", r#"{"operationId":"op_1"}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ManagedWorktree);
+        assert_eq!(tool.name, "create_worktree");
+        assert_eq!(
+            tool.arguments.get("ref").and_then(|v| v.as_str()),
+            Some("feature/foo")
+        );
+    }
+
+    #[test]
+    fn get_worktree_creation_status_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_status".to_string(),
+            "get_worktree_creation_status".to_string(),
+            r#"{"operationId":"op_1"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_status",
+            r#"{"status":"ready","workspaceRoot":"/tmp/worktree"}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].kind, ToolKind::ManagedWorktree);
+        assert_eq!(builder.finalized[0].name, "get_worktree_creation_status");
+    }
+
+    #[test]
+    fn list_worktrees_is_classified_as_managed_worktree() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_list_worktrees".to_string(),
+            "list_worktrees".to_string(),
+            "{}",
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_list_worktrees", r#"{"worktrees":[]}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].kind, ToolKind::ManagedWorktree);
+        assert_eq!(builder.finalized[0].name, "list_worktrees");
     }
 
     // Codex v0.153.0+ (PR #42178, issue #304): request_user_input_async is a built-in

@@ -780,6 +780,60 @@ describe("ToolCallItem", () => {
     });
   });
 
+  // Codex v0.158.0 (PRs #47529, #47665): command completion events now report process-launch
+  // failures through the exec tool's existing failure shape — exit_code: -1, status: "failed" —
+  // rather than dropping the lifecycle event entirely. -1 is never a real process exit status, so
+  // surface it as a distinct notice instead of letting it read as an ordinary nonzero exit.
+  describe("launch failure notice (v0.158.0+)", () => {
+    it("shows the launch-failed notice for an exec command with exit_code -1", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({
+            exit_code: -1,
+            status: "failed",
+            output: "No such file or directory (os error 2)",
+          })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/No real exit code/)).toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for an ordinary nonzero exit", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 1, status: "failed", output: "command not found: fooo" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for a successful command", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 0, status: "completed" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for a non-exec tool kind", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ kind: "mcp_tool", exit_code: -1, status: "failed" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+  });
+
   // Codex v0.150.0 (PR #40511): new `Interrupt` HookEventName variant, plus the general
   // requirement (issue #251) that hook events codex-trace has never seen before still
   // render through the generic shell_hook path instead of being dropped or shown as raw JSON.

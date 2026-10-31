@@ -1235,6 +1235,24 @@ fn handle_response_item(
             }
         }
 
+        // Codex v0.165.0 (PR #56163): reasoning-effort overrides are enabled by default,
+        // letting the user change reasoning effort mid-conversation. The change is recorded
+        // as a durable `configuration_update` response_item — `{"reasoning":{"effort":"..."}}`
+        // — rather than a new turn_context snapshot, so apply it directly to keep
+        // reasoning_effort current instead of leaving it stale until the next turn boundary.
+        "configuration_update" => {
+            let effort = payload
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if effort.is_some() {
+                if let Some(turn) = turns.get_mut(tid) {
+                    turn.reasoning_effort = effort;
+                }
+            }
+        }
+
         // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command imports setup, project
         // config, and recent chats from external agents (e.g. Claude Code). The import flow
         // writes response_items into the session transcript describing imported threads. These
@@ -3232,6 +3250,43 @@ mod tests {
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].reasoning_effort.as_deref(), Some("ultra"));
+    }
+
+    // Codex v0.165.0 (PR #56163): reasoning-effort overrides are enabled by default, so a
+    // mid-conversation effort change is persisted as a `configuration_update` response_item
+    // carrying `{"reasoning":{"effort":"..."}}` rather than a new turn_context snapshot.
+
+    #[test]
+    fn configuration_update_response_item_sets_reasoning_effort() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"s-cfg-update","timestamp":"2026-10-25T10:00:00Z","cli_version":"0.165.0"}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Switch to low effort and continue."}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:03Z","type":"response_item","payload":{"type":"configuration_update","reasoning":{"effort":"low"}}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793016004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn configuration_update_overrides_earlier_turn_context_effort() {
+        // Unlike thread_settings/turn_context's "first value wins" semantics, a
+        // configuration_update represents a deliberate change and must take precedence
+        // over whatever turn_context already set for the turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"s-cfg-override","timestamp":"2026-10-25T10:00:00Z","cli_version":"0.165.0"}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5.4","cwd":"/project","effort":"medium"}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:03Z","type":"response_item","payload":{"type":"configuration_update","reasoning":{"effort":"high"}}}"#,
+            r#"{"timestamp":"2026-10-25T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793016004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("high"));
     }
 
     // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event payload field renamed

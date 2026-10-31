@@ -656,6 +656,28 @@ mod tests {
         assert!(exec_end.payload.get("formatted_output").is_none());
     }
 
+    // Codex v0.162.0 (PR openai/codex#50402, issue #328): "Consolidate command execution
+    // output into aggregated_output" removes `stdout`, `stderr`, and `formatted_output`
+    // from CommandExecutionItem/ExecCommandEndEvent entirely (v0.132.0 only removed
+    // `formatted_output`) and clears `interaction_input` on migrated command completion
+    // items. The JSONL entry types themselves are unchanged; this regression guard
+    // confirms an exec_command_end payload carrying none of the four removed/cleared
+    // fields still parses through RawEntry without error, with `aggregated_output` as
+    // the sole output source.
+    #[test]
+    fn v0162_exec_command_end_parses_with_stdout_stderr_formatted_output_and_interaction_input_absent(
+    ) {
+        let line = r#"{"timestamp":"2026-10-01T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#;
+        let entry = RawEntry::parse(line).expect("parse failed");
+        assert_eq!(entry.entry_type, "event_msg");
+        assert_eq!(entry.payload["type"], "exec_command_end");
+        assert_eq!(entry.payload["aggregated_output"], "hello\n");
+        assert!(entry.payload.get("stdout").is_none());
+        assert!(entry.payload.get("stderr").is_none());
+        assert!(entry.payload.get("formatted_output").is_none());
+        assert!(entry.payload.get("interaction_input").is_none());
+    }
+
     // Codex v0.134.0 (PR #24081): `codex-tui.log` is now opt-in.
     //
     // Before v0.134.0, the TUI log file was written unconditionally at its default
@@ -1656,6 +1678,23 @@ mod tests {
         assert_eq!(e.entry_type, "event_msg");
         assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_result"));
         assert_eq!(e.payload["status"], "failed");
+    }
+
+    #[test]
+    fn v0163_response_incomplete_surfaces_as_generic_error_event_msg() {
+        // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
+        // max_output_tokens) now terminate the turn immediately as a non-retryable
+        // `ResponseIncomplete` error instead of a generic, retryable stream error. There is
+        // no dedicated wire event for this — it is delivered as the existing generic
+        // `error` event_msg, with the reason embedded in the message text.
+        let line = r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#;
+        let e = RawEntry::parse(line).expect("error event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("error"));
+        assert_eq!(
+            e.payload["message"],
+            "Incomplete response returned, reason: max_output_tokens"
+        );
     }
 
     #[test]

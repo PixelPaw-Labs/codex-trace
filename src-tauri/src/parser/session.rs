@@ -445,6 +445,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_accepts_gcp_model_provider() {
+        // Codex v0.165.0 (PR #56265): adds a built-in Google Cloud Vertex AI provider,
+        // configured via model_provider = "gcp". model_provider is stored as a plain
+        // Option<String> with no allow-list, so new provider values pass through unchanged.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-10-25T00-00-00-gcp.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-10-25T00:00:00Z","type":"session_meta","payload":{"id":"gcp-session","timestamp":"2026-10-25T00:00:00Z","cwd":"/tmp","cli_version":"0.165.0","model_provider":"gcp"}}"#,
+                r#"{"timestamp":"2026-10-25T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-10-25T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793016002.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.model_provider.as_deref(), Some("gcp"));
+    }
+
+    #[test]
     fn default_sessions_dir_exists() {
         let dir = default_sessions_dir();
         assert!(dir.is_some());

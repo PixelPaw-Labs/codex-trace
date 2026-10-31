@@ -119,7 +119,7 @@ were rendering blank.
   Codex records but codex-trace used to drop on the floor are now parsed and exposed on the
   session and turn payloads: the approval mode a session ran under (including v0.144.0's new
   `writes` value), the per-credit type and expiry on rate-limit resets, the thread a `codex
-exec` session was forked from, the thread a paginated continuation carries its history from,
+  exec` session was forked from, the thread a paginated continuation carries its history from,
   and the threads a turn @-mentioned. These are available to anything reading the HTTP API
   and are typed in `shared/types.ts`; the UI does not display them yet.
 

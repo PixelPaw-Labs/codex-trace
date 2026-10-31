@@ -344,6 +344,16 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .map(|s| s.to_string());
 }
 
+// Codex v0.166.0 (issue #361, upstream openai/codex#57366) added a `workspaceName`
+// field surfaced on the interactive TUI's `/status` card, showing the selected ChatGPT
+// workspace. Diffing the upstream PR confirms the field lives entirely on the
+// app-server protocol's `Account::Chatgpt` variant (`codex-rs/app-server-protocol/src/
+// protocol/v2/account.rs`, populated by `account_processor/workspace_routing.rs`) and
+// is never written to `session_meta` or any other rollout JSONL event defined in
+// `codex-rs/protocol`/`codex-rs/rollout`. codex-trace parses rollout files from disk and
+// never connects to the Codex app-server, so there is no field here for this change to
+// add, and no existing parsing for it to break.
+
 fn parse_session_meta_root(session: &mut CodexSession, raw: &Value) {
     session.id = str_field(raw, "id");
     session.timestamp = str_field(raw, "timestamp");
@@ -432,6 +442,27 @@ mod tests {
         .unwrap();
         let session = parse_session(&path).unwrap();
         assert_eq!(session.id, "thread-sess-id");
+    }
+
+    #[test]
+    fn parse_session_accepts_gcp_model_provider() {
+        // Codex v0.165.0 (PR #56265): adds a built-in Google Cloud Vertex AI provider,
+        // configured via model_provider = "gcp". model_provider is stored as a plain
+        // Option<String> with no allow-list, so new provider values pass through unchanged.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-10-25T00-00-00-gcp.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-10-25T00:00:00Z","type":"session_meta","payload":{"id":"gcp-session","timestamp":"2026-10-25T00:00:00Z","cwd":"/tmp","cli_version":"0.165.0","model_provider":"gcp"}}"#,
+                r#"{"timestamp":"2026-10-25T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-10-25T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793016002.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.model_provider.as_deref(), Some("gcp"));
     }
 
     #[test]

@@ -5021,4 +5021,34 @@ mod tests {
             "each message must carry its own position in the stream"
         );
     }
+
+    // Codex v0.164.0 (PRs #54930, #54949): negotiated zstd compression was added to
+    // app-server WebSocket connections, gated behind a feature flag that defaults to off.
+    // When the flag is enabled, raw WebSocket frames between the CLI and app-server can be
+    // zstd-compressed after negotiation instead of plain JSON.
+    //
+    // codex-trace reads session data exclusively from JSONL files at ~/.codex/sessions/ —
+    // it never connects to the Codex app-server WebSocket and never reads a raw WebSocket
+    // frame. The app-server decompresses negotiated frames (when the flag is on) before
+    // surfacing events through its standard APIs, and those events continue to be logged to
+    // disk as plain JSON in the same JSONL format as every prior version, regardless of
+    // whether the flag is enabled. The compression negotiation happens entirely on a wire
+    // codex-trace never touches.
+    //
+    // The test below confirms a v0.164.0 session still parses correctly, guarding against a
+    // future regression that would re-introduce a dependency on that WebSocket wire format.
+    #[test]
+    fn v0164_zstd_websocket_compression_negotiation_does_not_affect_session_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0164","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.164.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792000803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+    }
 }

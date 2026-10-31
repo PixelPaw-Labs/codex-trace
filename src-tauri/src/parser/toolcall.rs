@@ -707,12 +707,17 @@ impl ToolCallBuilder {
         let duration_secs = parse_duration(payload);
         // aggregated_output carries the actual command output; stdout is often empty.
         // formatted_output was a legacy field removed in Codex v0.132.0 (PR #22706).
+        // Codex v0.164.0 (#54309, #54432, #56049, issue #335) masks credentials sourced
+        // from environment variables (e.g. `printf "$OPENAI_API_KEY"`) in the output of
+        // remote Bash and Zsh-snapshot exec sessions, not in the command text itself —
+        // redact here too, mirroring the command-field redaction below, as a fallback for
+        // sessions where that masking is unavailable and falls back to raw output.
         let output = ["aggregated_output", "stdout"].iter().find_map(|key| {
             payload
                 .get(*key)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
+                .map(redact_secrets)
         });
         let status = str_field(payload, "status");
         // Codex v0.145.0 may include a truncation indicator when the runtime bounded command
@@ -1407,7 +1412,11 @@ fn session_id_from_arguments(arguments: &Value) -> Option<String> {
 }
 
 fn parse_exec_function_output(output: &str) -> ExecFunctionOutput {
-    let tool_output = display_output(output);
+    // Codex v0.164.0 (#54309, #54432, #56049, issue #335): exec output is where credentials
+    // sourced from environment variables actually leak (the command text the model wrote
+    // rarely contains the raw value) for remote Bash and Zsh-snapshot sessions, including
+    // write_stdin/PTY output merged in here. Redact the same patterns applied to `command`.
+    let tool_output = display_output(output).map(|s| redact_secrets(&s));
 
     // Exit code, duration, and running session id extraction only apply to the old
     // SDK-format output that contains an "Output:" marker line. v0.132.0 (PR #22706)
@@ -3636,5 +3645,106 @@ mod tests {
             "redacted command must not contain the raw secret"
         );
         assert!(command[0].contains("[REDACTED_SECRET]"));
+    }
+
+    // Codex v0.164.0 (#54309, #54432, #56049, issue #335): remote Bash and Zsh-snapshot
+    // exec sessions can leak env-var-sourced credentials through command *output* (e.g.
+    // `printf "$OPENAI_API_KEY"`) rather than the command text itself, which #217's fix
+    // never covered. codex-trace must redact `aggregated_output`/`stdout` too.
+    #[test]
+    fn exec_command_end_aggregated_output_has_secrets_redacted() {
+        let fixture_token = format!("sk-proj-{}", "executor-only-0000000000000000000000000000");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret_output".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"printf '%s' \"$OPENAI_API_KEY\"","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_secret_output",
+            "command": ["printf", "%s", "$OPENAI_API_KEY"],
+            "aggregated_output": fixture_token,
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        let tool = &builder.finalized[0];
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn function_call_output_exec_output_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "sk-", "abcdefghijklmnopqrstuvwx");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret_output_arg".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"printf '%s' \"$OPENAI_API_KEY\"","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_secret_output_arg", &fixture_token, None);
+
+        let tool = &builder.finalized[0];
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn write_stdin_pty_merged_output_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "sk-", "abcdefghijklmnopqrstuvwx");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_pty".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"zsh -l","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output(
+            "call_pty",
+            "Chunk ID: abc123\nWall time: 0.1000 seconds\n\
+             Process running with session ID pty-1\nOriginal token count: 0\nOutput:\nstarted\n",
+            None,
+        );
+        builder.add_function_call(
+            "call_stdin".to_string(),
+            "write_stdin".to_string(),
+            r#"{"session_id":"pty-1","chars":"echo $OPENAI_API_KEY\n"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_stdin", &fixture_token, None);
+
+        let tool = builder
+            .finalized
+            .iter()
+            .find(|tc| tc.call_id == "call_pty")
+            .expect("original exec call should be present");
+        let output = tool.output.as_ref().expect("output should be present");
+        assert!(
+            !output.contains(&fixture_token),
+            "redacted PTY output must not contain the raw secret"
+        );
+        assert!(output.contains("[REDACTED_SECRET]"));
     }
 }

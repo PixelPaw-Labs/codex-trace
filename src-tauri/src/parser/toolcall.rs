@@ -1831,6 +1831,50 @@ mod tests {
         );
     }
 
+    // Codex v0.162.0 (PR openai/codex#50402, issue #328): "Consolidate command execution
+    // output into aggregated_output" removes `stdout`, `stderr`, and `formatted_output`
+    // from CommandExecutionItem/ExecCommandEndEvent entirely (not just `formatted_output`,
+    // which v0.132.0 already removed) and clears `interaction_input` on migrated items.
+    // codex-trace already reads `aggregated_output` as the primary source (see the
+    // v0.132.0 test above) and never reads `stderr` or `interaction_input` anywhere, so
+    // this upstream change has no code path to affect here. Lock in that conclusion with
+    // a payload that has none of the four removed/cleared fields present at all.
+    #[test]
+    fn exec_command_end_v0162_reads_aggregated_output_with_stdout_stderr_formatted_output_and_interaction_input_absent(
+    ) {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None, // plugin_id
+        );
+
+        // v0.162.0 exec_command_end: only aggregated_output; stdout, stderr,
+        // formatted_output, and interaction_input are all absent from the payload.
+        let payload = json!({
+            "call_id": "call_1",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 120_000_000u64}
+        });
+        assert!(payload.get("stdout").is_none());
+        assert!(payload.get("stderr").is_none());
+        assert!(payload.get("formatted_output").is_none());
+        assert!(payload.get("interaction_input").is_none());
+
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+    }
+
     // Codex v0.139.0 (PR #26994): multi-agent v2 close_agent renamed to interrupt_agent.
     // Both old transcripts (close_agent) and new (interrupt_agent) must classify as InterruptAgent.
 
@@ -3080,6 +3124,112 @@ mod tests {
         assert_eq!(tool.kind, ToolKind::ExecCommand);
         assert_eq!(tool.output_truncated, Some(true));
         assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.158.0 (PRs #47529, #47665, issue #342): a process that fails to launch now
+    // gets a normal exec_command_end instead of no end event at all. It reuses the existing
+    // failure shape (exit_code: -1, status: "failed", zero duration) with the launch diagnostic
+    // in aggregated_output, so the generic field extraction below already parses it correctly.
+
+    #[test]
+    fn v0158_exec_command_end_process_launch_failure_parses_as_failed_with_exit_code_neg1() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_launch_fail".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"/not/a/real/binary","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_launch_fail",
+            "aggregated_output": "No such file or directory (os error 2)",
+            "exit_code": -1,
+            "status": "failed",
+            "duration": {"secs": 0, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.exit_code, Some(-1));
+        assert_eq!(tool.status, "failed");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("No such file or directory (os error 2)")
+        );
+        assert_eq!(tool.duration_secs, Some(0.0));
+    }
+
+    #[test]
+    fn v0158_exec_command_end_early_output_is_captured_in_aggregated_output() {
+        // PR #47665: output produced before the streaming subscriber attached is now
+        // included in aggregated_output. No new field — the existing aggregated_output
+        // extraction already surfaces whatever text the runtime puts there.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_early_output".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo early && echo late","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_early_output",
+            "aggregated_output": "early\nlate\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 5_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("early\nlate\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.164.0 (issue #336, upstream openai/codex#54433): the TUI's compact
+    // output now uses neutral labels for nonzero exits — `Exited (status N)` instead
+    // of `Failed (exit N)` for a single command, and `nonzero exit`/`nonzero exits`
+    // instead of `failed` for exploration counts, with the red styling removed. This
+    // change lives entirely in `codex-rs/tui/src/exec_cell/{compact,render}.rs` — it
+    // only affects how the live, interactive TUI renders text to the terminal.
+    // codex-trace never reads that rendered text: it parses the on-disk rollout
+    // JSONL directly, where `exec_command_end` still carries the structured,
+    // numeric `exit_code` and the `status` string Codex core writes independently of
+    // the TUI's display choices. Verify a nonzero exit still parses to `exit_code`
+    // and `status` exactly as before, regardless of the TUI's relabeling.
+    #[test]
+    fn v0164_neutral_tui_exit_labels_do_not_affect_exec_command_status_parsing() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_neutral_exit".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cargo test","workdir":"/project"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_neutral_exit",
+            "aggregated_output": "test result: FAILED. 1 passed; 1 failed;\n",
+            "exit_code": 101,
+            "status": "failed",
+            "duration": {"secs": 2, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.exit_code, Some(101));
+        assert_eq!(tool.status, "failed");
     }
 
     // Codex v0.146.0 (issue #223): exec_command_end may carry plugin_id/script_path when

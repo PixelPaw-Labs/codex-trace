@@ -213,6 +213,11 @@ export interface CodexTurn {
   cwd: string | null;
   reasoning_effort: string | null;
   error: string | null;
+  /** Codex v0.163.0 (PR openai/codex#53451): server-provided reason when the model's response
+   * was cut off (e.g. "max_output_tokens") and terminated immediately as a non-retryable
+   * `ResponseIncomplete` error rather than a generic stream error. Null when the turn didn't
+   * hit this condition. Absent for cached data serialized before this field was added. */
+  incomplete_reason?: string | null;
   has_compaction: boolean;
   thread_name: string | null;
   collab_spawns: CollabSpawn[];

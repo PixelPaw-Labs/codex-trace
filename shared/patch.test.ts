@@ -112,4 +112,34 @@ describe("parseApplyPatch", () => {
     const files = parseApplyPatch(patch)!;
     expect(files[0].hunks[0].lines.map((l) => l.kind)).toEqual(["added"]);
   });
+
+  it("strips trailing \\r from a CRLF-preserved patch body (Codex v0.162.0+)", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: src/main.rs",
+      "@@",
+      " fn main() {",
+      '-    println!("old");',
+      '+    println!("new");',
+      " }",
+      "*** End Patch",
+    ].join("\r\n");
+
+    const files = parseApplyPatch(patch)!;
+    expect(files).toHaveLength(1);
+    const file = files[0];
+    expect(file.path).toBe("src/main.rs");
+
+    const lines = file.hunks[0].lines;
+    expect(lines.map((l) => l.kind)).toEqual(["context", "removed", "added", "context"]);
+    for (const line of lines) {
+      for (const seg of line.segments) {
+        expect(seg.text).not.toContain("\r");
+      }
+    }
+    expect(lines[0].segments.map((s) => s.text).join("")).toBe("fn main() {");
+    expect(lines[1].segments.map((s) => s.text).join("")).toBe('    println!("old");');
+    expect(lines[2].segments.map((s) => s.text).join("")).toBe('    println!("new");');
+    expect(lines[3].segments.map((s) => s.text).join("")).toBe("}");
+  });
 });

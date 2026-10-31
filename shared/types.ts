@@ -113,7 +113,9 @@ export type ToolKind =
   | "interrupt_agent"
   /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
   | "followup_task"
-  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
+  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
+   * Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+   * payloads also carry the local command's working directory in `cwd`. */
   | "shell_hook"
   /** Codex v0.140.0 (PRs #27438, #27488, #27518): built-in runtime tools for querying the
    * remaining context budget (`token_budget_context`, `context_remaining`, `context_window`). */
@@ -131,8 +133,17 @@ export type ToolKind =
    * model asks the user mid-turn without ending the turn, via `request_user_input_async`.
    * `output` holds the user's answer (selected choice or custom text); if the turn ends
    * before the user answers (v0.157.0, #47422/#47423), `output` is null and `status` is
-   * `"unanswered"`. */
+   * `"unanswered"`.
+   *
+   * Codex v0.166.0 (issue #359): PRs #57259/#57292 made the TUI render Markdown for async
+   * question choices and replies, but the change is confined to `codex-rs/tui` — the
+   * `question`/`choices`/answer text itself is unchanged, so it may already contain raw
+   * Markdown syntax. Rendered as Markdown in `ToolCallItem.tsx`. */
   | "user_input_request"
+  /** Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools,
+   * registered in the same embedded dynamic-tools namespace as `spawn_agent`/`wait_agent`
+   * (`create_worktree`, `get_worktree_creation_status`, `list_worktrees`). */
+  | "managed_worktree"
   | "unknown";
 
 export interface CodexToolCall {
@@ -169,7 +180,11 @@ export interface CodexToolCall {
   image_file_path: string | null;
   worker_session: CodexSession | null;
   status: string;
-  /** Codex v0.145.0: true when exec_command_end signals that aggregated_output was clipped by the runtime's output limit. Null for pre-v0.145.0 sessions and non-exec tool calls. */
+  /** True when `aggregated_output` is known to be partial: either Codex v0.145.0's runtime
+   * output bound (an explicit truncation field on exec_command_end), or Codex v0.162.0's
+   * 64 KiB rollout-persistence cap (PR openai/codex#50427), signaled by a truncation marker
+   * embedded directly in `aggregated_output`. Null for pre-v0.145.0 sessions, non-exec tool
+   * calls, and runs whose output never hit either limit. */
   output_truncated: boolean | null;
 }
 
@@ -209,6 +224,11 @@ export interface CodexTurn {
   cwd: string | null;
   reasoning_effort: string | null;
   error: string | null;
+  /** Codex v0.163.0 (PR openai/codex#53451): server-provided reason when the model's response
+   * was cut off (e.g. "max_output_tokens") and terminated immediately as a non-retryable
+   * `ResponseIncomplete` error rather than a generic stream error. Null when the turn didn't
+   * hit this condition. Absent for cached data serialized before this field was added. */
+  incomplete_reason?: string | null;
   has_compaction: boolean;
   thread_name: string | null;
   collab_spawns: CollabSpawn[];

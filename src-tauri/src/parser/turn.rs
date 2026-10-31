@@ -2428,6 +2428,55 @@ mod tests {
         assert!(turns[0].tool_calls.is_empty());
     }
 
+    // Codex v0.166.0 (issue #360, upstream PRs openai/codex#57363/#57365): the TUI now
+    // explains why a turn was blocked for safety reasons and offers selectable safer
+    // follow-up prompts, submitting the chosen rewrite as a new turn tagged with a
+    // `turn_trigger` of "safety_recourse_follow_up" in a fork of the chat history.
+    //
+    // codex-trace is unaffected. The safety explanation is carried by the
+    // `TurnModerationMetadata` app-server notification, which upstream's
+    // `codex-rs/rollout/src/policy.rs` classifies as a transient, non-durable event —
+    // it is explicitly excluded from the rollout JSONL that codex-trace parses, so it
+    // never appears on disk. The "safety_recourse_follow_up" turn_trigger is likewise
+    // never persisted locally: it only travels as outbound Responses-API request
+    // metadata (`codex-rs/core/src/turn_metadata.rs`), not as a rollout field. The
+    // forked follow-up turn therefore shows up in the JSONL as an entirely ordinary
+    // task_started/user_message/task_complete turn, indistinguishable from any other
+    // user-submitted turn. This test locks in that such a turn parses exactly like any
+    // other turn, confirming there is no new entry shape for the parser to support.
+    #[test]
+    fn v0166_safety_recourse_follow_up_turn_parses_as_an_ordinary_turn() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"v0166-session","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.166.0"}}"#,
+            // The original turn that hit a safety block. In the live TUI this is where
+            // TurnModerationMetadata would arrive and the explanation would render, but
+            // that notification is excluded from rollout persistence entirely, so no
+            // entry for it ever lands in the JSONL.
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Do something risky"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1761000003.0}}"#,
+            // The user picks a selectable safer rewrite, submitted as a fresh forked
+            // turn. Its turn_trigger ("safety_recourse_follow_up") only travels as
+            // outbound API metadata and never appears in this JSONL.
+            r#"{"timestamp":"2026-10-20T10:00:10Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:11Z","type":"event_msg","payload":{"type":"user_message","message":"Do something risky, but safely"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:12Z","type":"event_msg","payload":{"type":"agent_message","message":"Done safely.","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:13Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1761000013.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Do something risky"));
+        assert_eq!(turns[1].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[1].user_message.as_deref(),
+            Some("Do something risky, but safely")
+        );
+        assert_eq!(turns[1].final_answer.as_deref(), Some("Done safely."));
+    }
+
     // Codex v0.129.0 (PR #20540): apply_patch file changes moved from patch_apply_end
     // event into an apply_patch_end response_item (turn item). The PatchApply call is
     // finalized by custom_tool_call_output (exit_code, output) and the file changes are

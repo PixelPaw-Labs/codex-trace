@@ -113,7 +113,9 @@ export type ToolKind =
   | "interrupt_agent"
   /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
   | "followup_task"
-  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
+  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
+   * Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+   * payloads also carry the local command's working directory in `cwd`. */
   | "shell_hook"
   /** Codex v0.140.0 (PRs #27438, #27488, #27518): built-in runtime tools for querying the
    * remaining context budget (`token_budget_context`, `context_remaining`, `context_window`). */

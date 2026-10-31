@@ -344,6 +344,16 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .map(|s| s.to_string());
 }
 
+// Codex v0.166.0 (issue #361, upstream openai/codex#57366) added a `workspaceName`
+// field surfaced on the interactive TUI's `/status` card, showing the selected ChatGPT
+// workspace. Diffing the upstream PR confirms the field lives entirely on the
+// app-server protocol's `Account::Chatgpt` variant (`codex-rs/app-server-protocol/src/
+// protocol/v2/account.rs`, populated by `account_processor/workspace_routing.rs`) and
+// is never written to `session_meta` or any other rollout JSONL event defined in
+// `codex-rs/protocol`/`codex-rs/rollout`. codex-trace parses rollout files from disk and
+// never connects to the Codex app-server, so there is no field here for this change to
+// add, and no existing parsing for it to break.
+
 fn parse_session_meta_root(session: &mut CodexSession, raw: &Value) {
     session.id = str_field(raw, "id");
     session.timestamp = str_field(raw, "timestamp");

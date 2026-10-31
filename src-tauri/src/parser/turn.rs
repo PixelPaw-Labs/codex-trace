@@ -1836,6 +1836,31 @@ mod tests {
         assert_eq!(tokens.model_context_window, 100000);
     }
 
+    // Codex v0.166.0 (issue #361, upstream openai/codex#57282) changed
+    // `format_tokens_compact` in `codex-rs/tui/src/status/helpers.rs` so a value that
+    // rounds to 1000 in a unit is promoted to the next one (e.g. 999_600 now renders
+    // "1.0M" instead of "999.6K" in the interactive `/status` card). That function is
+    // TUI-only display code with no rollout counterpart. codex-trace never reads it: the
+    // `token_count` event's `total_token_usage.total_tokens` is a plain JSON integer
+    // written by Codex core independently of how the TUI later chooses to round and
+    // label it for display, and codex-trace does its own formatting (`formatTokens` in
+    // shared/format.ts) from that raw integer. Verify a count at the exact threshold the
+    // upstream rounding change moved is still captured verbatim.
+    #[test]
+    fn v0166_token_rounding_unit_promotion_does_not_affect_raw_token_count_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-30T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0166","timestamp":"2026-10-30T10:00:00Z","cli_version":"0.166.0"}}"#,
+            r#"{"timestamp":"2026-10-30T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":999000,"cached_input_tokens":0,"output_tokens":600,"reasoning_output_tokens":0,"total_tokens":999600},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":1000000}}}"#,
+            r#"{"timestamp":"2026-10-30T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793354403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        let tokens = turns[0].total_tokens.as_ref().expect("token count");
+        assert_eq!(tokens.total_tokens, 999600);
+    }
+
     #[test]
     fn marks_failed_spawn_agent_output_without_child_link() {
         let failure =

@@ -1810,6 +1810,50 @@ mod tests {
         );
     }
 
+    // Codex v0.162.0 (PR openai/codex#50402, issue #328): "Consolidate command execution
+    // output into aggregated_output" removes `stdout`, `stderr`, and `formatted_output`
+    // from CommandExecutionItem/ExecCommandEndEvent entirely (not just `formatted_output`,
+    // which v0.132.0 already removed) and clears `interaction_input` on migrated items.
+    // codex-trace already reads `aggregated_output` as the primary source (see the
+    // v0.132.0 test above) and never reads `stderr` or `interaction_input` anywhere, so
+    // this upstream change has no code path to affect here. Lock in that conclusion with
+    // a payload that has none of the four removed/cleared fields present at all.
+    #[test]
+    fn exec_command_end_v0162_reads_aggregated_output_with_stdout_stderr_formatted_output_and_interaction_input_absent(
+    ) {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None, // plugin_id
+        );
+
+        // v0.162.0 exec_command_end: only aggregated_output; stdout, stderr,
+        // formatted_output, and interaction_input are all absent from the payload.
+        let payload = json!({
+            "call_id": "call_1",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 120_000_000u64}
+        });
+        assert!(payload.get("stdout").is_none());
+        assert!(payload.get("stderr").is_none());
+        assert!(payload.get("formatted_output").is_none());
+        assert!(payload.get("interaction_input").is_none());
+
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+    }
+
     // Codex v0.139.0 (PR #26994): multi-agent v2 close_agent renamed to interrupt_agent.
     // Both old transcripts (close_agent) and new (interrupt_agent) must classify as InterruptAgent.
 

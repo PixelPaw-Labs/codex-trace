@@ -4964,4 +4964,54 @@ mod tests {
             "each message must carry its own position in the stream"
         );
     }
+
+    // Codex v0.166.0 (issue #356) cites five upstream PRs — #57193 (preserve failed
+    // write_stdin calls), #57194 (classify tool calls by runtime handler), #57199 (truncate
+    // summaries at UTF-8 boundaries), #57280 (preserve full MCP results), #57311 (preserve
+    // tool output versions/history order) — as changing "the rollout trace (session JSONL)".
+    //
+    // Diffing each PR's changed files against openai/codex shows all five touch only the
+    // `codex-rs/rollout-trace` crate (plus its own test files; #57280 also adds one call from
+    // `codex-rs/core/src/mcp_tool_call.rs` into `rollout_thread_trace`). That crate's own
+    // README describes it as an opt-in diagnostic path, inactive unless
+    // `CODEX_ROLLOUT_TRACE_ROOT` is set, which writes an entirely separate bundle
+    // (`manifest.json`/`trace.jsonl`/`payloads/*.json`/`state.json`) — not the
+    // `~/.codex/sessions/*.jsonl` rollout file codex-trace reads. That file is written by the
+    // unrelated `codex-rs/rollout` crate (`recorder.rs`). Diffing `codex-rs/rollout/src/lib.rs`
+    // and `codex-rs/protocol/src/protocol.rs` (where `SessionMeta`/`EventMsg` are defined)
+    // directly between rust-v0.165.0 and rust-v0.166.0 confirms neither gained any field
+    // related to these five PRs.
+    //
+    // codex-trace is unaffected. The test below guards against a future regression and also
+    // shows the parser already tolerates fields it doesn't recognize: payloads are parsed as
+    // loosely-typed `serde_json::Value`, so an unexpected future field doesn't break parsing
+    // even without a dedicated code change.
+    #[test]
+    fn v0166_rollout_trace_crate_changes_do_not_affect_session_jsonl_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-01T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0166","timestamp":"2026-11-01T10:00:00Z","cli_version":"0.166.0"}}"#,
+            r#"{"timestamp":"2026-11-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-01T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-11-01T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec","aggregated_output":"hi\n","exit_code":0,"status":"completed","unexpected_future_field":"ignored"}}"#,
+            r#"{"timestamp":"2026-11-01T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-01T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793527205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            1,
+            "exec tool call still classified correctly"
+        );
+        assert_eq!(exec_calls[0].exit_code, Some(0));
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
 }

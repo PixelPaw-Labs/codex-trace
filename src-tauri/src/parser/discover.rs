@@ -987,6 +987,15 @@ fn resolve_worktree_owner_thread_id(cwd: Option<&str>) -> Option<String> {
 /// Codex writes it twice on a subagent's `session_meta`: once at the top level, once
 /// inside `source.subagent.thread_spawn`. Older subagent kinds (guardian review, memory
 /// consolidation) only carry the top-level one, so both are read.
+///
+/// Codex v0.165.0 (PRs #56211, #56414, issue #363) defaults fresh profiles to the "memory
+/// v2" pipeline and extends external-agent memory import to populate it. Checked against
+/// the upstream `rust-v0.165.0` tag: `SubAgentSource::MemoryConsolidation` still serializes
+/// to the plain string `"memory_consolidation"` under `source.subagent` (protocol.rs is
+/// untouched by either PR), and v1/v2 selection only changes which directory backs
+/// consolidation output — never the session's own `session_meta` shape. codex-trace never
+/// reads that storage directory (`memories/` or `memories_v2/`) or the SQLite state DB
+/// directly, so the v1/v2 split needs no parser change here.
 fn parent_thread_id(payload: &Value) -> Option<String> {
     opt_str(payload, "parent_thread_id").or_else(|| {
         payload
@@ -1350,6 +1359,38 @@ mod tests {
         let guardian = sessions.iter().find(|s| s.id == "guardian").unwrap();
 
         assert_eq!(guardian.parent_session_id.as_deref(), Some("desktop"));
+    }
+
+    #[test]
+    fn discover_sessions_nests_a_v0165_memory_consolidation_subagent_with_its_real_shape() {
+        // Codex v0.165.0 (PRs #56211, #56414, issue #363): memory v2 became the default
+        // pipeline for fresh profiles and external-agent memory import now feeds it too.
+        // Verified against the upstream `rust-v0.165.0` tag that `SubAgentSource::MemoryConsolidation`
+        // is a unit variant, so it serializes as the plain JSON string "memory_consolidation"
+        // under `source.subagent` — never an object — regardless of which memory pipeline
+        // version triggered the consolidation. This exercises that exact real-world shape
+        // (prior coverage above only used the `{"other": "guardian"}` object shape).
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-09-08T15-26-47-desktop.jsonl"),
+            r#"{"timestamp":"2026-09-08T15:26:47Z","type":"session_meta","payload":{"id":"desktop","timestamp":"2026-09-08T15:26:47Z","cwd":"/tmp"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T09-23-12-consolidation.jsonl"),
+            r#"{"timestamp":"2026-09-18T09:23:12Z","type":"session_meta","payload":{"id":"consolidation","parent_thread_id":"desktop","timestamp":"2026-09-18T09:23:12Z","source":{"subagent":"memory_consolidation"}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let consolidation = sessions.iter().find(|s| s.id == "consolidation").unwrap();
+
+        assert_eq!(consolidation.parent_session_id.as_deref(), Some("desktop"));
+        assert!(consolidation.is_external_worker);
+        assert!(!consolidation.is_inline_worker);
     }
 
     #[test]

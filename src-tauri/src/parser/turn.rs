@@ -4964,4 +4964,36 @@ mod tests {
             "each message must carry its own position in the stream"
         );
     }
+
+    // Codex v0.166.0 (openai/codex#57420, issue #357): `ThreadItem.startedAtMs` and
+    // `ThreadItem.completedAtMs` were marked optional/nullable in the app-server's generated
+    // TypeScript exports, so older servers can omit them. The changed files are confined to
+    // `codex-rs/app-server-protocol/` (the TS export schema, `export.rs`, and
+    // `protocol/v2/item.rs`) — none of `codex-rs/protocol` (rollout item types) or the rollout
+    // writer were touched.
+    //
+    // codex-trace never consumes the app-server's TypeScript exports or `ThreadItem` type —
+    // it reads JSONL session files from disk and never connects to the Codex app-server (see
+    // `redact.rs`'s note on `ThreadItem::CommandExecution` for the same distinction). Every
+    // entry codex-trace actually parses carries its own top-level `timestamp` field, which
+    // this change does not touch.
+    //
+    // The test below confirms a v0.166.0 session still parses correctly, guarding against a
+    // future regression that would re-introduce a dependency on the app-server's ThreadItem
+    // timestamp fields.
+    #[test]
+    fn v0166_optional_thread_item_timestamps_in_app_server_exports_does_not_affect_session_parsing()
+    {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-27T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0166","timestamp":"2026-10-27T10:00:00Z","cli_version":"0.166.0"}}"#,
+            r#"{"timestamp":"2026-10-27T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-27T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}"#,
+            r#"{"timestamp":"2026-10-27T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793181603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+    }
 }

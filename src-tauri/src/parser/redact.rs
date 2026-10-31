@@ -8,12 +8,40 @@
 //! redaction, codex-trace would surface secrets that Codex's own UIs now hide. These regexes
 //! mirror `codex-rs/secrets/src/sanitizer.rs` so codex-trace redacts the same patterns Codex
 //! itself does.
+//!
+//! Codex v0.164.0 (#54309, #54432, #56049, issue #335) adds a different mechanism for remote
+//! Bash execution and Zsh shell snapshot sessions: a network-proxy credential broker
+//! (`codex-rs/network-proxy/src/credential_broker/`) that swaps the real credential for a
+//! shaped placeholder — `<prefix>masked<random alphanumeric tail>`, built by
+//! `providers::shaped_dummy_value` — in the command's own environment *before* the command or
+//! its output is generated at all. So the rollout JSONL for these sessions never contains the
+//! raw secret in the first place; it contains this placeholder, for built-in providers
+//! (OpenAI's `sk-`/`sk-proj-`/`sk-svcacct-`/`sk-admin-`, GitHub's `ghp_`/`gho_`/`ghu_`/`ghs_`/
+//! `ghr_`/`github_pat_`) and arbitrary org-configured custom providers alike. The per-provider
+//! regexes below can't enumerate every custom-provider prefix, so `masked_credential_marker_regex`
+//! recognizes the placeholder's shape instead of its prefix.
 use regex::Regex;
 use std::sync::OnceLock;
 
 fn openai_key_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"sk-[A-Za-z0-9]{20,}").expect("valid regex"))
+    // Project-scoped keys (`sk-proj-...`) embed hyphens in the body, unlike legacy
+    // `sk-...` keys — without `_-` in the class, codex-trace never matched them at all.
+    REGEX.get_or_init(|| Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}").expect("valid regex"))
+}
+
+fn masked_credential_marker_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    // Matches Codex's own `<prefix>masked<tail>` placeholder (see module docs): a short
+    // identifier-like prefix immediately followed by the literal "masked" and a long
+    // alphanumeric tail. `shaped_dummy_value` guarantees at least 22 random characters
+    // after the marker (reserving >128 bits of entropy), so requiring 20+ here matches
+    // every real placeholder while keeping false positives on ordinary prose effectively
+    // impossible — plain text essentially never has 20+ unbroken alphanumeric characters
+    // immediately after the word "masked".
+    REGEX.get_or_init(|| {
+        Regex::new(r"[A-Za-z][A-Za-z0-9_-]{0,24}masked[A-Za-z0-9]{20,}").expect("valid regex")
+    })
 }
 
 fn aws_access_key_id_regex() -> &'static Regex {
@@ -40,6 +68,7 @@ fn secret_assignment_regex() -> &'static Regex {
 /// and `key=value`/`key: value` secret assignments) from a single line of display text.
 pub fn redact_secrets(input: &str) -> String {
     let redacted = bearer_token_regex().replace_all(input, "Bearer [REDACTED_SECRET]");
+    let redacted = masked_credential_marker_regex().replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = openai_key_regex().replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = aws_access_key_id_regex().replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = secret_assignment_regex().replace_all(&redacted, "$1$2$3[REDACTED_SECRET]");
@@ -72,6 +101,53 @@ mod tests {
         let output = redact_secrets(&input);
         assert!(!output.contains(&token));
         assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn redacts_openai_project_scoped_key_with_hyphens() {
+        let token = fixture_token(
+            "sk-proj-",
+            "executor-only-0000000000000000000000000000000000",
+        );
+        let output = redact_secrets(&token);
+        assert!(!output.contains(&token));
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    // Codex v0.164.0 (#54309, #54432, #56049, issue #335): remote Bash/Zsh-snapshot exec
+    // sessions never carry the raw secret — the network-proxy credential broker swaps it for
+    // a shaped `<prefix>masked<tail>` placeholder before the command/output is generated.
+    // codex-trace must recognize that marker shape even for prefixes it has no dedicated
+    // regex for (GitHub tokens, arbitrary custom/configured providers), or the placeholder
+    // shows up as unflagged, malformed-looking text instead of `[REDACTED_SECRET]`.
+    #[test]
+    fn leaves_hyphenated_names_containing_sk_dash_alone() {
+        let input = "cd ~/code/task-management-dashboard-frontend && docker run disk-usage-reporter-service-v2";
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn redacts_github_style_masked_credential_placeholder() {
+        let token = fixture_token("ghp_masked", "placeholderonly000000000000000000000");
+        let input = format!("export GITHUB_TOKEN={token}");
+        let output = redact_secrets(&input);
+        assert!(!output.contains(&token));
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn redacts_custom_provider_masked_credential_placeholder() {
+        let token = fixture_token("acme-key-masked", "placeholderonly000000000000000000000");
+        let input = format!("curl -H \"X-Acme-Key: {token}\" https://api.example.com");
+        let output = redact_secrets(&input);
+        assert!(!output.contains(&token));
+        assert!(output.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn leaves_the_word_masked_alone_without_a_long_alphanumeric_tail() {
+        let input = "the api key was masked for this session";
+        assert_eq!(redact_secrets(input), input);
     }
 
     #[test]

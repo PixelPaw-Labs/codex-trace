@@ -656,6 +656,28 @@ mod tests {
         assert!(exec_end.payload.get("formatted_output").is_none());
     }
 
+    // Codex v0.162.0 (PR openai/codex#50402, issue #328): "Consolidate command execution
+    // output into aggregated_output" removes `stdout`, `stderr`, and `formatted_output`
+    // from CommandExecutionItem/ExecCommandEndEvent entirely (v0.132.0 only removed
+    // `formatted_output`) and clears `interaction_input` on migrated command completion
+    // items. The JSONL entry types themselves are unchanged; this regression guard
+    // confirms an exec_command_end payload carrying none of the four removed/cleared
+    // fields still parses through RawEntry without error, with `aggregated_output` as
+    // the sole output source.
+    #[test]
+    fn v0162_exec_command_end_parses_with_stdout_stderr_formatted_output_and_interaction_input_absent(
+    ) {
+        let line = r#"{"timestamp":"2026-10-01T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#;
+        let entry = RawEntry::parse(line).expect("parse failed");
+        assert_eq!(entry.entry_type, "event_msg");
+        assert_eq!(entry.payload["type"], "exec_command_end");
+        assert_eq!(entry.payload["aggregated_output"], "hello\n");
+        assert!(entry.payload.get("stdout").is_none());
+        assert!(entry.payload.get("stderr").is_none());
+        assert!(entry.payload.get("formatted_output").is_none());
+        assert!(entry.payload.get("interaction_input").is_none());
+    }
+
     // Codex v0.134.0 (PR #24081): `codex-tui.log` is now opt-in.
     //
     // Before v0.134.0, the TUI log file was written unconditionally at its default

@@ -713,6 +713,16 @@ fn handle_event_msg(
         // catalog is truncated or skills are omitted for budget reasons. `warning` is a
         // generic notice event (also used for e.g. model-reroute warnings), so surface
         // its message on the current turn rather than dropping it.
+        //
+        // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend
+        // (the zsh fork runtime, `codex-execve-wrapper`, `shell-escalation` crate) was
+        // deleted outright, and the retired `shell_zsh_fork`/`unified_exec_zsh_fork`
+        // config flags now surface a migration/deprecation notice plus a warning when
+        // managed requirements for those flags are ignored. codex-trace never parsed the
+        // removed zsh-fork approval/escalation event shapes and has no config schema of
+        // its own for these flags, so there is nothing version-specific to remove; the
+        // new notice/warning message lands here like any other `warning` event and is
+        // surfaced verbatim rather than being misread as an `error` event.
         "warning" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -1790,6 +1800,63 @@ mod tests {
     }
 
     #[test]
+    fn v0163_parallel_read_only_tool_calls_pair_by_call_id_despite_interleaved_results() {
+        // Codex v0.163.0 (PR #52245, issue #338) runs independent read-only tool calls
+        // (skill, memory, conversation-history lookups) in parallel rather than strictly
+        // sequentially, so their start/end events can interleave: both calls start before
+        // either finishes, and the call that finishes first is not necessarily the one that
+        // started first. call_id (a HashMap key in ToolCallBuilder) rather than stream
+        // position drives request/result pairing, so this must still attribute each result
+        // to its own call and keep the call's *start* position — not its completion
+        // position — as its display order.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-04-27T04:53:00Z","type":"session_meta","payload":{"id":"s","timestamp":"2026-04-27T04:53:00Z"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:02Z","type":"response_item","payload":{"type":"function_call","name":"list_skills","arguments":"{}","call_id":"call_skill"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:03Z","type":"response_item","payload":{"type":"function_call","name":"memory_recall","arguments":"{}","call_id":"call_memory"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_memory","output":"MEMORY_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_skill","output":"SKILL_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279986.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_call_orders.len(), turn.tool_calls.len());
+
+        let skill_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_skill")
+            .expect("call_skill present");
+        let memory_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_memory")
+            .expect("call_memory present");
+
+        // Each result must land on its own call, not the other one, even though
+        // call_memory's result arrived first in the stream.
+        assert_eq!(
+            turn.tool_calls[skill_idx].output.as_deref(),
+            Some("SKILL_RESULT")
+        );
+        assert_eq!(
+            turn.tool_calls[memory_idx].output.as_deref(),
+            Some("MEMORY_RESULT")
+        );
+
+        // Display order must follow each call's *start* position (call_skill started first),
+        // not the order their results were finalized (call_memory finished first).
+        assert!(
+            turn.tool_call_orders[skill_idx] < turn.tool_call_orders[memory_idx],
+            "call_skill started before call_memory, so it must sort first regardless of \
+             which one's result arrived first"
+        );
+    }
+
+    #[test]
     fn links_spawn_agent_from_sdk_function_call_output() {
         let entries = entries(&[
             r#"{"timestamp":"2026-04-27T04:52:00Z","type":"session_meta","payload":{"id":"parent","timestamp":"2026-04-27T04:52:00Z"}}"#,
@@ -2419,6 +2486,30 @@ mod tests {
             r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
             r#"{"timestamp":"2026-06-08T10:00:02Z","type":"event_msg","payload":{"type":"response.processed","response_id":"resp-abc","status":"complete"}}"#,
             r#"{"timestamp":"2026-06-08T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // Codex v0.163.0 (PRs #52160, #52213): the entire zsh-fork approval/escalation flow
+    // (previously in `core/src/guardian/approval_request.rs`, `core/src/tools/approvals.rs`)
+    // was deleted along with the patched-zsh shell backend. codex-trace never parsed those
+    // event shapes in the first place — it has no approval/escalation-specific handling at
+    // all, relying on the generic wildcard arm in handle_event_msg. This test guards against
+    // regressions that would require codex-trace to understand the now-deleted event shapes,
+    // and confirms old session files recorded before the removal still parse unaffected.
+    #[test]
+    fn v0163_removed_zsh_fork_approval_events_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0163","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_request","call_id":"call_zsh","command":"sudo apt-get update"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_response","call_id":"call_zsh","decision":"approved"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -5018,5 +5109,61 @@ mod tests {
             turns[0].agent_messages[0].order < turns[0].agent_messages[1].order,
             "each message must carry its own position in the stream"
         );
+    }
+
+    // Codex v0.164.0 (PRs #54930, #54949): negotiated zstd compression was added to
+    // app-server WebSocket connections, gated behind a feature flag that defaults to off.
+    // When the flag is enabled, raw WebSocket frames between the CLI and app-server can be
+    // zstd-compressed after negotiation instead of plain JSON.
+    //
+    // codex-trace reads session data exclusively from JSONL files at ~/.codex/sessions/ —
+    // it never connects to the Codex app-server WebSocket and never reads a raw WebSocket
+    // frame. The app-server decompresses negotiated frames (when the flag is on) before
+    // surfacing events through its standard APIs, and those events continue to be logged to
+    // disk as plain JSON in the same JSONL format as every prior version, regardless of
+    // whether the flag is enabled. The compression negotiation happens entirely on a wire
+    // codex-trace never touches.
+    //
+    // The test below confirms a v0.164.0 session still parses correctly, guarding against a
+    // future regression that would re-introduce a dependency on that WebSocket wire format.
+    #[test]
+    fn v0164_zstd_websocket_compression_negotiation_does_not_affect_session_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0164","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.164.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792000803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+    }
+
+    // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend and
+    // its `shell_zsh_fork`/`unified_exec_zsh_fork` config flags were retired in favor of a
+    // migration/deprecation notice. codex-trace has no config schema referencing those
+    // flags and never parsed the removed zsh-fork approval/escalation event shapes, so the
+    // notice simply arrives as a generic `warning` event like any other and must be
+    // captured as a warning, not misread as a turn-ending `error`.
+    #[test]
+    fn v0163_zsh_fork_deprecation_notice_captured_as_warning_not_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"v0163-zsh-fork","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"shell_zsh_fork and unified_exec_zsh_fork are deprecated and ignored; the patched-zsh shell backend was removed in v0.163.0."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].error.is_none());
+        assert_eq!(turns[0].warnings.len(), 1);
+        assert!(turns[0].warnings[0].contains("shell_zsh_fork"));
+        assert!(turns[0].warnings[0].contains("unified_exec_zsh_fork"));
     }
 }

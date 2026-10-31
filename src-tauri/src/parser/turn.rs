@@ -4026,6 +4026,46 @@ mod tests {
         assert_eq!(tc.status, "failed");
     }
 
+    // Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+    // payloads gain a `cwd` field carrying the local command's working directory.
+
+    #[test]
+    fn v0166_shell_hook_output_with_cwd_populates_tool_call_cwd() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-20T10:00:00Z","type":"session_meta","payload":{"id":"v0166-hook-cwd","timestamp":"2026-09-20T10:00:00Z","cli_version":"0.166.0"}}"#,
+            r#"{"timestamp":"2026-09-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-20T10:00:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-cwd-1","hook_type":"pre_exec","stdout":"hook ran\n","exit_code":0,"cwd":"/repo/subdir"}}"#,
+            r#"{"timestamp":"2026-09-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "pre_exec");
+        assert_eq!(tc.cwd.as_deref(), Some("/repo/subdir"));
+    }
+
+    #[test]
+    fn v0166_permission_hook_with_cwd_populates_tool_call_cwd() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-20T10:01:00Z","type":"session_meta","payload":{"id":"v0166-hook-permission","timestamp":"2026-09-20T10:01:00Z","cli_version":"0.166.0"}}"#,
+            r#"{"timestamp":"2026-09-20T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-20T10:01:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-perm-1","hook_type":"permission","stdout":"","exit_code":0,"cwd":"/repo"}}"#,
+            r#"{"timestamp":"2026-09-20T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779463.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.name, "permission");
+        assert_eq!(tc.cwd.as_deref(), Some("/repo"));
+    }
+
     #[test]
     fn v0136_shell_hook_output_absent_nullable_fields_does_not_panic() {
         // v0.136.0 tightening: metadata and stderr are absent (not null). Verify the parser

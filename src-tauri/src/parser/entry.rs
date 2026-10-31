@@ -1076,6 +1076,29 @@ mod tests {
         assert_eq!(e.payload["hook_type"], "interrupt");
     }
 
+    // Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+    // payloads gain a `cwd` field carrying the local command's working directory. This is
+    // an additive field on the same `shell_hook_output` event — RawEntry must parse it
+    // without error, and older sessions without `cwd` must keep parsing as before.
+
+    #[test]
+    fn v0166_shell_hook_output_with_cwd_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-09-20T10:00:00Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-cwd-1","hook_type":"pre_exec","stdout":"hook ok\n","exit_code":0,"cwd":"/repo/subdir"}}"#;
+        let e = RawEntry::parse(line).expect("shell_hook_output with cwd must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("shell_hook_output"));
+        assert_eq!(e.payload["cwd"], "/repo/subdir");
+    }
+
+    #[test]
+    fn v0166_shell_hook_output_without_cwd_still_parses() {
+        // Pre-v0.166.0 sessions never carried a `cwd` field on hook payloads.
+        let line = r#"{"timestamp":"2026-09-20T10:00:01Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-no-cwd","hook_type":"post_exec","stdout":"done\n","exit_code":0}}"#;
+        let e = RawEntry::parse(line).expect("shell_hook_output without cwd must still parse");
+        assert_eq!(event_msg_type(&e.payload), Some("shell_hook_output"));
+        assert!(e.payload.get("cwd").is_none());
+    }
+
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
     // JSON output items. A "structured_output" response_item carries a JSON-validated
     // content object as its payload. RawEntry must parse these without panicking.

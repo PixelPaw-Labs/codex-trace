@@ -1185,6 +1185,10 @@ impl ToolCallBuilder {
     /// The v0.136.0 tightened schema requires: call_id, hook_type, stdout, exit_code.
     /// Fields that were previously null (metadata, stderr) are now absent — read only
     /// the stable fields so older null-padded payloads also parse correctly.
+    ///
+    /// Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+    /// payloads gain a `cwd` field carrying the local command's working directory.
+    /// Absent for pre-v0.166.0 sessions and hook types with no associated command.
     pub fn finalize_shell_hook(&mut self, payload: &Value) {
         let call_id = str_field(payload, "call_id");
         let hook_type = str_field(payload, "hook_type");
@@ -1197,6 +1201,10 @@ impl ToolCallBuilder {
             .get("exit_code")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32);
+        let cwd = payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let duration_secs = parse_duration(payload);
         let status = if exit_code.map(|c| c != 0).unwrap_or(false) {
             "failed"
@@ -1215,7 +1223,7 @@ impl ToolCallBuilder {
             output: stdout,
             exit_code,
             command: None,
-            cwd: None,
+            cwd,
             duration_secs,
             mcp_server: None,
             mcp_tool: None,
@@ -2412,6 +2420,62 @@ mod tests {
         let tc = &builder.finalized[0];
         assert_eq!(tc.kind, ToolKind::ShellHook);
         assert_eq!(tc.name, "some_future_hook_name");
+    }
+
+    // Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+    // payloads gain a `cwd` field carrying the local command's working directory.
+
+    #[test]
+    fn shell_hook_output_v0166_pre_exec_with_cwd_populates_tool_call() {
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-cwd-1",
+            "hook_type": "pre_exec",
+            "stdout": "hook ran ok\n",
+            "exit_code": 0,
+            "cwd": "/repo/subdir"
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.cwd.as_deref(), Some("/repo/subdir"));
+    }
+
+    #[test]
+    fn shell_hook_output_v0166_permission_hook_with_cwd_populates_tool_call() {
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-cwd-2",
+            "hook_type": "permission",
+            "stdout": "",
+            "exit_code": 0,
+            "cwd": "/repo"
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.name, "permission");
+        assert_eq!(tc.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn shell_hook_output_pre_v0166_without_cwd_leaves_cwd_none() {
+        // Older sessions (pre-v0.166.0) never carried a `cwd` field on hook payloads —
+        // must keep parsing without error and leave `cwd` as None.
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-no-cwd",
+            "hook_type": "post_exec",
+            "stdout": "done\n",
+            "exit_code": 0
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert!(builder.finalized[0].cwd.is_none());
     }
 
     // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.

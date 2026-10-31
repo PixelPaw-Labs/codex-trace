@@ -904,6 +904,32 @@ describe("ToolCallItem", () => {
     });
   });
 
+  // Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+  // payloads gain a `cwd` field carrying the local command's working directory.
+  describe("hook event cwd (issue #358)", () => {
+    it("renders the local command cwd for a PreToolUse-style hook event", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "pre_exec", cwd: "/repo/subdir" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("cwd: /repo/subdir")).toBeInTheDocument();
+    });
+
+    it("renders nothing extra when a hook event has no cwd (pre-v0.166.0 sessions)", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "post_exec", cwd: null })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(container.querySelector(".tool-call__cwd")).not.toBeInTheDocument();
+    });
+  });
+
   it("renders input for Desktop custom tools classified as unknown", () => {
     const { container } = render(
       <ToolCallItem

@@ -42,6 +42,16 @@ pub enum ToolKind {
     /// tool. Carries the question/choices in `arguments` and the user's answer (selected
     /// choice or custom text) in `output`. If the turn ends before the user answers
     /// (v0.157.0, #47422/#47423), `output` is None and `status` is `"unanswered"`.
+    ///
+    /// Note on Codex v0.166.0 Markdown rendering (issue #359): PRs #57259/#57292 make the
+    /// TUI render Markdown in async question choices and replies, but every changed file in
+    /// both diffs is under `codex-rs/tui` (`bottom_pane/async_questions/*`,
+    /// `history_cell/async_questions.rs`, `async_replies.rs`, `markdown.rs`). The
+    /// `question`/`answer` fields stay plain `String` — only visibility changed — and no
+    /// `codex-rs/protocol` or rollout field changed, so this builder needs no changes:
+    /// `arguments`/`output` already pass the raw text (which could already contain Markdown
+    /// syntax) through unmodified. codex-trace's frontend renders it as Markdown instead of
+    /// literal text (see `ToolCallItem.tsx`).
     UserInputRequest,
     Unknown,
 }

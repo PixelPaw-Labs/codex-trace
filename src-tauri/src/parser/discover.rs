@@ -124,6 +124,20 @@ pub struct CodexSessionInfo {
 /// introduced (see the `history_base_thread_id` field above, issue #210). Neither PR
 /// touches `codex-rs/rollout` or adds any rollout field — confirmed by diffing both PRs'
 /// changed files — so this scanner needs no changes for it.
+///
+/// Note on Codex v0.160.0 projectless TUI sessions (issue #341): PR #49160 lets a session
+/// start in a directory that isn't a recognized Codex "project" (no saved trust decision,
+/// no `project_root_markers` match), applying workspace-write defaults instead of prompting.
+/// Confirmed against the upstream PR's changed-file list that this is purely a
+/// `codex-rs/tui`/config-layer concern — it touches no file under `codex-rs/rollout` or
+/// `codex-rs/protocol`, so a projectless session's `session_meta` line has the exact same
+/// shape as any other: `cwd` (required, never null) is still the real directory Codex was
+/// started in. This scanner never keyed discovery or `date_group` off a project directory
+/// in the first place — it walks `sessions_dir` by date, and `cwd` is read as `Option<String>`
+/// purely for display, search matching, and `resolve_worktree_owner_thread_id` below, which
+/// already treats a non-worktree `cwd` (including one with no `.git` at all) as "not a
+/// worktree" rather than an error. No code changes needed; see
+/// `discover_sessions_groups_a_projectless_session_like_any_other` for the regression check.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -815,6 +829,19 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                     }
+                    "error" => {
+                        // `EventMsg::Error` always ends the turn (unlike `Warning`, which
+                        // doesn't) — including Codex v0.163.0's non-retryable
+                        // `ResponseIncomplete` terminal error (PR openai/codex#53451),
+                        // which has no dedicated wire event and surfaces as this generic
+                        // `error`. Treat it as turn-terminating so the session doesn't
+                        // linger as "ongoing" in the session list.
+                        is_ongoing = false;
+                        end_time = v
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
                     "token_count" => {
                         if let Some(info) = v
                             .get("payload")
@@ -987,6 +1014,15 @@ fn resolve_worktree_owner_thread_id(cwd: Option<&str>) -> Option<String> {
 /// Codex writes it twice on a subagent's `session_meta`: once at the top level, once
 /// inside `source.subagent.thread_spawn`. Older subagent kinds (guardian review, memory
 /// consolidation) only carry the top-level one, so both are read.
+///
+/// Codex v0.165.0 (PRs #56211, #56414, issue #363) defaults fresh profiles to the "memory
+/// v2" pipeline and extends external-agent memory import to populate it. Checked against
+/// the upstream `rust-v0.165.0` tag: `SubAgentSource::MemoryConsolidation` still serializes
+/// to the plain string `"memory_consolidation"` under `source.subagent` (protocol.rs is
+/// untouched by either PR), and v1/v2 selection only changes which directory backs
+/// consolidation output — never the session's own `session_meta` shape. codex-trace never
+/// reads that storage directory (`memories/` or `memories_v2/`) or the SQLite state DB
+/// directly, so the v1/v2 split needs no parser change here.
 fn parent_thread_id(payload: &Value) -> Option<String> {
     opt_str(payload, "parent_thread_id").or_else(|| {
         payload
@@ -1353,6 +1389,38 @@ mod tests {
     }
 
     #[test]
+    fn discover_sessions_nests_a_v0165_memory_consolidation_subagent_with_its_real_shape() {
+        // Codex v0.165.0 (PRs #56211, #56414, issue #363): memory v2 became the default
+        // pipeline for fresh profiles and external-agent memory import now feeds it too.
+        // Verified against the upstream `rust-v0.165.0` tag that `SubAgentSource::MemoryConsolidation`
+        // is a unit variant, so it serializes as the plain JSON string "memory_consolidation"
+        // under `source.subagent` — never an object — regardless of which memory pipeline
+        // version triggered the consolidation. This exercises that exact real-world shape
+        // (prior coverage above only used the `{"other": "guardian"}` object shape).
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/09/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-09-08T15-26-47-desktop.jsonl"),
+            r#"{"timestamp":"2026-09-08T15:26:47Z","type":"session_meta","payload":{"id":"desktop","timestamp":"2026-09-08T15:26:47Z","cwd":"/tmp"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            day_dir.join("rollout-2026-09-18T09-23-12-consolidation.jsonl"),
+            r#"{"timestamp":"2026-09-18T09:23:12Z","type":"session_meta","payload":{"id":"consolidation","parent_thread_id":"desktop","timestamp":"2026-09-18T09:23:12Z","source":{"subagent":"memory_consolidation"}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let consolidation = sessions.iter().find(|s| s.id == "consolidation").unwrap();
+
+        assert_eq!(consolidation.parent_session_id.as_deref(), Some("desktop"));
+        assert!(consolidation.is_external_worker);
+        assert!(!consolidation.is_inline_worker);
+    }
+
+    #[test]
     fn a_session_cached_before_lineage_scanning_is_nested_without_re_reading_it() {
         // Upgrading must not force a re-read of every session file — that is minutes of
         // pegged CPU on a real sessions directory. The parent is on line one, so a cached
@@ -1503,6 +1571,46 @@ mod tests {
             Some("owner-thread"),
             "a worktree session should nest under the thread that owns its checkout"
         );
+    }
+
+    #[test]
+    fn discover_sessions_groups_a_projectless_session_like_any_other() {
+        // Codex v0.160.0 (issue #341): a "projectless" TUI session runs in a directory that
+        // isn't a recognized Codex project (no saved trust decision, no root-marker match)
+        // and has no Git repo at all — just an ordinary scratch folder. Its `session_meta`
+        // line is shaped exactly like any other session's, since the upstream PR touches no
+        // rollout/protocol file. It should be discovered and date_group'd the same as a
+        // session anchored to a real project, with no worktree owner inferred from the lack
+        // of a `.git`.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/10/25");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let scratch_dir = tmp.path().join("scratch-no-project");
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+
+        std::fs::write(
+            day_dir.join("rollout-2026-10-25T09-00-00-projectless.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-10-25T09:00:00Z","type":"session_meta","payload":{{"id":"projectless-session","timestamp":"2026-10-25T09:00:00Z","cwd":"{}"}}}}"#,
+                scratch_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "projectless-session")
+            .unwrap();
+
+        assert_eq!(session.date_group, "2026/10/25");
+        assert_eq!(
+            session.cwd.as_deref(),
+            Some(scratch_dir.to_string_lossy()).as_deref()
+        );
+        assert_eq!(session.worktree_owner_thread_id, None);
+        assert_eq!(session.parent_session_id, None);
     }
 
     #[test]
@@ -2452,6 +2560,47 @@ mod tests {
         );
     }
 
+    // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses now terminate the
+    // turn immediately as a non-retryable `ResponseIncomplete` error instead of a generic,
+    // retryable stream error. There is no dedicated wire event for this — it is delivered
+    // as the existing generic `error` event_msg, which discover_sessions previously fell
+    // through to its catch-all arm without ending the scan's `is_ongoing` state.
+
+    #[test]
+    fn v0163_response_incomplete_error_marks_session_not_ongoing() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/10/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-10-01T10-00-00-v0163-incomplete.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-disc","timestamp":"2026-10-01T10:00:00Z","cwd":"/project","cli_version":"0.163.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-10-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+                r#"{"timestamp":"2026-10-01T10:00:03Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0163-incomplete-disc")
+            .expect("session terminated by a response-incomplete error must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.163.0"));
+        assert!(
+            !session.is_ongoing,
+            "a terminal error event must mark session as not ongoing"
+        );
+        assert_eq!(
+            session.end_time.as_deref(),
+            Some("2026-10-01T10:00:03Z"),
+            "end_time must be set from the error event's timestamp"
+        );
+    }
+
     // Codex v0.146.0 (PRs #34621, #35220, issue #210): paginated threads that fork or
     // inherit history from another rollout carry session_meta.history_base.thread_id,
     // pointing at the source rollout this one continues from. discover_sessions must
@@ -2789,6 +2938,50 @@ mod tests {
             .iter()
             .find(|s| s.id == "v0149-target")
             .expect("queued-into session must still be discovered by its own id");
+        assert_eq!(session.turn_count, 2);
+        assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.166.0 (PRs #57232, #57273, issue #362): `codex queue` gained a
+    // `--resume` flag that resumes an unloaded thread immediately after queueing a
+    // message into it, and now rejects unsupported options instead of silently
+    // accepting them. codex-trace never invokes `codex queue` itself (no script,
+    // fixture, or doc in this repo shells out to it), and the stricter option
+    // validation is a CLI argument-parsing change with no on-disk effect. The only
+    // thing codex-trace could be affected by is the shape of the rollout file a
+    // resumed-after-queue thread produces, which is indistinguishable from the
+    // queue-then-dispatch case already covered by
+    // `v0149_queued_message_appended_to_existing_session_is_attributed_correctly`:
+    // the resumed thread simply appends another turn to its existing session file.
+    // Verify that still holds.
+    #[test]
+    fn v0166_queue_resume_appends_turn_to_existing_session_like_any_resume() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let path = day_dir.join("rollout-2026-08-20T12-00-00-v0166-target.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T12:00:00Z","type":"session_meta","payload":{"id":"v0166-target","timestamp":"2026-08-20T12:00:00Z","cwd":"/project","cli_version":"0.166.0"}}"#,
+                r#"{"timestamp":"2026-08-20T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755691202.0}}"#,
+                // `codex queue --resume` queues a message into the idle thread above and
+                // immediately resumes it, which appends a new turn just like any other resume.
+                r#"{"timestamp":"2026-08-20T12:10:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                r#"{"timestamp":"2026-08-20T12:10:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1755691801.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0166-target")
+            .expect("queue --resume session must still be discovered by its own id");
         assert_eq!(session.turn_count, 2);
         assert!(!session.is_ongoing);
     }

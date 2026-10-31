@@ -302,6 +302,48 @@ describe("ToolCallItem", () => {
     expect(notice).toBeInTheDocument();
   });
 
+  it("renders create_worktree as a managed_worktree tool call (issue #340)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "managed_worktree",
+          name: "create_worktree",
+          arguments: { ref: "feature/foo", allowAsync: true },
+          command: null,
+          exit_code: null,
+          output: '{"operationId":"op_1"}',
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const body = container.querySelector(".tool-call__body");
+    expect(body).toBeInTheDocument();
+    expect(body!.textContent).toContain("feature/foo");
+    expect(body!.textContent).toContain("op_1");
+  });
+
+  it("renders list_worktrees as a managed_worktree tool call with no summary for empty args (issue #340)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "managed_worktree",
+          name: "list_worktrees",
+          arguments: {},
+          command: null,
+          exit_code: null,
+          output: '{"worktrees":[]}',
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const summary = container.querySelector(".tool-call__summary");
+    expect(summary).not.toBeInTheDocument();
+    const body = container.querySelector(".tool-call__body");
+    expect(body!.textContent).toContain("worktrees");
+  });
+
   it("renders web query when kind is web_search", () => {
     const { container } = render(
       <ToolCallItem
@@ -664,8 +706,9 @@ describe("ToolCallItem", () => {
     });
   });
 
-  // Codex v0.145.0: bounded exec output — truncation notice in expanded view.
-  describe("output truncation notice (v0.145.0+)", () => {
+  // Codex v0.145.0 (runtime bound) and v0.162.0 (64 KiB rollout-persistence cap, PR
+  // openai/codex#50427) both surface through the same output_truncated flag.
+  describe("output truncation notice (v0.145.0+, v0.162.0+)", () => {
     it("shows truncation notice when output_truncated is true", () => {
       render(
         <ToolCallItem
@@ -674,7 +717,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(screen.getByText(/Output was truncated by the Codex runtime/)).toBeInTheDocument();
+      expect(screen.getByText(/Output was truncated by Codex/)).toBeInTheDocument();
     });
 
     it("does not show truncation notice when output_truncated is null", () => {
@@ -685,9 +728,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(
-        screen.queryByText(/Output was truncated by the Codex runtime/),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/Output was truncated by Codex/)).not.toBeInTheDocument();
     });
 
     it("does not show truncation notice when output_truncated is false", () => {
@@ -698,9 +739,7 @@ describe("ToolCallItem", () => {
           onToggle={vi.fn()}
         />,
       );
-      expect(
-        screen.queryByText(/Output was truncated by the Codex runtime/),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/Output was truncated by Codex/)).not.toBeInTheDocument();
     });
   });
 
@@ -780,6 +819,60 @@ describe("ToolCallItem", () => {
     });
   });
 
+  // Codex v0.158.0 (PRs #47529, #47665): command completion events now report process-launch
+  // failures through the exec tool's existing failure shape — exit_code: -1, status: "failed" —
+  // rather than dropping the lifecycle event entirely. -1 is never a real process exit status, so
+  // surface it as a distinct notice instead of letting it read as an ordinary nonzero exit.
+  describe("launch failure notice (v0.158.0+)", () => {
+    it("shows the launch-failed notice for an exec command with exit_code -1", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({
+            exit_code: -1,
+            status: "failed",
+            output: "No such file or directory (os error 2)",
+          })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/No real exit code/)).toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for an ordinary nonzero exit", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 1, status: "failed", output: "command not found: fooo" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for a successful command", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ exit_code: 0, status: "completed" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+
+    it("does not show the launch-failed notice for a non-exec tool kind", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ kind: "mcp_tool", exit_code: -1, status: "failed" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/No real exit code/)).not.toBeInTheDocument();
+    });
+  });
+
   // Codex v0.150.0 (PR #40511): new `Interrupt` HookEventName variant, plus the general
   // requirement (issue #251) that hook events codex-trace has never seen before still
   // render through the generic shell_hook path instead of being dropped or shown as raw JSON.
@@ -808,6 +901,32 @@ describe("ToolCallItem", () => {
       expect(screen.getByText("some_future_hook_name")).toBeInTheDocument();
       expect(container.querySelector(".tool-call--hook")).toBeInTheDocument();
       expect(container.querySelector(".tool-call--unknown")).not.toBeInTheDocument();
+    });
+  });
+
+  // Codex v0.166.0 (PRs #57198, #57203): PreToolUse, permission, and post-tool hook
+  // payloads gain a `cwd` field carrying the local command's working directory.
+  describe("hook event cwd (issue #358)", () => {
+    it("renders the local command cwd for a PreToolUse-style hook event", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "pre_exec", cwd: "/repo/subdir" })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("cwd: /repo/subdir")).toBeInTheDocument();
+    });
+
+    it("renders nothing extra when a hook event has no cwd (pre-v0.166.0 sessions)", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({ kind: "shell_hook", name: "post_exec", cwd: null })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(container.querySelector(".tool-call__cwd")).not.toBeInTheDocument();
     });
   });
 

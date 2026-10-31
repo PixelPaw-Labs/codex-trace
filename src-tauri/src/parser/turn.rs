@@ -1790,6 +1790,63 @@ mod tests {
     }
 
     #[test]
+    fn v0163_parallel_read_only_tool_calls_pair_by_call_id_despite_interleaved_results() {
+        // Codex v0.163.0 (PR #52245, issue #338) runs independent read-only tool calls
+        // (skill, memory, conversation-history lookups) in parallel rather than strictly
+        // sequentially, so their start/end events can interleave: both calls start before
+        // either finishes, and the call that finishes first is not necessarily the one that
+        // started first. call_id (a HashMap key in ToolCallBuilder) rather than stream
+        // position drives request/result pairing, so this must still attribute each result
+        // to its own call and keep the call's *start* position — not its completion
+        // position — as its display order.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-04-27T04:53:00Z","type":"session_meta","payload":{"id":"s","timestamp":"2026-04-27T04:53:00Z"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:02Z","type":"response_item","payload":{"type":"function_call","name":"list_skills","arguments":"{}","call_id":"call_skill"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:03Z","type":"response_item","payload":{"type":"function_call","name":"memory_recall","arguments":"{}","call_id":"call_memory"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_memory","output":"MEMORY_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_skill","output":"SKILL_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279986.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_call_orders.len(), turn.tool_calls.len());
+
+        let skill_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_skill")
+            .expect("call_skill present");
+        let memory_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_memory")
+            .expect("call_memory present");
+
+        // Each result must land on its own call, not the other one, even though
+        // call_memory's result arrived first in the stream.
+        assert_eq!(
+            turn.tool_calls[skill_idx].output.as_deref(),
+            Some("SKILL_RESULT")
+        );
+        assert_eq!(
+            turn.tool_calls[memory_idx].output.as_deref(),
+            Some("MEMORY_RESULT")
+        );
+
+        // Display order must follow each call's *start* position (call_skill started first),
+        // not the order their results were finalized (call_memory finished first).
+        assert!(
+            turn.tool_call_orders[skill_idx] < turn.tool_call_orders[memory_idx],
+            "call_skill started before call_memory, so it must sort first regardless of \
+             which one's result arrived first"
+        );
+    }
+
+    #[test]
     fn links_spawn_agent_from_sdk_function_call_output() {
         let entries = entries(&[
             r#"{"timestamp":"2026-04-27T04:52:00Z","type":"session_meta","payload":{"id":"parent","timestamp":"2026-04-27T04:52:00Z"}}"#,

@@ -27,7 +27,7 @@ fn openai_key_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     // Project-scoped keys (`sk-proj-...`) embed hyphens in the body, unlike legacy
     // `sk-...` keys — without `_-` in the class, codex-trace never matched them at all.
-    REGEX.get_or_init(|| Regex::new(r"sk-[A-Za-z0-9_-]{20,}").expect("valid regex"))
+    REGEX.get_or_init(|| Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}").expect("valid regex"))
 }
 
 fn masked_credential_marker_regex() -> &'static Regex {
@@ -120,6 +120,12 @@ mod tests {
     // codex-trace must recognize that marker shape even for prefixes it has no dedicated
     // regex for (GitHub tokens, arbitrary custom/configured providers), or the placeholder
     // shows up as unflagged, malformed-looking text instead of `[REDACTED_SECRET]`.
+    #[test]
+    fn leaves_hyphenated_names_containing_sk_dash_alone() {
+        let input = "cd ~/code/task-management-dashboard-frontend && docker run disk-usage-reporter-service-v2";
+        assert_eq!(redact_secrets(input), input);
+    }
+
     #[test]
     fn redacts_github_style_masked_credential_placeholder() {
         let token = fixture_token("ghp_masked", "placeholderonly000000000000000000000");

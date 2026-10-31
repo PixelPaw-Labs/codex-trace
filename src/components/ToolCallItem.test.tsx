@@ -282,6 +282,53 @@ describe("ToolCallItem", () => {
     expect(body!.textContent).toContain("main");
   });
 
+  it("renders a user_input_request whose arguments could not be parsed", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "user_input_request",
+          name: "request_user_input_async",
+          arguments: null as unknown as Record<string, unknown>,
+          command: null,
+          exit_code: null,
+          output: "Yes",
+          status: "completed",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".tool-call__body")!.textContent).toContain("Yes");
+  });
+
+  it("renders Markdown in the question, choices, and answer of a user_input_request (issue #359)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "user_input_request",
+          name: "request_user_input_async",
+          arguments: {
+            question: "Keep `--verbose` for **failed** runs?",
+            choices: ["Yes, **always**", "No"],
+          },
+          command: null,
+          exit_code: null,
+          output: "Answer from **desktop**",
+          status: "completed",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const body = container.querySelector(".tool-call__body")!;
+    expect(body.querySelectorAll("code").length).toBeGreaterThan(0);
+    const bolded = Array.from(body.querySelectorAll("strong")).map((el) => el.textContent);
+    expect(bolded).toContain("failed");
+    expect(bolded).toContain("always");
+    expect(bolded).toContain("desktop");
+    expect(body.textContent).not.toContain("**");
+  });
+
   it("shows an unanswered notice when a request_user_input_async question got no answer (issue #304)", () => {
     const { container } = render(
       <ToolCallItem

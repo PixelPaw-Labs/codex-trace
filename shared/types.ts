@@ -133,7 +133,12 @@ export type ToolKind =
    * model asks the user mid-turn without ending the turn, via `request_user_input_async`.
    * `output` holds the user's answer (selected choice or custom text); if the turn ends
    * before the user answers (v0.157.0, #47422/#47423), `output` is null and `status` is
-   * `"unanswered"`. */
+   * `"unanswered"`.
+   *
+   * Codex v0.166.0 (issue #359): PRs #57259/#57292 made the TUI render Markdown for async
+   * question choices and replies, but the change is confined to `codex-rs/tui` — the
+   * `question`/`choices`/answer text itself is unchanged, so it may already contain raw
+   * Markdown syntax. Rendered as Markdown in `ToolCallItem.tsx`. */
   | "user_input_request"
   /** Codex v0.162.0 (PR #50148, issue #340): managed Git worktree create/list tools,
    * registered in the same embedded dynamic-tools namespace as `spawn_agent`/`wait_agent`

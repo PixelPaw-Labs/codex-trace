@@ -86,9 +86,13 @@ pub struct ToolCall {
     /// Codex v0.134.0 (PR #22882): subagent human-readable name from hook input identity fields.
     /// Null for parent-agent tool calls and sessions from pre-v0.134.0.
     pub subagent_name: Option<String>,
-    /// Codex v0.145.0: exec_command_end may include a truncation indicator when the runtime
-    /// bounded command output to fix an unbounded-exec bug. True means `aggregated_output`
-    /// is partial; None means no truncation field was present (pre-v0.145.0 or unaffected run).
+    /// True when `aggregated_output` is known to be partial rather than the complete command
+    /// output. Set by either of two independent Codex mechanisms: Codex v0.145.0's runtime
+    /// output bound, signaled via an explicit `truncated`/`output_truncated`/`bytes_truncated`
+    /// field on `exec_command_end`; or Codex v0.162.0's 64 KiB rollout-persistence cap (PR
+    /// openai/codex#50427), signaled by an embedded truncation marker inside `aggregated_output`
+    /// itself with no separate indicator field. None means neither signal was present
+    /// (pre-v0.145.0 sessions, or a run whose output never hit either limit).
     #[serde(default)]
     pub output_truncated: Option<bool>,
 }
@@ -711,9 +715,10 @@ impl ToolCallBuilder {
                 .map(|s| s.to_string())
         });
         let status = str_field(payload, "status");
-        // Codex v0.145.0: may include a truncation indicator when the runtime bounded
-        // command output to fix an unbounded-exec bug (bytes_truncated, truncated, or
-        // output_truncated). Parse it so the UI can warn users that output is partial.
+        // Codex v0.145.0 may include a truncation indicator when the runtime bounded command
+        // output (bytes_truncated, truncated, or output_truncated); Codex v0.162.0 instead
+        // embeds a truncation marker directly in aggregated_output when the rollout-persistence
+        // cap clipped it. Parse both so the UI can warn users that output is partial.
         let output_truncated = parse_output_truncated(payload);
 
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
@@ -1709,18 +1714,29 @@ fn extract_mcp_result(payload: &Value) -> (Option<String>, bool) {
     (output, is_error)
 }
 
+/// Marker Codex v0.162.0 (PR openai/codex#50427, `truncate_middle_with_marker`) splices into
+/// the middle of `aggregated_output` when the rollout-persistence policy caps it at 64 KiB.
+/// Unlike the v0.145.0 indicator fields below, this mechanism carries no separate boolean or
+/// count field — the only signal is this literal text embedded in the output itself.
+const PERSISTED_OUTPUT_TRUNCATION_MARKER: &str = "command output truncated for persistence";
+
 /// Detect whether an exec_command_end payload signals truncated output.
 ///
-/// Codex v0.145.0 introduced bounded exec output to fix an unbounded-exec bug.
-/// When the runtime clips command output it may set one of three fields:
-/// - `truncated` (bool true) — primary indicator added in v0.145.0
-/// - `output_truncated` (bool true) — alternative spelling used in some builds
-/// - `bytes_truncated` (number > 0) — byte count of dropped output
+/// Two independent Codex mechanisms can clip `aggregated_output`:
+/// - Codex v0.145.0 bounded exec output at the runtime level to fix an unbounded-exec bug,
+///   and signals it via one of three fields:
+///   - `truncated` (bool true) — primary indicator added in v0.145.0
+///   - `output_truncated` (bool true) — alternative spelling used in some builds
+///   - `bytes_truncated` (number > 0) — byte count of dropped output
+/// - Codex v0.162.0 caps the *persisted* `aggregated_output` at 64 KiB (rollout recording,
+///   thread-store appends, and legacy-to-paginated migration) and signals it by splicing
+///   [`PERSISTED_OUTPUT_TRUNCATION_MARKER`] into the output text itself, with no separate
+///   indicator field.
 ///
-/// Returns `Some(true)` when any indicator is present and signals truncation,
-/// `Some(false)` when an indicator is explicitly present but false/zero (not
-/// truncated), and `None` when no indicator field exists (pre-v0.145.0 sessions
-/// or exec calls that completed without hitting the output limit).
+/// Returns `Some(true)` when any indicator or the marker text is present and signals
+/// truncation, `Some(false)` when an indicator is explicitly present but false/zero (not
+/// truncated), and `None` when no signal exists (pre-v0.145.0 sessions, or exec calls that
+/// completed without hitting either limit).
 fn parse_output_truncated(payload: &Value) -> Option<bool> {
     if let Some(v) = payload.get("truncated").and_then(|v| v.as_bool()) {
         return Some(v);
@@ -1730,6 +1746,11 @@ fn parse_output_truncated(payload: &Value) -> Option<bool> {
     }
     if let Some(n) = payload.get("bytes_truncated").and_then(|v| v.as_u64()) {
         return Some(n > 0);
+    }
+    if let Some(output) = payload.get("aggregated_output").and_then(|v| v.as_str()) {
+        if output.contains(PERSISTED_OUTPUT_TRUNCATION_MARKER) {
+            return Some(true);
+        }
     }
     None
 }
@@ -3007,6 +3028,66 @@ mod tests {
             builder.finalized[0].output_truncated.is_none(),
             "output_truncated must be None when no truncation field is present"
         );
+    }
+
+    // Codex v0.162.0 (PR openai/codex#50427): the rollout-persistence policy caps a
+    // completed command's `aggregated_output` at 64 KiB, splicing a truncation marker
+    // into the output text instead of setting a separate indicator field. The parser
+    // must recognize the marker and still surface output_truncated = true.
+    #[test]
+    fn v0162_persisted_output_truncation_marker_sets_output_truncated() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_persist_trunc".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat huge.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // No truncated/output_truncated/bytes_truncated field — the only signal is the
+        // marker text embedded in aggregated_output by truncate_middle_with_marker.
+        let payload = json!({
+            "call_id": "call_persist_trunc",
+            "aggregated_output": "head of output\n... command output truncated for persistence ...\ntail of output",
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output_truncated, Some(true));
+        assert!(tool
+            .output
+            .as_deref()
+            .unwrap()
+            .contains("truncated for persistence"));
+    }
+
+    #[test]
+    fn v0162_output_without_persisted_truncation_marker_yields_none() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_no_persist_trunc".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_no_persist_trunc",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert!(builder.finalized[0].output_truncated.is_none());
     }
 
     #[test]

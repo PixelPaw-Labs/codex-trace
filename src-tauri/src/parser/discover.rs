@@ -2793,6 +2793,50 @@ mod tests {
         assert!(!session.is_ongoing);
     }
 
+    // Codex v0.166.0 (PRs #57232, #57273, issue #362): `codex queue` gained a
+    // `--resume` flag that resumes an unloaded thread immediately after queueing a
+    // message into it, and now rejects unsupported options instead of silently
+    // accepting them. codex-trace never invokes `codex queue` itself (no script,
+    // fixture, or doc in this repo shells out to it), and the stricter option
+    // validation is a CLI argument-parsing change with no on-disk effect. The only
+    // thing codex-trace could be affected by is the shape of the rollout file a
+    // resumed-after-queue thread produces, which is indistinguishable from the
+    // queue-then-dispatch case already covered by
+    // `v0149_queued_message_appended_to_existing_session_is_attributed_correctly`:
+    // the resumed thread simply appends another turn to its existing session file.
+    // Verify that still holds.
+    #[test]
+    fn v0166_queue_resume_appends_turn_to_existing_session_like_any_resume() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let path = day_dir.join("rollout-2026-08-20T12-00-00-v0166-target.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-20T12:00:00Z","type":"session_meta","payload":{"id":"v0166-target","timestamp":"2026-08-20T12:00:00Z","cwd":"/project","cli_version":"0.166.0"}}"#,
+                r#"{"timestamp":"2026-08-20T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-20T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1755691202.0}}"#,
+                // `codex queue --resume` queues a message into the idle thread above and
+                // immediately resumes it, which appends a new turn just like any other resume.
+                r#"{"timestamp":"2026-08-20T12:10:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                r#"{"timestamp":"2026-08-20T12:10:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1755691801.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0166-target")
+            .expect("queue --resume session must still be discovered by its own id");
+        assert_eq!(session.turn_count, 2);
+        assert!(!session.is_ongoing);
+    }
+
     /// Write a one-turn session and return its path.
     fn write_one_turn_session(dir: &Path, id: &str) -> PathBuf {
         let day_dir = dir.join("2026/09/16");

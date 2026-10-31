@@ -169,7 +169,11 @@ export interface CodexToolCall {
   image_file_path: string | null;
   worker_session: CodexSession | null;
   status: string;
-  /** Codex v0.145.0: true when exec_command_end signals that aggregated_output was clipped by the runtime's output limit. Null for pre-v0.145.0 sessions and non-exec tool calls. */
+  /** True when `aggregated_output` is known to be partial: either Codex v0.145.0's runtime
+   * output bound (an explicit truncation field on exec_command_end), or Codex v0.162.0's
+   * 64 KiB rollout-persistence cap (PR openai/codex#50427), signaled by a truncation marker
+   * embedded directly in `aggregated_output`. Null for pre-v0.145.0 sessions, non-exec tool
+   * calls, and runs whose output never hit either limit. */
   output_truncated: boolean | null;
 }
 
@@ -209,6 +213,11 @@ export interface CodexTurn {
   cwd: string | null;
   reasoning_effort: string | null;
   error: string | null;
+  /** Codex v0.163.0 (PR openai/codex#53451): server-provided reason when the model's response
+   * was cut off (e.g. "max_output_tokens") and terminated immediately as a non-retryable
+   * `ResponseIncomplete` error rather than a generic stream error. Null when the turn didn't
+   * hit this condition. Absent for cached data serialized before this field was added. */
+  incomplete_reason?: string | null;
   has_compaction: boolean;
   thread_name: string | null;
   collab_spawns: CollabSpawn[];

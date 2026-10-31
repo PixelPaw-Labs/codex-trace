@@ -16,6 +16,14 @@ use super::toolcall::{ToolCall, ToolCallBuilder};
 /// rendered as an assistant message.
 const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
+/// Codex v0.163.0 (PR openai/codex#53451): the upstream `Display` text for the
+/// non-retryable `ResponseIncomplete` error (`"Incomplete response returned, reason:
+/// {reason}"`), optionally behind a caller-supplied prefix such as `"Error running
+/// remote compact task: "`. There is no dedicated wire event for this error — it is
+/// delivered as a generic `error` event_msg, so this marker is the only way to tell it
+/// apart from other terminal errors and recover the server's incomplete-reason.
+const RESPONSE_INCOMPLETE_MARKER: &str = "Incomplete response returned, reason: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -170,6 +178,13 @@ pub struct CodexTurn {
     pub reasoning_effort: Option<String>,
     pub error: Option<String>,
     pub aborted_reason: Option<String>,
+    /// Codex v0.163.0 (PR openai/codex#53451): server-provided reason when the model's
+    /// response was cut off (e.g. "max_output_tokens") and the turn was terminated
+    /// immediately as a non-retryable `ResponseIncomplete` error rather than a generic
+    /// stream error. `None` for turns that didn't hit this condition and for sessions
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
     pub has_compaction: bool,
     pub thread_name: Option<String>,
     pub collab_spawns: Vec<CollabSpawn>,
@@ -227,6 +242,7 @@ impl CodexTurn {
             reasoning_effort: None,
             error: None,
             aborted_reason: None,
+            incomplete_reason: None,
             has_compaction: false,
             thread_name: None,
             collab_spawns: Vec::new(),
@@ -704,6 +720,18 @@ fn handle_event_msg(
                         .unwrap_or("unknown error")
                         .to_string();
                     turn.status = TurnStatus::Error;
+                    // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses
+                    // (e.g. hitting max_output_tokens) are now a non-retryable terminal
+                    // `ResponseIncomplete` error instead of a generic, retryable stream
+                    // error. There is no dedicated wire event for this — it surfaces as
+                    // this same generic `error` event, with the reason embedded in the
+                    // message text (optionally behind a caller-supplied prefix, e.g.
+                    // "Error running remote compact task: Incomplete response returned,
+                    // reason: max_output_tokens"), so detect it by splitting on the
+                    // upstream Display text rather than a separate field.
+                    turn.incomplete_reason = msg
+                        .split_once(RESPONSE_INCOMPLETE_MARKER)
+                        .map(|(_, reason)| reason.to_string());
                     turn.error = Some(msg);
                 }
             }
@@ -713,6 +741,16 @@ fn handle_event_msg(
         // catalog is truncated or skills are omitted for budget reasons. `warning` is a
         // generic notice event (also used for e.g. model-reroute warnings), so surface
         // its message on the current turn rather than dropping it.
+        //
+        // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend
+        // (the zsh fork runtime, `codex-execve-wrapper`, `shell-escalation` crate) was
+        // deleted outright, and the retired `shell_zsh_fork`/`unified_exec_zsh_fork`
+        // config flags now surface a migration/deprecation notice plus a warning when
+        // managed requirements for those flags are ignored. codex-trace never parsed the
+        // removed zsh-fork approval/escalation event shapes and has no config schema of
+        // its own for these flags, so there is nothing version-specific to remove; the
+        // new notice/warning message lands here like any other `warning` event and is
+        // surfaced verbatim rather than being misread as an `error` event.
         "warning" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -1790,6 +1828,63 @@ mod tests {
     }
 
     #[test]
+    fn v0163_parallel_read_only_tool_calls_pair_by_call_id_despite_interleaved_results() {
+        // Codex v0.163.0 (PR #52245, issue #338) runs independent read-only tool calls
+        // (skill, memory, conversation-history lookups) in parallel rather than strictly
+        // sequentially, so their start/end events can interleave: both calls start before
+        // either finishes, and the call that finishes first is not necessarily the one that
+        // started first. call_id (a HashMap key in ToolCallBuilder) rather than stream
+        // position drives request/result pairing, so this must still attribute each result
+        // to its own call and keep the call's *start* position — not its completion
+        // position — as its display order.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-04-27T04:53:00Z","type":"session_meta","payload":{"id":"s","timestamp":"2026-04-27T04:53:00Z"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:02Z","type":"response_item","payload":{"type":"function_call","name":"list_skills","arguments":"{}","call_id":"call_skill"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:03Z","type":"response_item","payload":{"type":"function_call","name":"memory_recall","arguments":"{}","call_id":"call_memory"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_memory","output":"MEMORY_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_skill","output":"SKILL_RESULT"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279986.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_call_orders.len(), turn.tool_calls.len());
+
+        let skill_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_skill")
+            .expect("call_skill present");
+        let memory_idx = turn
+            .tool_calls
+            .iter()
+            .position(|tc| tc.call_id == "call_memory")
+            .expect("call_memory present");
+
+        // Each result must land on its own call, not the other one, even though
+        // call_memory's result arrived first in the stream.
+        assert_eq!(
+            turn.tool_calls[skill_idx].output.as_deref(),
+            Some("SKILL_RESULT")
+        );
+        assert_eq!(
+            turn.tool_calls[memory_idx].output.as_deref(),
+            Some("MEMORY_RESULT")
+        );
+
+        // Display order must follow each call's *start* position (call_skill started first),
+        // not the order their results were finalized (call_memory finished first).
+        assert!(
+            turn.tool_call_orders[skill_idx] < turn.tool_call_orders[memory_idx],
+            "call_skill started before call_memory, so it must sort first regardless of \
+             which one's result arrived first"
+        );
+    }
+
+    #[test]
     fn links_spawn_agent_from_sdk_function_call_output() {
         let entries = entries(&[
             r#"{"timestamp":"2026-04-27T04:52:00Z","type":"session_meta","payload":{"id":"parent","timestamp":"2026-04-27T04:52:00Z"}}"#,
@@ -2428,6 +2523,30 @@ mod tests {
         assert!(turns[0].tool_calls.is_empty());
     }
 
+    // Codex v0.163.0 (PRs #52160, #52213): the entire zsh-fork approval/escalation flow
+    // (previously in `core/src/guardian/approval_request.rs`, `core/src/tools/approvals.rs`)
+    // was deleted along with the patched-zsh shell backend. codex-trace never parsed those
+    // event shapes in the first place — it has no approval/escalation-specific handling at
+    // all, relying on the generic wildcard arm in handle_event_msg. This test guards against
+    // regressions that would require codex-trace to understand the now-deleted event shapes,
+    // and confirms old session files recorded before the removal still parse unaffected.
+    #[test]
+    fn v0163_removed_zsh_fork_approval_events_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0163","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_request","call_id":"call_zsh","command":"sudo apt-get update"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"zsh_fork_escalation_response","call_id":"call_zsh","decision":"approved"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
     // Codex v0.129.0 (PR #20540): apply_patch file changes moved from patch_apply_end
     // event into an apply_patch_end response_item (turn item). The PatchApply call is
     // finalized by custom_tool_call_output (exit_code, output) and the file changes are
@@ -2515,6 +2634,61 @@ mod tests {
         assert_eq!(tc.output.as_deref(), Some("Applied 1 hunk"));
         let changes = tc.patch_changes.as_ref().expect("patch_changes from event");
         assert_eq!(changes[0]["path"], "old.rs");
+    }
+
+    // Codex v0.163.0 (PR #53444): `codex exec`'s human-readable terminal output now
+    // suppresses reprinting an unchanged file diff after an unrelated command — it only
+    // reprints when the diff actually changes, goes from empty to non-empty, or a new turn
+    // starts. codex-trace is unaffected because it never reads `codex exec` terminal
+    // stdout/stderr; it parses the structured JSONL rollout file, where each apply_patch
+    // call is a distinct patch_apply_end event keyed by call_id. There is no "one diff print
+    // per modifying command" assumption to break: two patches touching the same file,
+    // separated by an unrelated exec_command, still yield two independent PatchApply tool
+    // calls each with their own patch_changes.
+    #[test]
+    fn v0163_exec_diff_reprint_suppression_does_not_affect_patch_tracking() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-session","timestamp":"2026-10-01T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // First patch: modifies foo.rs.
+            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch_1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: foo.rs\n..."}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch_1","output":"{\"output\":\"Applied patch successfully\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:04Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_1","success":true,"changes":[{"path":"foo.rs","type":"modified"}]}}"#,
+            // Unrelated command in between — in printed terminal output this is where
+            // v0.163.0 suppresses reprinting the still-current foo.rs diff.
+            r#"{"timestamp":"2026-10-01T10:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo check\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:06Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec","aggregated_output":"Checking project\n","exit_code":0,"status":"completed"}}"#,
+            // Second patch: touches foo.rs again, producing the same resulting change.
+            r#"{"timestamp":"2026-10-01T10:00:07Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch_2","name":"apply_patch","input":"*** Begin Patch\n*** Update File: foo.rs\n..."}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch_2","output":"{\"output\":\"Applied patch successfully\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:09Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_2","success":true,"changes":[{"path":"foo.rs","type":"modified"}]}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1759312810.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        // Three distinct tool calls — both patches tracked independently, with no
+        // dependency on how many diff blocks `codex exec` would have printed to stdout.
+        assert_eq!(turns[0].tool_calls.len(), 3);
+
+        let patch_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::PatchApply)
+            .collect();
+        assert_eq!(patch_calls.len(), 2, "both patches tracked independently");
+        for patch in &patch_calls {
+            assert_eq!(patch.patch_success, Some(true));
+            assert_eq!(patch.patch_changes.as_ref().unwrap()[0]["path"], "foo.rs");
+        }
+
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(exec_calls.len(), 1, "unrelated command tracked separately");
     }
 
     // Codex v0.129.0 (PRs #20502/#20682): persist_extended_history disabled; app-server
@@ -3812,6 +3986,67 @@ mod tests {
         assert_eq!(tc.output.as_deref(), Some("turn interrupted\n"));
     }
 
+    // Codex v0.163.0 (PR openai/codex#53451): incomplete model responses (e.g. hitting
+    // max_output_tokens) are now a non-retryable terminal `ResponseIncomplete` error
+    // instead of a generic, retryable stream error. There is no dedicated wire event for
+    // this — it is delivered as the existing generic `error` event_msg, with the reason
+    // embedded in the message text, so `incomplete_reason` must be recovered from there.
+
+    #[test]
+    fn v0163_response_incomplete_marks_turn_error_with_reason() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"v0163-incomplete","timestamp":"2026-10-01T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","payload":{"type":"error","message":"Incomplete response returned, reason: max_output_tokens"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("Incomplete response returned, reason: max_output_tokens")
+        );
+    }
+
+    #[test]
+    fn v0163_response_incomplete_reason_recovered_behind_a_caller_prefix() {
+        // e.g. compaction wraps the same upstream error with "Error running remote
+        // compact task: " before the marker text.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:01:00Z","type":"session_meta","payload":{"id":"v0163-incomplete-compact","timestamp":"2026-10-01T10:01:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:01:02Z","type":"event_msg","payload":{"type":"error","message":"Error running remote compact task: Incomplete response returned, reason: max_output_tokens"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn generic_error_without_response_incomplete_marker_leaves_incomplete_reason_unset() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-01T10:02:00Z","type":"session_meta","payload":{"id":"v0163-generic-error","timestamp":"2026-10-01T10:02:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-01T10:02:02Z","type":"event_msg","payload":{"type":"error","message":"context window exceeded"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Error);
+        assert_eq!(turn.incomplete_reason, None);
+        assert_eq!(turn.error.as_deref(), Some("context window exceeded"));
+    }
+
     // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
     // JSON output items. The final model response is emitted as a "structured_output"
     // response_item with a JSON object in `content`. codex-trace must capture this as the
@@ -4963,5 +5198,61 @@ mod tests {
             turns[0].agent_messages[0].order < turns[0].agent_messages[1].order,
             "each message must carry its own position in the stream"
         );
+    }
+
+    // Codex v0.164.0 (PRs #54930, #54949): negotiated zstd compression was added to
+    // app-server WebSocket connections, gated behind a feature flag that defaults to off.
+    // When the flag is enabled, raw WebSocket frames between the CLI and app-server can be
+    // zstd-compressed after negotiation instead of plain JSON.
+    //
+    // codex-trace reads session data exclusively from JSONL files at ~/.codex/sessions/ —
+    // it never connects to the Codex app-server WebSocket and never reads a raw WebSocket
+    // frame. The app-server decompresses negotiated frames (when the flag is on) before
+    // surfacing events through its standard APIs, and those events continue to be logged to
+    // disk as plain JSON in the same JSONL format as every prior version, regardless of
+    // whether the flag is enabled. The compression negotiation happens entirely on a wire
+    // codex-trace never touches.
+    //
+    // The test below confirms a v0.164.0 session still parses correctly, guarding against a
+    // future regression that would re-introduce a dependency on that WebSocket wire format.
+    #[test]
+    fn v0164_zstd_websocket_compression_negotiation_does_not_affect_session_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0164","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.164.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792000803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+    }
+
+    // Codex v0.163.0 (PRs #52160, #52213): the patched-zsh shell escalation backend and
+    // its `shell_zsh_fork`/`unified_exec_zsh_fork` config flags were retired in favor of a
+    // migration/deprecation notice. codex-trace has no config schema referencing those
+    // flags and never parsed the removed zsh-fork approval/escalation event shapes, so the
+    // notice simply arrives as a generic `warning` event like any other and must be
+    // captured as a warning, not misread as a turn-ending `error`.
+    #[test]
+    fn v0163_zsh_fork_deprecation_notice_captured_as_warning_not_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-10-20T10:00:00Z","type":"session_meta","payload":{"id":"v0163-zsh-fork","timestamp":"2026-10-20T10:00:00Z","cli_version":"0.163.0"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"shell_zsh_fork and unified_exec_zsh_fork are deprecated and ignored; the patched-zsh shell backend was removed in v0.163.0."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-10-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1792828804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].error.is_none());
+        assert_eq!(turns[0].warnings.len(), 1);
+        assert!(turns[0].warnings[0].contains("shell_zsh_fork"));
+        assert!(turns[0].warnings[0].contains("unified_exec_zsh_fork"));
     }
 }

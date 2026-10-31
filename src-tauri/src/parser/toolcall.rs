@@ -3045,6 +3045,74 @@ mod tests {
         assert_eq!(tool.exit_code, Some(0));
     }
 
+    // Codex v0.158.0 (PRs #47529, #47665, issue #342): a process that fails to launch now
+    // gets a normal exec_command_end instead of no end event at all. It reuses the existing
+    // failure shape (exit_code: -1, status: "failed", zero duration) with the launch diagnostic
+    // in aggregated_output, so the generic field extraction below already parses it correctly.
+
+    #[test]
+    fn v0158_exec_command_end_process_launch_failure_parses_as_failed_with_exit_code_neg1() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_launch_fail".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"/not/a/real/binary","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_launch_fail",
+            "aggregated_output": "No such file or directory (os error 2)",
+            "exit_code": -1,
+            "status": "failed",
+            "duration": {"secs": 0, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.exit_code, Some(-1));
+        assert_eq!(tool.status, "failed");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("No such file or directory (os error 2)")
+        );
+        assert_eq!(tool.duration_secs, Some(0.0));
+    }
+
+    #[test]
+    fn v0158_exec_command_end_early_output_is_captured_in_aggregated_output() {
+        // PR #47665: output produced before the streaming subscriber attached is now
+        // included in aggregated_output. No new field — the existing aggregated_output
+        // extraction already surfaces whatever text the runtime puts there.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_early_output".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo early && echo late","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_early_output",
+            "aggregated_output": "early\nlate\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 5_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("early\nlate\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
     // Codex v0.146.0 (issue #223): exec_command_end may carry plugin_id/script_path when
     // the command was attributed to a trusted plugin script ("hardened plugin isolation").
 

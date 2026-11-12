@@ -1,4 +1,5 @@
-import type { AgentMessage, CodexToolCall, CodexTurn } from "../../shared/types";
+import type { AgentMessage, CodexToolCall, CodexTurn, UserMessage } from "../../shared/types";
+import { UserMessageContent } from "./UserMessageContent";
 import { ToolCallItem } from "./ToolCallItem";
 import { ComplementaryItem } from "./ComplementaryItem";
 import { OngoingDots } from "./OngoingDots";
@@ -36,9 +37,16 @@ export function TurnDetail({
   // When order data is missing (old cached sessions), messages keep order 0 and tools sort last,
   // which reproduces the previous "messages first, tools after" layout.
   type TimelineItem =
+    | { order: number; kind: "user"; msg: UserMessage }
     | { order: number; kind: "msg"; msg: AgentMessage }
     | { order: number; kind: "tool"; tool: CodexToolCall; index: number };
   const timeline: TimelineItem[] = [];
+  const userMessages = turn.user_messages?.length
+    ? turn.user_messages
+    : turn.user_message
+      ? [{ text: turn.user_message, images: [], timestamp: "", order: 0 }]
+      : [];
+  userMessages.forEach((msg) => timeline.push({ order: msg.order, kind: "user", msg }));
   commentary.forEach((msg) => {
     timeline.push({ order: msg.order ?? 0, kind: "msg", msg });
   });
@@ -138,7 +146,14 @@ export function TurnDetail({
           {timeline.length > 0 && (
             <div className="turn-detail__section turn-detail__section--activity">
               {timeline.map((item, i) =>
-                item.kind === "msg" ? (
+                item.kind === "user" ? (
+                  <div className="turn-detail__user-message" key={`u-${item.order}`}>
+                    <div className="turn-detail__section-label">
+                      User {item.msg.timestamp && formatExactTime(item.msg.timestamp)}
+                    </div>
+                    <UserMessageContent message={item.msg} />
+                  </div>
+                ) : item.kind === "msg" ? (
                   <ComplementaryItem key={`m-${item.msg.timestamp || i}`} msg={item.msg} />
                 ) : (
                   <ToolCallItem

@@ -83,6 +83,44 @@ function renderTurnDetail(turn: CodexTurn) {
 }
 
 describe("TurnDetail", () => {
+  it("interleaves user steering with replies and displays the attached image", () => {
+    const image = "data:image/png;base64,YQ==";
+    renderTurnDetail(
+      makeTurn({
+        user_messages: [
+          { text: "Image question", images: [image], timestamp: "2026-11-12T02:52:00Z", order: 1 },
+          { text: "Use production data", images: [], timestamp: "2026-11-12T02:52:19Z", order: 3 },
+        ],
+        agent_messages: [
+          { ...FINAL_MSG, text: "Checking now", phase: "commentary", order: 2 },
+          { ...FINAL_MSG, order: 4 },
+        ],
+      }),
+    );
+    expect(screen.getByRole("img", { name: "User attachment 1" })).toHaveAttribute("src", image);
+    const prompt = screen.getByText("Image question");
+    const reply = screen.getByText("Checking now");
+    const steering = screen.getByText("Use production data");
+    expect(prompt.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(reply.compareDocumentPosition(steering) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows an unavailable attachment without loading a remote URL", () => {
+    renderTurnDetail(
+      makeTurn({
+        user_messages: [
+          {
+            text: "Question",
+            images: ["https://example.com/private.png"],
+            timestamp: "",
+            order: 0,
+          },
+        ],
+      }),
+    );
+    expect(screen.getByText("Image 1 unavailable")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
   it("shows context-left metadata using Codex's last-token usage", () => {
     renderTurnDetail(makeTurn());
 

@@ -49,6 +49,14 @@ pub struct AgentMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMsg {
+    pub text: String,
+    pub images: Vec<String>,
+    pub timestamp: String,
+    pub order: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(Default))]
 pub struct TokenInfo {
     pub input_tokens: u64,
@@ -162,6 +170,8 @@ pub struct CodexTurn {
     pub duration_ms: Option<u64>,
     pub status: TurnStatus,
     pub user_message: Option<String>,
+    #[serde(default)]
+    pub user_messages: Vec<UserMsg>,
     pub text_elements: Vec<TextElement>,
     pub agent_messages: Vec<AgentMsg>,
     pub tool_calls: Vec<ToolCall>,
@@ -231,6 +241,7 @@ impl CodexTurn {
             duration_ms: None,
             status: TurnStatus::Ongoing,
             user_message: None,
+            user_messages: Vec::new(),
             text_elements: Vec::new(),
             agent_messages: Vec::new(),
             tool_calls: Vec::new(),
@@ -278,9 +289,8 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     let mut call_order: HashMap<String, usize> = HashMap::new();
     // Turns whose user_message was taken from a user-role `message` response_item rather
     // than from event_msg.user_message (Codex Desktop v0.153 emits only the former). Such
-    // text is provisional: a later user-role response_item replaces it (Desktop writes the
-    // injected context first and the real prompt last), and event_msg.user_message always
-    // wins over it regardless of ordering.
+    // text is provisional: event_msg.user_message wins over the response-item copy,
+    // while Desktop-only turns retain all their user messages.
     let mut provisional_user_messages: HashSet<String> = HashSet::new();
     // Assistant replies seen as response_items, keyed by turn. Classic rollouts carry the same
     // text as event_msg.agent_message too, so these are only used for a turn the event stream
@@ -491,6 +501,8 @@ fn handle_event_msg(
                 let mut turn = CodexTurn::new(turn_id.clone());
                 turn.started_at = started_at;
                 turn.user_message = Some(message);
+                turn.user_messages
+                    .push(user_message_from_entry(entry, index));
                 turn.task_mentions = task_mentions;
                 turns.insert(turn_id.clone(), turn);
                 *current_turn_id = Some(turn_id.clone());
@@ -501,10 +513,14 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     // event_msg.user_message is authoritative: it fills an empty slot and
                     // also replaces provisional text taken from a user-role response_item.
-                    if turn.user_message.is_none() || provisional_user_messages.remove(tid) {
-                        turn.user_message = Some(message);
-                        turn.task_mentions = task_mentions;
+                    if provisional_user_messages.remove(tid) {
+                        turn.user_messages.clear();
+                        turn.task_mentions.clear();
                     }
+                    turn.user_messages
+                        .push(user_message_from_entry(entry, index));
+                    turn.user_message = Some(join_user_messages(&turn.user_messages));
+                    turn.task_mentions.extend(task_mentions);
                 }
             }
         }
@@ -1327,8 +1343,8 @@ fn handle_response_item(
 
         // Codex Desktop v0.153 records user prompts as response_item messages with
         // role=user and input_text content blocks (rather than event_msg.user_message).
-        // Use the last user message in a turn: the first one is often the injected
-        // environment/context block, while the final one is the actual prompt.
+        // Keep every real prompt, including steering messages within a running turn.
+        // Injected context is filtered separately rather than replaced by the next prompt.
         //
         // Regular CLI rollouts carry these items too (environment context, compaction
         // summaries, the prompt as sent to the model) alongside event_msg.user_message, so
@@ -1336,12 +1352,16 @@ fn handle_response_item(
         // event_msg, and it can itself be replaced by a later event_msg.user_message.
         "message" if payload.get("role").and_then(|v| v.as_str()) == Some("user") => {
             let raw_text = extract_item_content(payload);
-            if !raw_text.is_empty() {
+            let user_message = user_message_from_entry(entry, index);
+            if (!raw_text.is_empty() || !user_message.images.is_empty())
+                && !is_injected_user_context(&raw_text)
+            {
                 if let Some(turn) = turns.get_mut(tid) {
                     if turn.user_message.is_none() || provisional_user_messages.contains(tid) {
-                        let (text, task_mentions) = decode_task_mentions(&raw_text);
-                        turn.user_message = Some(text);
-                        turn.task_mentions = task_mentions;
+                        let (_, task_mentions) = decode_task_mentions(&raw_text);
+                        turn.user_messages.push(user_message);
+                        turn.user_message = Some(join_user_messages(&turn.user_messages));
+                        turn.task_mentions.extend(task_mentions);
                         provisional_user_messages.insert(tid.to_string());
                     }
                 }
@@ -1387,6 +1407,85 @@ fn handle_response_item(
 
         _ => {}
     }
+}
+
+fn is_injected_user_context(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<INSTRUCTIONS>",
+        "<user_instructions>",
+        "<turn_aborted>",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn user_message_from_entry(entry: &RawEntry, order: usize) -> UserMsg {
+    let payload = if matches!(entry.entry_type.as_str(), "response_item" | "event_msg") {
+        &entry.payload
+    } else {
+        &entry.raw
+    };
+    let mut images = Vec::new();
+    let text = if let Some(content) = payload.get("content").and_then(Value::as_array) {
+        content
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("input_image") {
+                    if let Some(url) = block.get("image_url") {
+                        if let Some(url) = url
+                            .as_str()
+                            .or_else(|| url.get("url").and_then(Value::as_str))
+                        {
+                            images.push(url.to_string());
+                        }
+                    }
+                    return None;
+                }
+                block.get("text").and_then(Value::as_str).filter(|text| {
+                    // Desktop wraps image blocks in separate textual path markers.
+                    !(text.trim().starts_with("<image ") || text.trim() == "</image>")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        payload
+            .get("message")
+            .map(extract_message_text)
+            .unwrap_or_else(|| extract_item_content(payload))
+    };
+    if let Some(event_images) = payload.get("images").and_then(Value::as_array) {
+        images.extend(
+            event_images
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    let (text, _) = decode_task_mentions(&text);
+    UserMsg {
+        text,
+        images,
+        timestamp: entry.timestamp.clone().unwrap_or_default(),
+        order,
+    }
+}
+
+fn join_user_messages(messages: &[UserMsg]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            if message.text.is_empty() && !message.images.is_empty() {
+                "[Image]".to_string()
+            } else {
+                message.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn handle_turn_context(
@@ -3242,7 +3341,7 @@ mod tests {
         let entries = entries(&[
             r#"{"timestamp":"2026-09-06T10:00:00Z","type":"session_meta","payload":{"id":"desktop-v153","timestamp":"2026-09-06T10:00:00Z","cli_version":"0.153.3"}}"#,
             r#"{"timestamp":"2026-09-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-desktop"}}"#,
-            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Injected context"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
+            r#"{"timestamp":"2026-09-06T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>Injected context</environment_context>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
             r#"{"timestamp":"2026-09-06T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Actual request"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
             r#"{"timestamp":"2026-09-06T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"custom-exec","input":"const result = await run();","internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
             r#"{"timestamp":"2026-09-06T10:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-exec","output":[{"type":"input_text","text":"Script completed\n"},{"type":"input_text","text":"result output"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-desktop"}}}"#,
@@ -3266,6 +3365,54 @@ mod tests {
         );
         assert_eq!(tool.exit_code, None);
         assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn desktop_retains_image_prompt_and_steering_messages_in_one_turn() {
+        let parsed = entries(&[
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /project\n<INSTRUCTIONS>rules</INSTRUCTIONS>"}]}}"##,
+            r#"{"timestamp":"2026-11-12T02:52:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/private/file.jpg\">"},{"type":"input_image","image_url":"data:image/jpeg;base64,YQ=="},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"Why is retention high?"}]}}"#,
+            r#"{"timestamp":"2026-11-12T02:52:19Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Production data"}]}}"#,
+            r#"{"timestamp":"2026-11-12T02:55:21Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Read-only checks approved"}]}}"#,
+        ]);
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let messages = &turns[0].user_messages;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].text, "Why is retention high?");
+        assert_eq!(messages[0].images, vec!["data:image/jpeg;base64,YQ=="]);
+        assert_eq!(messages[0].timestamp, "2026-11-12T02:52:00Z");
+        assert!(messages[0].order < messages[1].order);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Why is retention high?\n\nProduction data\n\nRead-only checks approved")
+        );
+    }
+
+    #[test]
+    fn image_only_prompt_is_not_discarded() {
+        let parsed = entries(&[
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":{"url":"data:image/png;base64,YQ=="}}]}}"#,
+        ]);
+        let turns = build_turns(&parsed);
+        assert_eq!(turns[0].user_messages.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("[Image]"));
+    }
+
+    #[test]
+    fn event_messages_keep_steering_without_response_item_duplicates() {
+        let parsed = entries(&[
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"First"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"First"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"First"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Second"}}"#,
+        ]);
+        let turns = build_turns(&parsed);
+        assert_eq!(turns[0].user_messages.len(), 2);
+        assert_eq!(turns[0].user_message.as_deref(), Some("First\n\nSecond"));
     }
 
     // Regular Codex CLI rollouts also carry user-role response_item messages alongside

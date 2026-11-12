@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 use crate::parser::session::CodexSession;
 use crate::parser::turn::{AgentMsg, CodexTurn, TurnStatus};
 
+/// Image bodies stay in the lazy-loaded turn rather than the list index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessagePreview {
+    pub text: String,
+    pub image_count: usize,
+    pub timestamp: String,
+    pub order: usize,
+}
+
 /// Everything the list view draws for one turn, and nothing else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnSummary {
@@ -25,6 +34,8 @@ pub struct TurnSummary {
     pub duration_ms: Option<u64>,
     /// Shown in full: a prompt is small next to the tool output it triggers.
     pub user_message: Option<String>,
+    #[serde(default)]
+    pub user_messages: Vec<UserMessagePreview>,
     /// The final answer when there is one, else the first non-reasoning message
     /// — the same fallback the row used to compute for itself.
     pub agent_preview: Option<String>,
@@ -58,6 +69,16 @@ impl TurnSummary {
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
             user_message: turn.user_message.clone(),
+            user_messages: turn
+                .user_messages
+                .iter()
+                .map(|message| UserMessagePreview {
+                    text: message.text.clone(),
+                    image_count: message.images.len(),
+                    timestamp: message.timestamp.clone(),
+                    order: message.order,
+                })
+                .collect(),
             agent_preview: agent_preview(&turn.agent_messages),
             last_agent_timestamp: turn.agent_messages.last().map(|m| m.timestamp.clone()),
             tool_call_count: turn.tool_calls.len(),
@@ -68,7 +89,9 @@ impl TurnSummary {
                 .count(),
             total_tokens: turn.total_tokens.as_ref().map(|t| t.total_tokens),
             model: turn.model.clone(),
-            has_detail: !turn.agent_messages.is_empty() || !turn.tool_calls.is_empty(),
+            has_detail: !turn.agent_messages.is_empty()
+                || !turn.tool_calls.is_empty()
+                || !turn.user_messages.is_empty(),
         }
     }
 }
@@ -199,6 +222,24 @@ mod tests {
         assert_eq!(s.tool_call_count, 0);
         assert_eq!(s.reasoning_count, 0);
         assert!(s.last_agent_timestamp.is_none());
+    }
+
+    #[test]
+    fn user_previews_keep_messages_but_omit_image_bodies() {
+        let mut turn = turn_with(vec![], vec![]);
+        turn.user_messages.push(crate::parser::turn::UserMsg {
+            text: "Question".into(),
+            images: vec!["data:image/png;base64,PRIVATE_IMAGE_BODY".into()],
+            timestamp: "2026-11-12T02:52:00Z".into(),
+            order: 12,
+        });
+        let summary = TurnSummary::of(&turn);
+        assert!(summary.has_detail);
+        assert_eq!(summary.user_messages[0].image_count, 1);
+        assert_eq!(summary.user_messages[0].text, "Question");
+        assert!(!serde_json::to_string(&summary)
+            .unwrap()
+            .contains("PRIVATE_IMAGE_BODY"));
     }
 
     #[test]

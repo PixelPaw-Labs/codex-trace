@@ -3734,3 +3734,20 @@ body {
   color: var(--text-secondary);
   margin-left: auto;
 }
+
+.turn-detail__user-message {
+  padding: 12px;
+  margin-block: 12px;
+  border-left: 2px solid var(--text-secondary);
+}
+.user-message__text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.user-message__image {
+  display: block;
+  max-width: 100%;
+  max-height: 600px;
+  object-fit: contain;
+  margin-top: 8px;
+}

@@ -75,6 +75,28 @@ function renderList(summaries: TurnSummary[], selectedIndex = -1, onSelectTurn =
 }
 
 describe("TurnList", () => {
+  it("shows every user prompt and opens image attachments in detail", () => {
+    const onSelect = renderList([
+      makeSummary({
+        user_messages: [
+          { text: "Image question", image_count: 1, timestamp: "2026-11-12T02:52:00Z", order: 1 },
+          { text: "Production data", image_count: 0, timestamp: "2026-11-12T02:52:19Z", order: 3 },
+          {
+            text: "Read-only checks approved",
+            image_count: 0,
+            timestamp: "2026-11-12T02:55:21Z",
+            order: 5,
+          },
+        ],
+      }),
+    ]);
+    expect(screen.getByText("Image question")).toBeInTheDocument();
+    expect(screen.getByText("Production data")).toBeInTheDocument();
+    expect(screen.getByText("Read-only checks approved")).toBeInTheDocument();
+    expect(screen.queryByText("Hello Codex")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View 1 image" }));
+    expect(onSelect).toHaveBeenCalledWith(0);
+  });
   it("shows empty state message when there are no turns", () => {
     renderList([]);
     expect(screen.getByText("No turns in this session.")).toBeInTheDocument();

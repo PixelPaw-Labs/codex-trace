@@ -5506,4 +5506,58 @@ mod tests {
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
     }
+
+    // Codex v0.169.0 (issue #390) bundles four upstream PRs — #60554 (add the
+    // `collapse_turn_details` TUI setting plus its render path), #60555 (collapse completed
+    // turn history cells when the setting is on), #60556 (group consecutive tool calls in the
+    // collapsed view), #60557 (keep streaming/replay state in sync with collapsed turns) —
+    // described in the issue as an opt-in "Collapse turn details" mode that "folds completed
+    // activity beneath each prompt" in the full-screen transcript.
+    //
+    // Diffing each PR's changed files against openai/codex shows all four touch only
+    // `codex-rs/tui/*`, plus `codex-rs/config/src/types.rs` (adds the new
+    // `Tui::collapse_turn_details: bool` field, read from `~/.codex/config.toml`) and
+    // `codex-rs/core/src/config/*` (wires that field through config loading). This is purely a
+    // local TUI *rendering* preference: it changes how `codex-rs/tui` lays out history cells on
+    // screen once the user opts in, folding completed turns under their prompt. None of the
+    // four PRs touch `codex-rs/rollout` (the crate that writes `~/.codex/sessions/*.jsonl`) or
+    // `codex-rs/protocol` (where `SessionMeta`/`EventMsg`/`ResponseItem` are defined).
+    //
+    // codex-trace never reads the TUI's rendered terminal output — it parses the on-disk
+    // rollout JSONL directly, where every `response_item` and `event_msg` is written in full
+    // and in order regardless of whether the live TUI folds or expands that turn on screen.
+    // There is no "collapsed" JSONL field and nothing in the file for a collapse setting to
+    // fold away or reorder.
+    #[test]
+    fn v0169_collapse_turn_details_tui_setting_does_not_affect_session_jsonl_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0169","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.169.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec_1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_1","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo bye\",\"workdir\":\"/tmp\"}","call_id":"call_exec_2"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_2","aggregated_output":"bye\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794729607.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Both exec calls are present and distinct in the parsed turn — the TUI's optional
+        // folding of completed activity under the prompt has no bearing on what the JSONL
+        // parser extracts, since the setting only governs the live terminal's visual layout.
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            2,
+            "both tool calls still parsed, none folded away"
+        );
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
 }

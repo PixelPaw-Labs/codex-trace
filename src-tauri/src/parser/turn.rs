@@ -5506,4 +5506,68 @@ mod tests {
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
     }
+
+    // Codex v0.168.0 (issue #386) cites PR #59256 — "Set tui.notification_method = \"osc777\"
+    // for terminal notifications. Approval notifications show longer command previews and
+    // distinguish terminal input from network access requests." — as adding a config key and
+    // changing approval-prompt notification content.
+    //
+    // Diffing PR #59256 against openai/codex shows every changed file is confined to
+    // `codex-rs/config/src/types.rs` and `codex-rs/core/config.schema.json` (adding the
+    // `Osc777` variant to the `NotificationMethod` enum/schema) and
+    // `codex-rs/tui/src/{chatwidget,notifications}` (the TUI's own OSC-9/OSC-777 desktop
+    // notification backend and the `Notification::ExecApprovalRequested` subject text it
+    // formats for that escape sequence). None of `codex-rs/protocol` (where `EventMsg`/rollout
+    // item types live) or `codex-rs/rollout` (the recorder that writes
+    // `~/.codex/sessions/*.jsonl`) were touched.
+    //
+    // `tui.notification_method` only selects which escape sequence (OSC 9 / OSC 777 / BEL) the
+    // TUI writes directly to its own stdout to trigger a terminal/OS desktop notification —
+    // codex-trace has no config.toml reader or recognized-keys schema of its own (it only reads
+    // the rollout JSONL plus its own `settings.json`, see `settings.rs`), so there is nothing to
+    // add this key to. Likewise, the longer preview and the terminal-input/network-access
+    // distinction are text computed at notification-dispatch time from fields the approval
+    // event already carries (`ev.kind`, `ev.network_approval_context`) purely to format that
+    // OSC message — they are never persisted to the rollout JSONL. The raw `command:
+    // Vec<String>` that actually lands in the JSONL (via `exec_command_end`, see `redact.rs`)
+    // is untouched by this PR, and codex-trace has never parsed an approval-request event type
+    // in the first place (the closest precedent, `zsh_fork_escalation_request`/`_response`
+    // above, is also ignored by the same fallback).
+    //
+    // codex-trace is unaffected. The test below guards against a future regression and shows a
+    // hypothetical persisted approval-prompt event carrying the new terminal-input/network-access
+    // shape and a long command preview is already tolerated gracefully, while the real
+    // exec_command flow around it still parses correctly.
+    #[test]
+    fn v0168_tui_notification_method_and_approval_preview_changes_do_not_affect_session_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0168","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Hypothetical persisted approval-prompt event carrying the new terminal-input vs.
+            // network-access distinction and a long command preview — not an event type
+            // codex-trace has ever recognized, so it must fall through untouched.
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call_net","kind":"network_access","network_approval_context":{"host":"example.com"},"command":"curl -sL https://example.com/a/very/long/path/that/exceeds/the/old/thirty/grapheme/preview/limit"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"curl -sL https://example.com\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec","aggregated_output":"ok\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794607206.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            1,
+            "exec tool call still classified correctly alongside the ignored approval event"
+        );
+        assert_eq!(exec_calls[0].exit_code, Some(0));
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
 }

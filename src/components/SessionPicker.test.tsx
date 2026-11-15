@@ -131,3 +131,31 @@ describe("SessionPicker batching", () => {
     expect(screen.queryByText(/more/)).not.toBeInTheDocument();
   });
 });
+
+describe("selection across date groups", () => {
+  const sessions = [
+    makeSession({ id: "a", path: "/sessions/2026/04/26/a.jsonl", date_group: "2026/04/26" }),
+    makeSession({ id: "b", path: "/sessions/2026/04/26/b.jsonl", date_group: "2026/04/26" }),
+    makeSession({ id: "c", path: "/sessions/2026/04/25/c.jsonl", date_group: "2026/04/25" }),
+    makeSession({ id: "d", path: "/sessions/2026/04/25/d.jsonl", date_group: "2026/04/25" }),
+  ];
+
+  function selectedRowPositions() {
+    return [...document.querySelectorAll(".picker__session")].flatMap((row, position) =>
+      row.classList.contains("picker__session--selected") ? [position] : [],
+    );
+  }
+
+  it.each([0, 1, 2, 3])("counts rows continuously, so index %i selects that row", (index) => {
+    renderPicker({ sessions, selectedIndex: index });
+
+    expect(document.querySelectorAll(".picker__group-header")).toHaveLength(2);
+    expect(selectedRowPositions()).toEqual([index]);
+  });
+
+  it("selects nothing when the index is past the last row", () => {
+    renderPicker({ sessions, selectedIndex: 4 });
+
+    expect(selectedRowPositions()).toEqual([]);
+  });
+});

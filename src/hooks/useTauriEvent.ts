@@ -17,16 +17,16 @@ export function useTauriEvent<T>(event: string, handler: (payload: T) => void | 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    const teardown = new AbortController();
 
     const forward: EventHandler<T> = (e) => {
-      if (!cancelled) return handlerRef.current(e.payload);
+      if (!teardown.signal.aborted) return handlerRef.current(e.payload);
     };
 
     const setupListener = async () => {
       const unlisten = await listen<T>(event, forward);
 
-      if (!cancelled) {
+      if (!teardown.signal.aborted) {
         unlistenRef.current = unlisten;
       } else {
         unlisten();
@@ -39,7 +39,7 @@ export function useTauriEvent<T>(event: string, handler: (payload: T) => void | 
     setupListener().catch((err) => console.error(`failed to listen for ${event}:`, err));
 
     return () => {
-      cancelled = true;
+      teardown.abort();
       unlistenRef.current?.();
       unlistenRef.current = null;
     };

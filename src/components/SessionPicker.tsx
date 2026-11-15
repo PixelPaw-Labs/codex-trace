@@ -84,7 +84,12 @@ export function SessionPicker({
   );
 
   const dateGroups = groupByDate(sessions);
-  let flatIndex = 0;
+  const groupStartIndexes: number[] = [];
+  let sessionsBefore = 0;
+  for (const group of dateGroups) {
+    groupStartIndexes.push(sessionsBefore);
+    sessionsBefore += group.items.length;
+  }
 
   return (
     <div className="picker">
@@ -117,11 +122,11 @@ export function SessionPicker({
           </div>
         )}
 
-        {dateGroups.map((group) => (
+        {dateGroups.map((group, groupIndex) => (
           <div key={group.category}>
             <div className="picker__group-header">{group.category}</div>
-            {group.items.map((s) => {
-              const idx = flatIndex++;
+            {group.items.map((s, itemIndex) => {
+              const idx = groupStartIndexes[groupIndex] + itemIndex;
               const isSelected = idx === selectedIndex;
               const model = shortModel(s.model ?? "");
               const modelClr = s.model ? getModelColor(s.model) : undefined;

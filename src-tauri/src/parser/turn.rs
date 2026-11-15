@@ -5506,4 +5506,70 @@ mod tests {
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
     }
+
+    // Codex v0.168.0 (issue #387, upstream PRs #59234/#59268): audio-capable models can
+    // now receive uploaded audio recordings. Diffing both PRs against openai/codex shows
+    // a user-role response_item's content array gains a new `input_audio` item
+    // (`{"type":"input_audio","file_id":"..."}`, or an inline `audio_url` variant)
+    // alongside the existing `input_text`/`input_image` items, and a new
+    // `rejected_audio_file_ids` field is added to the task_started `compaction` object (so
+    // a provider-confirmed-rejected recording is dropped across compaction/resume) and to
+    // the `task_complete` event's `error` object. Measured clip duration is cached only by
+    // an in-memory attachment-store crate for token-budget estimation — it is never
+    // written into the rollout JSONL, so there is nothing new to parse for it.
+    //
+    // codex-trace is unaffected. `extract_item_content` already extracts display text from
+    // a content array by reading each item's `text` field and skipping items without one,
+    // and `compaction_meta` is built by reading individual fields off the `compaction`
+    // object rather than via a strict struct — so both the new `input_audio` item and the
+    // new `rejected_audio_file_ids` field already pass through safely. The tests below
+    // guard against a future regression.
+
+    #[test]
+    fn v0168_input_audio_content_item_is_skipped_without_losing_text() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-audio","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Summarize this recording"},{"type":"input_audio","file_id":"file_abc123"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Here is the summary."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794628804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Summarize this recording"),
+            "input_audio content item must not corrupt or suppress the extracted prompt text"
+        );
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Here is the summary.")
+        );
+    }
+
+    #[test]
+    fn v0168_rejected_audio_file_ids_in_compaction_metadata_does_not_break_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T11:00:00Z","type":"session_meta","payload":{"id":"v0168-compaction","timestamp":"2026-11-13T11:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":9000,"tokens_after":3000,"summary":"Earlier discussion summarized.","rejected_audio_file_ids":["file_expired_1"]}}}"#,
+            r#"{"timestamp":"2026-11-13T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794632402.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must still be captured");
+        assert_eq!(meta.tokens_before, Some(9000));
+        assert_eq!(meta.tokens_after, Some(3000));
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some("Earlier discussion summarized.")
+        );
+    }
 }

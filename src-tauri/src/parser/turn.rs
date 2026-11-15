@@ -751,6 +751,19 @@ fn handle_event_msg(
         // its own for these flags, so there is nothing version-specific to remove; the
         // new notice/warning message lands here like any other `warning` event and is
         // surfaced verbatim rather than being misread as an `error` event.
+        //
+        // Codex v0.168.0 (PR #59479, issue #388): the legacy `[features].multi_agent`
+        // boolean is deprecated (kept enabled by default, still controlling the V1
+        // multi-agent fallback) in favor of `[agents].enabled`. Confirmed against
+        // `codex-rs/core/src/session/session.rs` on the upstream `rust-v0.168.0` tag: the
+        // new deprecation text is pushed onto `Config::startup_warnings`, which session
+        // startup turns into a plain `EventMsg::Warning` posted alongside session
+        // configuration — the exact same mechanism as every other deprecated-config
+        // notice (zsh-fork above, `transcript_v2`, `guardianv2.thread_context`, etc.).
+        // codex-trace has no config-schema code of its own referencing either
+        // `features.multi_agent` or `agents.enabled` — it only reads the rollout JSONL,
+        // never `config.toml` — so the warning lands here like any other and needs no
+        // parser change.
         "warning" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -5505,5 +5518,31 @@ mod tests {
         );
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
+
+    // Codex v0.168.0 (PR #59479, issue #388): the legacy `[features].multi_agent` boolean
+    // is deprecated in favor of `[agents].enabled`, and Codex now emits a startup warning
+    // when a user or project config explicitly sets the old flag. codex-trace has no
+    // config schema referencing either key — it never reads `config.toml` — so the new
+    // deprecation text simply arrives as a generic `warning` event like any other and
+    // must be captured as a warning, not misread as a turn-ending `error`.
+    #[test]
+    fn v0168_multi_agent_feature_deprecation_notice_captured_as_warning_not_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-multi-agent","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"`[features].multi_agent` is deprecated. Use `[agents].enabled = false` to disable subagent tools."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794168604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].error.is_none());
+        assert_eq!(turns[0].warnings.len(), 1);
+        assert!(turns[0].warnings[0].contains("features].multi_agent"));
+        assert!(turns[0].warnings[0].contains("agents].enabled"));
     }
 }

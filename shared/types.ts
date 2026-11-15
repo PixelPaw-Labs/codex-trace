@@ -40,6 +40,20 @@ export interface AgentMessage {
   order?: number;
 }
 
+export interface UserMessage {
+  text: string;
+  images: string[];
+  timestamp: string;
+  order: number;
+}
+
+export interface UserMessagePreview {
+  text: string;
+  image_count: number;
+  timestamp: string;
+  order: number;
+}
+
 /** Codex v0.132.0 (PR #23148): memory summaries are now versioned.
  * Pre-v0.132.0 sessions use plain strings; `version` is absent for those. */
 export interface MemorySummary {
@@ -213,6 +227,7 @@ export interface CodexTurn {
   duration_ms: number | null;
   status: "complete" | "aborted" | "cancelled" | "ongoing" | "error";
   user_message: string | null;
+  user_messages?: UserMessage[];
   agent_messages: AgentMessage[];
   tool_calls: CodexToolCall[];
   /** Display-order index for each tool call, parallel to `tool_calls` (same length/order).
@@ -286,6 +301,7 @@ export interface TurnSummary {
   completed_at: number | null;
   duration_ms: number | null;
   user_message: string | null;
+  user_messages?: UserMessagePreview[];
   /** Final answer when there is one, else the first non-reasoning message. */
   agent_preview: string | null;
   /** Used for the row timestamp when `completed_at` is absent. */

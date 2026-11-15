@@ -66,7 +66,9 @@ function renderTurnRow(i: number, _data: unknown, ctx: TurnRowContext) {
   const summary = ctx.summaries[i];
   if (!summary) return null;
   const isSelected = i === ctx.selectedIndex;
-  const userMsg = summary.user_message ?? "";
+  const userMessages = summary.user_messages?.length
+    ? summary.user_messages
+    : [{ text: summary.user_message ?? "", timestamp: "", image_count: 0, order: 0 }];
   const userExpanded = ctx.expandedUsers.has(i);
   const userTs = summary.started_at
     ? formatExactTime(new Date(summary.started_at * 1000).toISOString())
@@ -76,28 +78,48 @@ function renderTurnRow(i: number, _data: unknown, ctx: TurnRowContext) {
   return (
     <div className="turn-list__turn">
       {/* User message */}
-      <div
-        className={`message message--user${isSelected ? " message--selected" : ""}`}
-        onClick={() => ctx.onToggleUser(i)}
-        role="button"
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") ctx.onToggleUser(i);
-        }}
-      >
-        <div className="message__header">
-          <span className="message__role-icon">
-            <UserIcon />
-          </span>
-          <span className="message__role message__role--user">User</span>
-          {userTs && <span className="message__timestamp">{userTs}</span>}
-        </div>
-        {userMsg && (
-          <div className={`message__content${!userExpanded ? " message__content--collapsed" : ""}`}>
-            {userMsg}
+      {userMessages.map((message) => (
+        <div
+          key={`user-${message.order}`}
+          className={`message message--user${isSelected ? " message--selected" : ""}`}
+          onClick={() => ctx.onToggleUser(i)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") ctx.onToggleUser(i);
+          }}
+        >
+          <div className="message__header">
+            <span className="message__role-icon">
+              <UserIcon />
+            </span>
+            <span className="message__role message__role--user">User</span>
+            {(message.timestamp || userTs) && (
+              <span className="message__timestamp">
+                {message.timestamp ? formatExactTime(message.timestamp) : userTs}
+              </span>
+            )}
           </div>
-        )}
-      </div>
+          {message.text && (
+            <div
+              className={`message__content${!userExpanded ? " message__content--collapsed" : ""}`}
+            >
+              {message.text}
+            </div>
+          )}
+          {message.image_count > 0 && (
+            <button
+              className="message__detail-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                ctx.onSelectTurn(i);
+              }}
+            >
+              View {message.image_count} image{message.image_count > 1 ? "s" : ""}
+            </button>
+          )}
+        </div>
+      ))}
 
       {/* Agent (Codex) message */}
       <div

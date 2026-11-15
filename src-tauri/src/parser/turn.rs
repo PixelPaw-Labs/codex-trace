@@ -756,6 +756,19 @@ fn handle_event_msg(
         // its own for these flags, so there is nothing version-specific to remove; the
         // new notice/warning message lands here like any other `warning` event and is
         // surfaced verbatim rather than being misread as an `error` event.
+        //
+        // Codex v0.168.0 (PR #59479, issue #388): the legacy `[features].multi_agent`
+        // boolean is deprecated (kept enabled by default, still controlling the V1
+        // multi-agent fallback) in favor of `[agents].enabled`. Confirmed against
+        // `codex-rs/core/src/session/session.rs` on the upstream `rust-v0.168.0` tag: the
+        // new deprecation text is pushed onto `Config::startup_warnings`, which session
+        // startup turns into a plain `EventMsg::Warning` posted alongside session
+        // configuration — the exact same mechanism as every other deprecated-config
+        // notice (zsh-fork above, `transcript_v2`, `guardianv2.thread_context`, etc.).
+        // codex-trace has no config-schema code of its own referencing either
+        // `features.multi_agent` or `agents.enabled` — it only reads the rollout JSONL,
+        // never `config.toml` — so the warning lands here like any other and needs no
+        // parser change.
         "warning" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -2016,6 +2029,57 @@ mod tests {
 
         let tokens = turns[0].total_tokens.as_ref().expect("token count");
         assert_eq!(tokens.total_tokens, 999600);
+    }
+
+    // Codex v0.167.0 (upstream openai/codex#58404, issue #383): automatic context
+    // compaction now tracks a "last usable usage" boundary in the in-process
+    // `ContextManager` so that reasoning/output retained from a failed or
+    // usage-less response is still estimated and can trigger compaction, instead of
+    // being silently excluded from the live context-window estimate. The changed
+    // files (`context_manager/history.rs`, `session/mod.rs`, `session/turn.rs`,
+    // `state/session.rs`, `tasks/mod_tests.rs`, `compact_remote_v2_attempt.rs`) are
+    // confined to Codex's in-memory conversation history used to build the next
+    // model request — the new `last_server_reported_usage_item_count` /
+    // `last_model_output_item_count` boundary is explicitly documented upstream as
+    // "not saved in rollouts". Neither `codex-rs/protocol` (rollout item types) nor
+    // the rollout writer is touched, and the `token_count` event's
+    // `total_token_usage` / `last_token_usage` wire shape is unchanged.
+    //
+    // codex-trace never reconstructs Codex's live context window — it only reads
+    // whatever `response_item`/`event_msg` entries actually land in the on-disk
+    // rollout. This test locks in that codex-trace already tolerates both halves
+    // of the change: a `token_count` event whose `info` carries no
+    // `total_token_usage` (a response with no usable usage data) leaves
+    // `turn.total_tokens` untouched rather than panicking, and a `reasoning`
+    // response_item retained from an earlier incomplete response — which the new
+    // boundary logic keeps live for longer before compaction — parses as a no-op
+    // alongside the rest of the turn instead of disrupting it.
+    #[test]
+    fn v0167_token_count_without_usage_and_retained_reasoning_output_do_not_disrupt_turn_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-06T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0167","timestamp":"2026-11-06T10:00:00Z","cli_version":"0.167.0"}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Reasoning retained from an earlier incomplete/failed response. Under the
+            // v0.167.0 estimator this stays "unreported" for longer, but it was always
+            // just another response_item on disk as far as codex-trace is concerned.
+            r#"{"timestamp":"2026-11-06T10:00:02Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"..."}}"#,
+            // A response with no usable usage data: `info` is present but carries no
+            // `total_token_usage` at all.
+            r#"{"timestamp":"2026-11-06T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":100000}}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+            // A later response does report usable usage; it must still populate normally.
+            r#"{"timestamp":"2026-11-06T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":5100},"last_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":5100},"model_context_window":100000}}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793354406.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Complete);
+        assert_eq!(turn.final_answer.as_deref(), Some("Done"));
+        let tokens = turn.total_tokens.as_ref().expect("token count");
+        assert_eq!(tokens.total_tokens, 5100);
     }
 
     #[test]
@@ -5546,6 +5610,216 @@ mod tests {
             exec_calls.len(),
             1,
             "exec tool call still classified correctly"
+        );
+        assert_eq!(exec_calls[0].exit_code, Some(0));
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
+
+    // Codex v0.169.0 (issue #390) bundles four upstream PRs — #60554 (add the
+    // `collapse_turn_details` TUI setting plus its render path), #60555 (collapse completed
+    // turn history cells when the setting is on), #60556 (group consecutive tool calls in the
+    // collapsed view), #60557 (keep streaming/replay state in sync with collapsed turns) —
+    // described in the issue as an opt-in "Collapse turn details" mode that "folds completed
+    // activity beneath each prompt" in the full-screen transcript.
+    //
+    // Diffing each PR's changed files against openai/codex shows all four touch only
+    // `codex-rs/tui/*`, plus `codex-rs/config/src/types.rs` (adds the new
+    // `Tui::collapse_turn_details: bool` field, read from `~/.codex/config.toml`) and
+    // `codex-rs/core/src/config/*` (wires that field through config loading). This is purely a
+    // local TUI *rendering* preference: it changes how `codex-rs/tui` lays out history cells on
+    // screen once the user opts in, folding completed turns under their prompt. None of the
+    // four PRs touch `codex-rs/rollout` (the crate that writes `~/.codex/sessions/*.jsonl`) or
+    // `codex-rs/protocol` (where `SessionMeta`/`EventMsg`/`ResponseItem` are defined).
+    //
+    // codex-trace never reads the TUI's rendered terminal output — it parses the on-disk
+    // rollout JSONL directly, where every `response_item` and `event_msg` is written in full
+    // and in order regardless of whether the live TUI folds or expands that turn on screen.
+    // There is no "collapsed" JSONL field and nothing in the file for a collapse setting to
+    // fold away or reorder.
+    #[test]
+    fn v0169_collapse_turn_details_tui_setting_does_not_affect_session_jsonl_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0169","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.169.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec_1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_1","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo bye\",\"workdir\":\"/tmp\"}","call_id":"call_exec_2"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_2","aggregated_output":"bye\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794729607.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Both exec calls are present and distinct in the parsed turn — the TUI's optional
+        // folding of completed activity under the prompt has no bearing on what the JSONL
+        // parser extracts, since the setting only governs the live terminal's visual layout.
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            2,
+            "both tool calls still parsed, none folded away"
+        );
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
+
+    // Codex v0.168.0 (issue #387, upstream PRs #59234/#59268): audio-capable models can
+    // now receive uploaded audio recordings. Diffing both PRs against openai/codex shows
+    // a user-role response_item's content array gains a new `input_audio` item
+    // (`{"type":"input_audio","file_id":"..."}`, or an inline `audio_url` variant)
+    // alongside the existing `input_text`/`input_image` items, and a new
+    // `rejected_audio_file_ids` field is added to the task_started `compaction` object (so
+    // a provider-confirmed-rejected recording is dropped across compaction/resume) and to
+    // the `task_complete` event's `error` object. Measured clip duration is cached only by
+    // an in-memory attachment-store crate for token-budget estimation — it is never
+    // written into the rollout JSONL, so there is nothing new to parse for it.
+    //
+    // codex-trace is unaffected. `extract_item_content` already extracts display text from
+    // a content array by reading each item's `text` field and skipping items without one,
+    // and `compaction_meta` is built by reading individual fields off the `compaction`
+    // object rather than via a strict struct — so both the new `input_audio` item and the
+    // new `rejected_audio_file_ids` field already pass through safely. The tests below
+    // guard against a future regression.
+
+    #[test]
+    fn v0168_input_audio_content_item_is_skipped_without_losing_text() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-audio","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Summarize this recording"},{"type":"input_audio","file_id":"file_abc123"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Here is the summary."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794628804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Summarize this recording"),
+            "input_audio content item must not corrupt or suppress the extracted prompt text"
+        );
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Here is the summary.")
+        );
+    }
+
+    #[test]
+    fn v0168_rejected_audio_file_ids_in_compaction_metadata_does_not_break_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T11:00:00Z","type":"session_meta","payload":{"id":"v0168-compaction","timestamp":"2026-11-13T11:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":9000,"tokens_after":3000,"summary":"Earlier discussion summarized.","rejected_audio_file_ids":["file_expired_1"]}}}"#,
+            r#"{"timestamp":"2026-11-13T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794632402.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must still be captured");
+        assert_eq!(meta.tokens_before, Some(9000));
+        assert_eq!(meta.tokens_after, Some(3000));
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some("Earlier discussion summarized.")
+        );
+    }
+
+    // Codex v0.168.0 (PR #59479, issue #388): the legacy `[features].multi_agent` boolean
+    // is deprecated in favor of `[agents].enabled`, and Codex now emits a startup warning
+    // when a user or project config explicitly sets the old flag. codex-trace has no
+    // config schema referencing either key — it never reads `config.toml` — so the new
+    // deprecation text simply arrives as a generic `warning` event like any other and
+    // must be captured as a warning, not misread as a turn-ending `error`.
+    #[test]
+    fn v0168_multi_agent_feature_deprecation_notice_captured_as_warning_not_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-multi-agent","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"`[features].multi_agent` is deprecated. Use `[agents].enabled = false` to disable subagent tools."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794168604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].error.is_none());
+        assert_eq!(turns[0].warnings.len(), 1);
+        assert!(turns[0].warnings[0].contains("features].multi_agent"));
+        assert!(turns[0].warnings[0].contains("agents].enabled"));
+    }
+
+    // Codex v0.168.0 (issue #386) cites PR #59256 — "Set tui.notification_method = \"osc777\"
+    // for terminal notifications. Approval notifications show longer command previews and
+    // distinguish terminal input from network access requests." — as adding a config key and
+    // changing approval-prompt notification content.
+    //
+    // Diffing PR #59256 against openai/codex shows every changed file is confined to
+    // `codex-rs/config/src/types.rs` and `codex-rs/core/config.schema.json` (adding the
+    // `Osc777` variant to the `NotificationMethod` enum/schema) and
+    // `codex-rs/tui/src/{chatwidget,notifications}` (the TUI's own OSC-9/OSC-777 desktop
+    // notification backend and the `Notification::ExecApprovalRequested` subject text it
+    // formats for that escape sequence). None of `codex-rs/protocol` (where `EventMsg`/rollout
+    // item types live) or `codex-rs/rollout` (the recorder that writes
+    // `~/.codex/sessions/*.jsonl`) were touched.
+    //
+    // `tui.notification_method` only selects which escape sequence (OSC 9 / OSC 777 / BEL) the
+    // TUI writes directly to its own stdout to trigger a terminal/OS desktop notification —
+    // codex-trace has no config.toml reader or recognized-keys schema of its own (it only reads
+    // the rollout JSONL plus its own `settings.json`, see `settings.rs`), so there is nothing to
+    // add this key to. Likewise, the longer preview and the terminal-input/network-access
+    // distinction are text computed at notification-dispatch time from fields the approval
+    // event already carries (`ev.kind`, `ev.network_approval_context`) purely to format that
+    // OSC message — they are never persisted to the rollout JSONL. The raw `command:
+    // Vec<String>` that actually lands in the JSONL (via `exec_command_end`, see `redact.rs`)
+    // is untouched by this PR, and codex-trace has never parsed an approval-request event type
+    // in the first place (the closest precedent, `zsh_fork_escalation_request`/`_response`
+    // above, is also ignored by the same fallback).
+    //
+    // codex-trace is unaffected. The test below guards against a future regression and shows a
+    // hypothetical persisted approval-prompt event carrying the new terminal-input/network-access
+    // shape and a long command preview is already tolerated gracefully, while the real
+    // exec_command flow around it still parses correctly.
+    #[test]
+    fn v0168_tui_notification_method_and_approval_preview_changes_do_not_affect_session_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0168","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Hypothetical persisted approval-prompt event carrying the new terminal-input vs.
+            // network-access distinction and a long command preview — not an event type
+            // codex-trace has ever recognized, so it must fall through untouched.
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call_net","kind":"network_access","network_approval_context":{"host":"example.com"},"command":"curl -sL https://example.com/a/very/long/path/that/exceeds/the/old/thirty/grapheme/preview/limit"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"curl -sL https://example.com\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec","aggregated_output":"ok\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794607206.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            1,
+            "exec tool call still classified correctly alongside the ignored approval event"
         );
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));

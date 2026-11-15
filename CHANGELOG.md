@@ -4,6 +4,104 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.7.0] — 2026-11-16
+
+This release is mostly about keeping up with Codex. Versions 0.152 through 0.169 added
+new tools, new kinds of session record and new settings, and several of them were being
+shown as "Unknown" or dropped without a word. They are now read and drawn properly:
+reasoning summaries, voice conversations, questions the agent asks you mid-turn, worktree
+sessions and more. A small sessions directory also fills the picker on its first draw
+instead of showing an empty list.
+
+### Added
+
+- **The picker is complete on its first draw for small session directories**
+  ([`abe7c5b`](https://github.com/PixelPaw-Labs/codex-trace/commit/abe7c5b)). The first
+  request for a directory now waits a short moment for the background read to finish
+  before answering. A small directory used to finish so quickly that its "done" signal
+  was sent before the page was listening, which left an empty list until something else
+  asked again. Large directories still answer straight away and fill in behind the
+  progress bar, and the progress it reports is more accurate.
+
+### Fixed
+
+- **Every prompt in a turn is kept, along with its images**
+  ([`ece3ca2`](https://github.com/PixelPaw-Labs/codex-trace/commit/ece3ca2), @jackila).
+  Codex Desktop can record several user messages inside one turn, such as a question
+  followed by steering messages. Only the last one was shown, and an attached image was
+  lost. Each prompt now appears on its own in the turn list and in order in the detail
+  view, and embedded images are displayed. Only images stored inside the session file
+  are drawn, so opening a trace never contacts another host. One caveat: some context
+  that Codex Desktop injects for itself, such as its open-page and in-app-browser
+  blocks, can now show up as a prompt.
+- **Reasoning summaries are shown**
+  ([`23a8886`](https://github.com/PixelPaw-Labs/codex-trace/commit/23a8886)). The
+  Reasoning section always said "reasoning encrypted — cannot display", even when the
+  session held a readable summary. The summary text is now rendered. A reply that Codex
+  0.168 merges around a tool call into one message is also read correctly.
+- **Questions the agent asks mid-turn are visible**
+  ([`6b21dad`](https://github.com/PixelPaw-Labs/codex-trace/commit/6b21dad),
+  [`564ebd3`](https://github.com/PixelPaw-Labs/codex-trace/commit/564ebd3)). Codex's
+  async "ask the user" tool appeared as an unknown tool, and a question left unanswered
+  across a turn boundary vanished. The question, its suggested choices and your answer
+  are now drawn as their own tool call, with Markdown rendered.
+- **Realtime voice conversations are captured**
+  ([`df59b84`](https://github.com/PixelPaw-Labs/codex-trace/commit/df59b84)). Codex
+  0.156 turned voice conversations on by default and stores them as a new kind of
+  record, which was being dropped. The session start and end and each speaker's
+  transcript now appear in the turn.
+- **Worktree sessions sit under the thread that owns them**
+  ([`cd21ca7`](https://github.com/PixelPaw-Labs/codex-trace/commit/cd21ca7)). Sessions
+  run in a separate git worktree showed up as unrelated top-level entries. They are now
+  nested under their owner, found through the note Codex leaves in the worktree's git
+  directory.
+- **New Codex tools are named instead of shown as Unknown**
+  ([`405957e`](https://github.com/PixelPaw-Labs/codex-trace/commit/405957e),
+  [`da23950`](https://github.com/PixelPaw-Labs/codex-trace/commit/da23950)). This
+  covers the nine agent message-board tools from 0.157 and the three managed-worktree
+  tools from 0.162, each with a proper summary and arguments.
+- **MCP tools from servers with a slash in their name are split correctly**
+  ([`4df683c`](https://github.com/PixelPaw-Labs/codex-trace/commit/4df683c)). A server
+  called `myorg/myserver` had its name cut short and the rest glued onto the tool name.
+- **A mid-conversation change of reasoning effort is applied**
+  ([`a24ceff`](https://github.com/PixelPaw-Labs/codex-trace/commit/a24ceff)). Turns
+  after the change kept showing the effort the session started with.
+- **An incomplete model response shows its reason**
+  ([`ee6cfe1`](https://github.com/PixelPaw-Labs/codex-trace/commit/ee6cfe1)). When a
+  response is cut off, for example by hitting the output-token limit, the turn is
+  marked as an error and says why, instead of showing a generic stream error.
+- **Truncated command output is flagged**
+  ([`9896465`](https://github.com/PixelPaw-Labs/codex-trace/commit/9896465)). Codex
+  0.162 caps saved command output at 64 KiB and splices in a marker. That output was
+  displayed as if it were complete; it now carries the truncation banner.
+- **Diffs from files with Windows line endings render cleanly**
+  ([`1723e35`](https://github.com/PixelPaw-Labs/codex-trace/commit/1723e35)). A stray
+  carriage return was left on every line of an `apply_patch` diff taken from a CRLF
+  file.
+- **An exit code of -1 is labelled as a non-standard exit**
+  ([`ebe0013`](https://github.com/PixelPaw-Labs/codex-trace/commit/ebe0013)). Codex
+  reports -1 when a command could not be launched at all, which is different from a
+  command that ran and failed.
+- **Masked credentials are recognised**
+  ([`f4b3e9e`](https://github.com/PixelPaw-Labs/codex-trace/commit/f4b3e9e)). Codex
+  0.164 replaces real secrets with a `…masked…` placeholder before a command runs.
+  These placeholders are now treated as redacted values, whichever provider they come
+  from.
+- **Shell hooks show their working directory**
+  ([`914c1d0`](https://github.com/PixelPaw-Labs/codex-trace/commit/914c1d0)). Codex
+  0.166 records the directory a hook's command ran in, and the tool call detail now
+  has a cwd line for it.
+- **The index progress bar no longer shifts the page**
+  ([`7a6f308`](https://github.com/PixelPaw-Labs/codex-trace/commit/7a6f308)). The bar
+  was drawn in both the sidebar and the picker header, and rows jumped each time it
+  appeared or went away. There is now one bar in a fixed box in the bottom strip.
+- **`script/redeploy.sh` works on Docker-compatible engines other than Docker**
+  ([`40195a9`](https://github.com/PixelPaw-Labs/codex-trace/commit/40195a9)). The script
+  stopped without a message on an engine that rejects `docker ps --filter publish=`. It
+  now finds the container on the port itself, and prints the error if listing fails.
+
+[0.7.0]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.7.0
+
 ## [0.6.0] — 2026-09-18
 
 Two things this release is about: the app now draws its first session card in seconds

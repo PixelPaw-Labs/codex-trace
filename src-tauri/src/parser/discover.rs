@@ -139,6 +139,21 @@ pub struct CodexSessionInfo {
 /// worktree" rather than an error. No code changes needed; see
 /// `discover_sessions_groups_a_projectless_session_like_any_other` for the regression check.
 ///
+/// Note on Codex v0.169.0 explicit project trust in non-interactive runs (issue #389): PR
+/// #60041 keeps project configuration and MCP servers disabled for `codex exec`/`codex
+/// review` runs in an untrusted directory, even with `--sandbox workspace-write` — callers
+/// must now pass `--trust` to enable them. Confirmed against the upstream PR's changed-file
+/// list (`codex-rs/cli/src/main.rs`, `codex-rs/config/src/loader/mod.rs`,
+/// `codex-rs/config/src/state.rs`, `codex-rs/core/src/config/mod.rs`,
+/// `codex-rs/exec/src/cli.rs`, `codex-rs/exec/src/lib.rs`) that this is purely a
+/// config/CLI-layer gate — it touches no file under `codex-rs/rollout` or
+/// `codex-rs/protocol`. The new disabled-project-config warning is an `eprintln!` to the
+/// exec process's stderr, never written to the rollout JSONL. The only observable effect on
+/// a trace is fewer MCP tool call events (MCP servers never start) and no project-level
+/// config layer applied — this scanner, the tool-call classifier, and the session parser
+/// never assumed `--sandbox workspace-write` implies either, so none need changes. See
+/// `discover_sessions_handles_untrusted_exec_run_like_any_other` for the regression check.
+///
 /// Note on Codex v0.169.0 opt-in terminal workspace side-chat tabs (issue #391): PRs #59784/
 /// #60152/#60181 let the sidebar hold multiple switchable side-chat tabs, with a saved chat
 /// reopenable after restart. Reading `codex-rs/tui/src/app_server_session.rs` and
@@ -1632,6 +1647,43 @@ mod tests {
         );
         assert_eq!(session.worktree_owner_thread_id, None);
         assert_eq!(session.parent_session_id, None);
+    }
+
+    #[test]
+    fn discover_sessions_handles_untrusted_exec_run_like_any_other() {
+        // Codex v0.169.0 (issue #389): a `codex exec` run in a directory with no saved
+        // trust decision keeps project configuration and MCP servers disabled unless
+        // `--trust` is passed, even with `--sandbox workspace-write`. The upstream PR
+        // touches no rollout/protocol file, so such a session's `session_meta` line is
+        // shaped exactly like any other — it should be discovered and date_group'd the
+        // same way, with no special handling for the absence of MCP activity.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/11/13");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(
+            day_dir.join("rollout-2026-11-13T09-00-00-untrusted-exec.jsonl"),
+            [
+                r#"{"timestamp":"2026-11-13T09:00:00Z","type":"session_meta","payload":{"id":"untrusted-exec-session","timestamp":"2026-11-13T09:00:00Z","cwd":"/untrusted/project","cli_version":"0.169.0","originator":"codex_exec"}}"#,
+                r#"{"timestamp":"2026-11-13T09:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-11-13T09:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794726002.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "untrusted-exec-session")
+            .expect("an untrusted-directory exec session must discover like any other");
+
+        assert_eq!(session.date_group, "2026/11/13");
+        assert_eq!(session.originator.as_deref(), Some("codex_exec"));
+        assert!(
+            !session.is_headless,
+            "codex_exec is not remote-control; must not be flagged headless"
+        );
+        assert_eq!(session.turn_count, 1);
     }
 
     #[test]

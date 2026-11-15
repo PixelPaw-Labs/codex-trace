@@ -3084,6 +3084,9 @@ body {
   font-style: italic;
   font-size: 13px;
 }
+.turn-detail__reasoning-note + .turn-detail__reasoning-note {
+  margin-top: 0.4rem;
+}
 .turn-detail__compaction-note {
   font-size: 12px;
   color: var(--text-dim);

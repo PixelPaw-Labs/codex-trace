@@ -338,11 +338,16 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
 
     // Fill in assistant replies for turns the event stream left silent, and prefer the one the
     // model marked as the answer over whichever happened to come first.
+    //
+    // Only a prior commentary/final-answer message blocks this fallback — a reasoning
+    // response_item (Codex v0.168.0, PRs #59698, #59700) pushes directly into
+    // `turn.agent_messages` earlier in this same pass, and must not be mistaken for an
+    // already-populated reply that makes this provisional fill-in redundant.
     for (turn_id, messages) in provisional_agent_messages {
         let Some(turn) = turns.get_mut(&turn_id) else {
             continue;
         };
-        if !turn.agent_messages.is_empty() {
+        if turn.agent_messages.iter().any(|m| !m.is_reasoning) {
             continue;
         }
         if let Some(answer) = messages
@@ -351,7 +356,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
         {
             turn.final_answer = Some(answer.text.clone());
         }
-        turn.agent_messages = messages;
+        turn.agent_messages.extend(messages);
     }
 
     // Finalize all tool builders
@@ -1398,6 +1403,28 @@ fn handle_response_item(
             }
         }
 
+        // Codex v0.168.0 (PRs #59698, #59700): the TUI now restores reasoning summaries
+        // when replaying a conversation. Reasoning response_items carry a `summary` array
+        // of `{"type": "summary_text", "text": "..."}` blocks once reasoning summaries are
+        // enabled, in addition to (or instead of) the opaque `encrypted_content` field this
+        // item type already carried. Extract that plaintext so it reaches the UI instead of
+        // being silently dropped by the catch-all arm below. Items that carry only
+        // `encrypted_content` and no `summary` still have nothing displayable to extract.
+        "reasoning" => {
+            let text = extract_reasoning_summary(payload);
+            if !text.is_empty() {
+                if let Some(turn) = turns.get_mut(tid) {
+                    turn.agent_messages.push(AgentMsg {
+                        text,
+                        phase: None,
+                        timestamp: entry.timestamp.clone().unwrap_or_default(),
+                        is_reasoning: true,
+                        order: index,
+                    });
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -1553,6 +1580,23 @@ fn extract_item_content(payload: &Value) -> String {
         Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// Extract plaintext from a reasoning response_item's `summary` field — an array of
+/// `{"type": "summary_text", "text": "..."}` blocks (OpenAI Responses API format). Returns
+/// an empty string for reasoning items that carry only opaque `encrypted_content`.
+fn extract_reasoning_summary(payload: &Value) -> String {
+    payload
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
 }
 
 /// Extract output from a custom tool result across legacy and Desktop formats.
@@ -5779,5 +5823,84 @@ mod tests {
         );
         assert_eq!(exec_calls[0].exit_code, Some(0));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
+
+    // Codex v0.168.0 (PRs #59698, #59700): the TUI now restores reasoning summaries when
+    // replaying a conversation. A reasoning response_item's `summary` array must be
+    // extracted as a displayable reasoning message rather than silently dropped.
+    #[test]
+    fn v0168_reasoning_summary_is_extracted_from_response_item() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-reasoning","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Considering the failing test."},{"type":"summary_text","text":"Checking the fixture data next."}],"encrypted_content":"..."}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixed it."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794600004.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let reasoning: Vec<_> = turns[0]
+            .agent_messages
+            .iter()
+            .filter(|m| m.is_reasoning)
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(
+            reasoning[0].text,
+            "Considering the failing test.\n\nChecking the fixture data next."
+        );
+        // The reasoning entry must not block the provisional fallback that fills in a
+        // Codex-Desktop-style reply (response_item only, no event_msg.agent_message) — a
+        // reasoning summary and the final answer are independent concerns.
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Fixed it."));
+        assert!(
+            turns[0]
+                .agent_messages
+                .iter()
+                .any(|m| !m.is_reasoning && m.text == "Fixed it."),
+            "final answer message must still be collected alongside the reasoning summary"
+        );
+    }
+
+    #[test]
+    fn v0168_reasoning_item_with_only_encrypted_content_yields_no_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-encrypted","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"opaque-blob"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794600004.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert!(turns[0].agent_messages.iter().all(|m| !m.is_reasoning));
+    }
+
+    // Codex v0.168.0 (PRs #59698, #59700): a reply interrupted by a tool call is now
+    // recorded/replayed as a single merged Markdown message rather than separate segments
+    // around the tool call. The parser pushes each message response_item independently
+    // regardless of count, so a single merged message after a tool call must still land in
+    // the turn with the correct order and populate the final answer.
+    #[test]
+    fn v0168_tool_call_interrupted_reply_merges_into_one_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0168-merged","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.168.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"Output:\nhi\nProcess exited with code 0\n"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Ran the command, here is what happened."}],"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794600005.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages[0].text,
+            "Ran the command, here is what happened."
+        );
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Ran the command, here is what happened.")
+        );
+        assert_eq!(turns[0].tool_calls.len(), 1);
     }
 }

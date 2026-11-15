@@ -127,11 +127,13 @@ export function TurnDetail({
                 className="turn-detail__section-label"
                 style={{ color: "var(--reasoning-text)" }}
               >
-                Reasoning (encrypted)
+                Reasoning
               </div>
-              <div className="turn-detail__reasoning-note">
-                (reasoning encrypted — cannot display)
-              </div>
+              {reasoning.map((msg, i) => (
+                <div className="turn-detail__reasoning-note" key={`r-${msg.timestamp || i}`}>
+                  <MarkdownRenderer content={msg.text} />
+                </div>
+              ))}
             </div>
           )}
 

@@ -191,4 +191,28 @@ describe("TurnDetail", () => {
 
     expect(screen.queryByText("Warnings")).not.toBeInTheDocument();
   });
+
+  // Codex v0.168.0 (PRs #59698, #59700): the TUI now restores reasoning summaries when
+  // replaying a conversation, so codex-trace must render the actual summary text rather
+  // than the old hardcoded "cannot display" placeholder.
+  it("renders reasoning summary text", () => {
+    const reasoningMsg: AgentMessage = {
+      text: "REASONING_TEXT",
+      phase: null,
+      timestamp: "2026-04-26T10:00:00Z",
+      is_reasoning: true,
+      order: 0,
+    };
+    renderTurnDetail(makeTurn({ agent_messages: [reasoningMsg, FINAL_MSG] }));
+
+    expect(screen.getByText("Reasoning")).toBeInTheDocument();
+    expect(screen.getByText("REASONING_TEXT")).toBeInTheDocument();
+    expect(screen.queryByText(/cannot display/)).not.toBeInTheDocument();
+  });
+
+  it("omits the Reasoning section when there are no reasoning messages", () => {
+    renderTurnDetail(makeTurn());
+
+    expect(screen.queryByText("Reasoning")).not.toBeInTheDocument();
+  });
 });

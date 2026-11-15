@@ -138,6 +138,27 @@ pub struct CodexSessionInfo {
 /// already treats a non-worktree `cwd` (including one with no `.git` at all) as "not a
 /// worktree" rather than an error. No code changes needed; see
 /// `discover_sessions_groups_a_projectless_session_like_any_other` for the regression check.
+///
+/// Note on Codex v0.169.0 opt-in terminal workspace side-chat tabs (issue #391): PRs #59784/
+/// #60152/#60181 let the sidebar hold multiple switchable side-chat tabs, with a saved chat
+/// reopenable after restart. Reading `codex-rs/tui/src/app_server_session.rs` and
+/// `codex-rs/protocol/src/protocol.rs` at the `rust-v0.169.0` tag resolves the storage
+/// question directly: `SideChatStorage::configure_fork` sets `config.ephemeral = true` for an
+/// unsaved ("Temporary") side chat, so it stays "pathless" and is never materialized to a
+/// rollout file at all — the same ephemeral-fork behavior already covered by the v0.146.0
+/// note above (issue #210). A saved ("Attached") side chat sets `ephemeral = false` and goes
+/// through the same `RolloutRecorder` path as any other thread, landing in this same
+/// `sessions_dir` as an ordinary `rollout-*.jsonl` file. Its `session_meta` gains two new
+/// fields this scanner never reads (`attached_thread: bool`, and `thread_source` serialized
+/// as the plain string `"tui_side_chat"`), so there is nothing here that could break on them,
+/// plus the existing `forked_from_id` pointing at the parent conversation — already surfaced
+/// as `forked_from_thread_id` by the v0.148.0 handling below. No parser change needed: a
+/// saved side chat is discovered like any other session. It does land as a flat, top-level
+/// entry rather than nested under its parent, because nesting here is driven only by
+/// `parent_thread_id`/`spawned_worker_ids`, which a fork never sets — the same flat placement
+/// `codex exec fork` sessions already get. See
+/// `discover_sessions_v0169_attached_side_chat_is_discovered_like_any_other_session` for the
+/// regression check.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -2851,6 +2872,50 @@ mod tests {
             .find(|s| s.id == "v0148-empty-fork")
             .expect("session must be discovered even with an empty forked_from_id");
         assert!(session.forked_from_thread_id.is_none());
+    }
+
+    // Codex v0.169.0 (PRs #59784, #60152, #60181, issue #391): a saved ("Attached") TUI
+    // side-chat tab is recorded as an ordinary rollout file — see the note above
+    // `discover_sessions` for how this was confirmed against the upstream source. Its
+    // session_meta carries the new `attached_thread`/`thread_source` fields alongside the
+    // pre-existing `forked_from_id`; this must parse cleanly, surface the fork lineage the
+    // same way `codex exec fork` already does, and not be mistaken for a subagent or
+    // headless session.
+    #[test]
+    fn discover_sessions_v0169_attached_side_chat_is_discovered_like_any_other_session() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/11/13");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-11-13T10-00-00-v0169-side-chat.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"v0169-side-chat-child","timestamp":"2026-11-13T10:00:00Z","cwd":"/project","cli_version":"0.169.0","originator":"vscode","model_provider":"openai","forked_from_id":"v0169-side-chat-parent","attached_thread":true,"thread_source":"tui_side_chat"}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0169-side-chat-child")
+            .expect("saved side-chat session must be discovered like any other rollout file");
+        assert_eq!(
+            session.forked_from_thread_id.as_deref(),
+            Some("v0169-side-chat-parent"),
+            "forked_from_id must still be surfaced as forked_from_thread_id for a side chat"
+        );
+        assert!(
+            !session.is_external_worker,
+            "a side chat is not a system-spawned subagent"
+        );
+        assert!(
+            !session.is_headless,
+            "a side chat is not a remote-control session"
+        );
+        assert!(
+            session.parent_session_id.is_none(),
+            "a side chat is not nested under its parent — nesting is driven by \
+             parent_thread_id/spawned_worker_ids, which a fork never sets"
+        );
     }
 
     // Codex v0.149.0 (PR #39385): the TUI's queue-by-name command resolution now picks

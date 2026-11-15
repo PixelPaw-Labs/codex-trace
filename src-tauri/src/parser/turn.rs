@@ -1974,6 +1974,57 @@ mod tests {
         assert_eq!(tokens.total_tokens, 999600);
     }
 
+    // Codex v0.167.0 (upstream openai/codex#58404, issue #383): automatic context
+    // compaction now tracks a "last usable usage" boundary in the in-process
+    // `ContextManager` so that reasoning/output retained from a failed or
+    // usage-less response is still estimated and can trigger compaction, instead of
+    // being silently excluded from the live context-window estimate. The changed
+    // files (`context_manager/history.rs`, `session/mod.rs`, `session/turn.rs`,
+    // `state/session.rs`, `tasks/mod_tests.rs`, `compact_remote_v2_attempt.rs`) are
+    // confined to Codex's in-memory conversation history used to build the next
+    // model request — the new `last_server_reported_usage_item_count` /
+    // `last_model_output_item_count` boundary is explicitly documented upstream as
+    // "not saved in rollouts". Neither `codex-rs/protocol` (rollout item types) nor
+    // the rollout writer is touched, and the `token_count` event's
+    // `total_token_usage` / `last_token_usage` wire shape is unchanged.
+    //
+    // codex-trace never reconstructs Codex's live context window — it only reads
+    // whatever `response_item`/`event_msg` entries actually land in the on-disk
+    // rollout. This test locks in that codex-trace already tolerates both halves
+    // of the change: a `token_count` event whose `info` carries no
+    // `total_token_usage` (a response with no usable usage data) leaves
+    // `turn.total_tokens` untouched rather than panicking, and a `reasoning`
+    // response_item retained from an earlier incomplete response — which the new
+    // boundary logic keeps live for longer before compaction — parses as a no-op
+    // alongside the rest of the turn instead of disrupting it.
+    #[test]
+    fn v0167_token_count_without_usage_and_retained_reasoning_output_do_not_disrupt_turn_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-06T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0167","timestamp":"2026-11-06T10:00:00Z","cli_version":"0.167.0"}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Reasoning retained from an earlier incomplete/failed response. Under the
+            // v0.167.0 estimator this stays "unreported" for longer, but it was always
+            // just another response_item on disk as far as codex-trace is concerned.
+            r#"{"timestamp":"2026-11-06T10:00:02Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"..."}}"#,
+            // A response with no usable usage data: `info` is present but carries no
+            // `total_token_usage` at all.
+            r#"{"timestamp":"2026-11-06T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":100000}}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+            // A later response does report usable usage; it must still populate normally.
+            r#"{"timestamp":"2026-11-06T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":5100},"last_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":5100},"model_context_window":100000}}}"#,
+            r#"{"timestamp":"2026-11-06T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1793354406.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Complete);
+        assert_eq!(turn.final_answer.as_deref(), Some("Done"));
+        let tokens = turn.total_tokens.as_ref().expect("token count");
+        assert_eq!(tokens.total_tokens, 5100);
+    }
+
     #[test]
     fn marks_failed_spawn_agent_output_without_child_link() {
         let failure =
@@ -5504,6 +5555,60 @@ mod tests {
             "exec tool call still classified correctly"
         );
         assert_eq!(exec_calls[0].exit_code, Some(0));
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
+    }
+
+    // Codex v0.169.0 (issue #390) bundles four upstream PRs — #60554 (add the
+    // `collapse_turn_details` TUI setting plus its render path), #60555 (collapse completed
+    // turn history cells when the setting is on), #60556 (group consecutive tool calls in the
+    // collapsed view), #60557 (keep streaming/replay state in sync with collapsed turns) —
+    // described in the issue as an opt-in "Collapse turn details" mode that "folds completed
+    // activity beneath each prompt" in the full-screen transcript.
+    //
+    // Diffing each PR's changed files against openai/codex shows all four touch only
+    // `codex-rs/tui/*`, plus `codex-rs/config/src/types.rs` (adds the new
+    // `Tui::collapse_turn_details: bool` field, read from `~/.codex/config.toml`) and
+    // `codex-rs/core/src/config/*` (wires that field through config loading). This is purely a
+    // local TUI *rendering* preference: it changes how `codex-rs/tui` lays out history cells on
+    // screen once the user opts in, folding completed turns under their prompt. None of the
+    // four PRs touch `codex-rs/rollout` (the crate that writes `~/.codex/sessions/*.jsonl`) or
+    // `codex-rs/protocol` (where `SessionMeta`/`EventMsg`/`ResponseItem` are defined).
+    //
+    // codex-trace never reads the TUI's rendered terminal output — it parses the on-disk
+    // rollout JSONL directly, where every `response_item` and `event_msg` is written in full
+    // and in order regardless of whether the live TUI folds or expands that turn on screen.
+    // There is no "collapsed" JSONL field and nothing in the file for a collapse setting to
+    // fold away or reorder.
+    #[test]
+    fn v0169_collapse_turn_details_tui_setting_does_not_affect_session_jsonl_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-13T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0169","timestamp":"2026-11-13T10:00:00Z","cli_version":"0.169.0"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec_1"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_1","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:04Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo bye\",\"workdir\":\"/tmp\"}","call_id":"call_exec_2"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_2","aggregated_output":"bye\n","exit_code":0,"status":"completed"}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+            r#"{"timestamp":"2026-11-13T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1794729607.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Both exec calls are present and distinct in the parsed turn — the TUI's optional
+        // folding of completed activity under the prompt has no bearing on what the JSONL
+        // parser extracts, since the setting only governs the live terminal's visual layout.
+        let exec_calls: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.kind == ToolKind::ExecCommand)
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            2,
+            "both tool calls still parsed, none folded away"
+        );
         assert_eq!(turns[0].final_answer.as_deref(), Some("Done"));
     }
 

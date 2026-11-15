@@ -4,7 +4,7 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
-## [0.7.0] — 2026-11-16
+## [0.7.1] — 2026-11-16
 
 This release is mostly about keeping up with Codex. Versions 0.152 through 0.169 added
 new tools, new kinds of session record and new settings, and several of them were being
@@ -12,6 +12,9 @@ shown as "Unknown" or dropped without a word. They are now read and drawn proper
 reasoning summaries, voice conversations, questions the agent asks you mid-turn, worktree
 sessions and more. A small sessions directory also fills the picker on its first draw
 instead of showing an empty list.
+
+Version 0.7.0 was tagged but never published, because its app build failed. 0.7.1 is
+that release with the build fixed.
 
 ### Added
 
@@ -100,7 +103,7 @@ instead of showing an empty list.
   stopped without a message on an engine that rejects `docker ps --filter publish=`. It
   now finds the container on the port itself, and prints the error if listing fails.
 
-[0.7.0]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.7.0
+[0.7.1]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.7.1
 
 ## [0.6.0] — 2026-09-18
 

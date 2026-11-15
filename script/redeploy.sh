@@ -4,6 +4,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+container_ids_publishing_port() {
+  local port="$1"
+  docker ps --format '{{.ID}} {{.Ports}}' |
+    awk -v published=":${port}->" 'index($0, published) { print $1 }'
+}
+
 main() {
   cd "$ROOT_DIR"
 
@@ -18,7 +24,7 @@ main() {
   # Also stop any manually-started container occupying the target port
   local port="${CODEXTRACE_HOST_PORT:-1422}"
   local existing
-  existing=$(docker ps -q --filter "publish=${port}" 2>/dev/null)
+  existing=$(container_ids_publishing_port "$port")
   if [ -n "$existing" ]; then
     echo "    Stopping container(s) on port ${port}: $existing"
     docker stop $existing >/dev/null

@@ -277,6 +277,10 @@ export function App() {
             <div className="app__loading">Loading session…</div>
           )}
 
+          {view === "list" && !session.loading && !session.session && session.error && (
+            <div className="app__error">{session.error}</div>
+          )}
+
           {view === "list" && !session.loading && session.session && (
             <TurnList
               // Root CSS zoom invalidates Virtuoso's cached row geometry.

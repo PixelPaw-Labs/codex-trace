@@ -277,3 +277,48 @@ describe("App worker panel", () => {
     expect(find(TOGGLE)).not.toBeNull();
   });
 });
+
+describe("App session load error", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return {
+            sessions_dir: "/sessions",
+            default_dir: "/sessions",
+            allowed_origins: [],
+            api_auth_enabled: true,
+            api_auth_source: "file",
+            clients: [],
+          };
+        case "list_sessions":
+          return {
+            sessions: [makeSessionInfo()],
+            total: 1,
+            groups: [{ date_group: "2026/04/26", count: 1 }],
+            index: { files_read: 1, total_files: 1, bytes_read: 1, total_bytes: 1, done: true },
+          };
+        case "load_session":
+          throw new Error(
+            "no local session data at /sessions/parent.jsonl (the session may have run against a remote app server, e.g. `codex exec --remote`, which does not write a local rollout file)",
+          );
+        default:
+          return undefined;
+      }
+    });
+  });
+
+  it("shows the backend's error instead of a blank screen when a session has no local data", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { container } = render(<App />);
+    const find = (sel: string) => container.querySelector(sel);
+
+    await waitFor(() => expect(find(".picker__session")).not.toBeNull());
+    fireEvent.click(find(".picker__session") as Element);
+
+    await waitFor(() => expect(find(".app__error")).not.toBeNull());
+    expect(find(".app__error")?.textContent).toContain("no local session data");
+    errors.mockRestore();
+  });
+});

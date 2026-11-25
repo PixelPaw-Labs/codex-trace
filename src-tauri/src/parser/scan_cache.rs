@@ -86,7 +86,7 @@ pub struct CachedScan {
 /// the session's first line, so `needs_lineage` lets the next scan fill it in from the
 /// head of each file instead; `worktree_owner_thread_id` is derived from the already-cached
 /// `cwd`, so `needs_worktree_scan` fills it in without reopening the session file at all.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
@@ -373,7 +373,8 @@ mod tests {
         let stamp = FileStamp::of(&file).unwrap();
         let on_disk = tmp.path().join("scan-cache.json");
         let older = format!(
-            r#"{{"version":1,"entries":{{{path:?}:{{"stamp":{{"modified_secs":{secs},"len":{len}}},"info":{info}}}}}}}"#,
+            r#"{{"version":{version},"entries":{{{path:?}:{{"stamp":{{"modified_secs":{secs},"len":{len}}},"info":{info}}}}}}}"#,
+            version = FORMAT_VERSION,
             path = file.to_string_lossy(),
             secs = stamp.modified_secs,
             len = stamp.len,
@@ -430,7 +431,7 @@ mod tests {
         let on_disk = tmp.path().join("scan-cache.json");
         fs::write(
             &on_disk,
-            r#"{"version":0,"entries":{"/a":{"stamp":{"modified_secs":1,"len":2},"info":{}}}}"#,
+            r#"{"version":1,"entries":{"/a":{"stamp":{"modified_secs":1,"len":2},"info":{}}}}"#,
         )
         .unwrap();
 

@@ -1528,6 +1528,20 @@ fn join_user_messages(messages: &[UserMsg]) -> String {
         .join("\n\n")
 }
 
+// Codex v0.171.0 (issue #412) cites PR #61663 "Fix config reads with relative working
+// directories", which corrects how the real Codex CLI resolves `config.toml` when invoked
+// with a relative `cwd` — it was previously resolving relative to the process's actual
+// working directory instead of the `cwd` Codex was told to use, so a config file could be
+// missed or the wrong one picked up for that run's sandbox/approval settings.
+//
+// codex-trace has no config-resolution logic of its own to realign with this fix: it never
+// reads `~/.codex/config.toml` or any other config file (see the `v0169`/`v0168` notes above
+// and `discover_sessions` for the equivalent note on the session scanner), and `CodexTurn`
+// has no `sandbox_policy`/`approval_policy` field to display in the first place. The `cwd`
+// read here is stored and shown verbatim as an opaque string — exactly as it appears in the
+// `turn_context` payload, whether absolute or relative — and is never used to look up a
+// config file. See `v0171_relative_cwd_in_turn_context_is_stored_verbatim_not_resolved` for
+// the regression check.
 fn handle_turn_context(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
@@ -6119,5 +6133,30 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_eq!(turns[0].user_message.as_deref(), Some("Hello"));
         assert_eq!(turns[0].final_answer.as_deref(), Some("Hi there."));
+    }
+
+    // Codex v0.171.0 (issue #412, PR #61663): the real CLI's own `config.toml` resolution
+    // for relative working directories was fixed. codex-trace never resolves or reads
+    // `config.toml` itself — see the note above `handle_turn_context` — so a `turn_context`
+    // entry carrying a relative `cwd` (exactly as a session recorded while Codex was
+    // invoked from a relative path would look) must still be stored and surfaced as the
+    // literal string from the payload, with no path resolution or lookup performed on it.
+    #[test]
+    fn v0171_relative_cwd_in_turn_context_is_stored_verbatim_not_resolved() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-20T10:00:00Z","type":"session_meta","payload":{"id":"v0171-relative-cwd","timestamp":"2026-11-20T10:00:00Z","cli_version":"0.171.0"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"./relative/project"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1795248003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].cwd.as_deref(),
+            Some("./relative/project"),
+            "a relative cwd must be stored exactly as written, not resolved against any config file"
+        );
     }
 }

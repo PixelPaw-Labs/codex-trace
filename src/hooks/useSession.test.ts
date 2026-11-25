@@ -337,6 +337,48 @@ describe("useSession", () => {
 
     expect(result.current.loading).toBe(false);
     expect(result.current.summaries).toEqual([]);
+    expect(result.current.error).toBe("broken");
+    errors.mockRestore();
+  });
+
+  it("surfaces a no-local-session-data error (e.g. a codex exec --remote session)", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_session") {
+        throw new Error(
+          "no local session data at /remote.jsonl (the session may have run against a remote app server, e.g. `codex exec --remote`, which does not write a local rollout file)",
+        );
+      }
+      return undefined;
+    });
+
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/remote.jsonl");
+    });
+
+    expect(result.current.error).toContain("no local session data");
+    errors.mockRestore();
+  });
+
+  it("clears a previous error once a session loads successfully", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_session") throw new Error("broken");
+      return undefined;
+    });
+    const { result } = renderHook(() => useSession());
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+    });
+    expect(result.current.error).toBe("broken");
+
+    mockBackend();
+    await act(async () => {
+      await result.current.loadSession("/s.jsonl");
+    });
+
+    expect(result.current.error).toBeNull();
     errors.mockRestore();
   });
 });

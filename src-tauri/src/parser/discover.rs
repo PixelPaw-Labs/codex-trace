@@ -53,14 +53,18 @@ pub struct CodexSessionInfo {
     /// true when the session has been archived via `codex archive` (Codex v0.136.0+).
     /// A trailing `session_archived` event sets this; a subsequent `session_unarchived` clears it.
     pub is_archived: bool,
-    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+    /// Approval mode from session_meta (Codex v0.144.0+, PR #30482).
     /// Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
     /// Checked against upstream (PR #36373, #37057): v0.147.0's `--approve-for-me`
     /// flag and v0.146.1's cyber-model auto-review defaults do NOT add a new value
     /// here — both route through the existing "on-request" policy plus a separate
-    /// auto-review-reviewer setting, not a new ask_for_approval string. Parsing
-    /// below is already a permissive passthrough, so no new value is expected.
-    /// Null for sessions predating v0.144.0 or when the field is absent.
+    /// auto-review-reviewer setting, not a new ask_for_approval string.
+    /// Codex v0.170.0/v0.171.0 (issue #408) removes the legacy `sandbox_policy`/
+    /// `ask_for_approval` accessors in favor of a single "permission profile" string;
+    /// read from `session_meta.permission_profile` first, falling back to the legacy
+    /// `session_meta.ask_for_approval` for sessions recorded before the rename. Parsing
+    /// is a permissive passthrough either way, so no new value needs special handling.
+    /// Null for sessions predating v0.144.0 or when neither field is present.
     pub approval_mode: Option<String>,
     /// Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
     /// inherits from, read from session_meta.payload.history_base.thread_id. Distinct from
@@ -665,11 +669,24 @@ fn scan_session_file(path: &Path, on_bytes: &mut impl FnMut(u64)) -> Option<Code
                 .get("archived")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            // Codex v0.144.0 (PR #30482): approval mode captured in session_meta.
+            // Codex v0.144.0 (PR #30482): approval mode captured in session_meta.ask_for_approval.
+            // Codex v0.170.0/v0.171.0 (issue #408, PRs #61133-#61395 and friends) finishes a
+            // migration already underway by v0.156.1: the sandbox_policy/ask_for_approval pair
+            // is replaced by a single `permission_profile` string (confirmed as the field
+            // `SessionConfiguredEvent` carries instead — see `resolve_worktree_owner_thread_id`'s
+            // doc comment below, checked against the same v0.156.1 binary). Read the new field
+            // first; fall back to the legacy `ask_for_approval` for sessions recorded before the
+            // rename so old rollout files keep showing their approval mode.
             let approval_mode = payload
-                .get("ask_for_approval")
+                .get("permission_profile")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    payload
+                        .get("ask_for_approval")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
                 .map(|s| s.to_string());
             // Codex v0.146.0 (PRs #34621, #35220): a paginated rollout continuing another
             // thread's history carries session_meta.history_base.thread_id pointing at the
@@ -2967,6 +2984,85 @@ mod tests {
             session.parent_session_id.is_none(),
             "a side chat is not nested under its parent — nesting is driven by \
              parent_thread_id/spawned_worker_ids, which a fork never sets"
+        );
+    }
+
+    // Codex v0.170.0/v0.171.0 (issue #408): the legacy sandbox_policy/ask_for_approval
+    // config accessors are removed in favor of a single "permission profile" system.
+    // session_meta now carries `permission_profile` instead of `ask_for_approval` —
+    // discover_sessions must read the new field so approval_mode keeps populating.
+    #[test]
+    fn discover_sessions_v0171_reads_approval_mode_from_permission_profile() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/11/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-11-20T10-00-00-v0171-perm-profile.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-11-20T10:00:00Z","type":"session_meta","payload":{"id":"v0171-perm-profile","timestamp":"2026-11-20T10:00:00Z","cli_version":"0.171.0","permission_profile":"full-auto"}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0171-perm-profile")
+            .expect("session must be discovered");
+        assert_eq!(
+            session.approval_mode.as_deref(),
+            Some("full-auto"),
+            "approval_mode must be populated from the new permission_profile field"
+        );
+    }
+
+    // A session recorded before the v0.156.1 rename still only carries the legacy
+    // `ask_for_approval` field — it must keep surfacing approval_mode too.
+    #[test]
+    fn discover_sessions_v0171_falls_back_to_legacy_ask_for_approval() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/09");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-07-09T10-00-00-v0144-legacy-approval.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-legacy-approval","timestamp":"2026-07-09T10:00:00Z","cli_version":"0.144.0","ask_for_approval":"on-request"}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0144-legacy-approval")
+            .expect("session must be discovered");
+        assert_eq!(
+            session.approval_mode.as_deref(),
+            Some("on-request"),
+            "older sessions without permission_profile must still read the legacy field"
+        );
+    }
+
+    // When a session carries both fields, the new permission_profile is canonical.
+    #[test]
+    fn discover_sessions_v0171_prefers_permission_profile_over_legacy_field() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/11/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-11-20T10-01-00-v0171-both-fields.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-11-20T10:01:00Z","type":"session_meta","payload":{"id":"v0171-both-fields","timestamp":"2026-11-20T10:01:00Z","cli_version":"0.171.0","ask_for_approval":"on-request","permission_profile":"read-only"}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0171-both-fields")
+            .expect("session must be discovered");
+        assert_eq!(
+            session.approval_mode.as_deref(),
+            Some("read-only"),
+            "permission_profile must win when both fields are present"
         );
     }
 

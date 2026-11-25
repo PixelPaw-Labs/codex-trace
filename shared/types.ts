@@ -348,14 +348,17 @@ export interface CodexSession {
   has_missing_spawn_metadata: boolean;
   /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
   is_archived: boolean;
-  /** Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+  /** Approval mode from session_meta (Codex v0.144.0+, PR #30482).
    * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
    * Checked against upstream (PR #36373, #37057): v0.147.0's `--approve-for-me`
    * flag and v0.146.1's cyber-model auto-review defaults do NOT add a new value
    * here — both route through the existing "on-request" policy plus a separate
-   * auto-review-reviewer setting, not a new ask_for_approval string. Parsing is
-   * already a permissive passthrough, so no new value is expected.
-   * Null for sessions predating v0.144.0 or when the field is absent. */
+   * auto-review-reviewer setting, not a new ask_for_approval string.
+   * Codex v0.170.0/v0.171.0 (issue #408) removes the legacy `sandbox_policy`/
+   * `ask_for_approval` accessors in favor of a single "permission profile" string;
+   * read from `session_meta.permission_profile` first, falling back to the legacy
+   * `session_meta.ask_for_approval` for sessions recorded before the rename.
+   * Null for sessions predating v0.144.0 or when neither field is present. */
   approval_mode: string | null;
   /** Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
    * inherits from (session_meta.payload.history_base.thread_id). Distinct from the
@@ -407,14 +410,17 @@ export interface CodexSessionInfo {
   is_headless: boolean;
   /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
   is_archived: boolean;
-  /** Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+  /** Approval mode from session_meta (Codex v0.144.0+, PR #30482).
    * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
    * Checked against upstream (PR #36373, #37057): v0.147.0's `--approve-for-me`
    * flag and v0.146.1's cyber-model auto-review defaults do NOT add a new value
    * here — both route through the existing "on-request" policy plus a separate
-   * auto-review-reviewer setting, not a new ask_for_approval string. Parsing is
-   * already a permissive passthrough, so no new value is expected.
-   * Null for sessions predating v0.144.0 or when the field is absent. */
+   * auto-review-reviewer setting, not a new ask_for_approval string.
+   * Codex v0.170.0/v0.171.0 (issue #408) removes the legacy `sandbox_policy`/
+   * `ask_for_approval` accessors in favor of a single "permission profile" string;
+   * read from `session_meta.permission_profile` first, falling back to the legacy
+   * `session_meta.ask_for_approval` for sessions recorded before the rename.
+   * Null for sessions predating v0.144.0 or when neither field is present. */
   approval_mode: string | null;
   /** Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
    * inherits from (session_meta.payload.history_base.thread_id). Distinct from the

@@ -174,6 +174,28 @@ pub struct CodexSessionInfo {
 /// `codex exec fork` sessions already get. See
 /// `discover_sessions_v0169_attached_side_chat_is_discovered_like_any_other_session` for the
 /// regression check.
+///
+/// Note on Codex v0.171.0 SQLite-backed thread-list state database (issue #411): PRs
+/// #61727/#61730 add targeted indexes (`codex-rs/state/migrations/0063_thread_listing_indexes.sql`,
+/// renumbered to `0064` by #61730) so the app-server's own default and attached thread
+/// listings can be served straight from SQLite; #61928 wraps the shared single-permit
+/// semaphore guarding those listings in a new `ThreadListState`; #62138 has the TUI's chat/
+/// task analytics request root threads with `useStateDbOnly` first, falling back to a full
+/// filesystem-repairing listing only on a `-32603` error; #61955 bounds the TUI's own
+/// `read_thread` MCP tool (the `@`-mention lookup already covered by `mentions.rs`, issue
+/// #210) to the newest 20 items per turn. #61866 ("Preserve SQLite row metadata in thread
+/// listings") is the only one of the six that touches `codex-rs/rollout` at all, and only to
+/// change `recorder::thread_item_from_state_metadata` from private to crate-public — a row-
+/// to-summary projection used by the app-server's own `thread/list` response, not a change
+/// to what `RolloutRecorder` writes. None of the six touch `codex-rs/rollout`'s write path
+/// or `codex-rs/protocol`'s wire types: the SQLite state database is an app-server-internal
+/// index that accelerates the TUI's own listing, search, and analytics RPCs, never a
+/// replacement for the rollout JSONL file as the record of a session. Every session is still
+/// written to `sessions_dir` in full regardless of that index, so this scanner's directory
+/// walk keeps finding every session the CLI itself lists — it was never coupled to the
+/// app-server's listing RPCs or its SQLite state in the first place. See
+/// `discover_sessions_v0171_state_database_session_discovers_like_any_other` for the
+/// regression check.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -2967,6 +2989,48 @@ mod tests {
             session.parent_session_id.is_none(),
             "a side chat is not nested under its parent — nesting is driven by \
              parent_thread_id/spawned_worker_ids, which a fork never sets"
+        );
+    }
+
+    // Codex v0.171.0 (issue #411): thread/session listing grew a SQLite-backed "state
+    // database" fast path for the app-server's own listing, search, and analytics RPCs
+    // (PRs #61727, #61730, #61866, #61928, #61955, #62138) — see the note above
+    // `discover_sessions` for how this was confirmed against the upstream source. None of
+    // those PRs touch the rollout writer or change what lands in `session_meta`, so a
+    // v0.171.0 session's rollout file is shaped exactly like any earlier version's and
+    // must be discovered the same way, with no dependency on any database query.
+    #[test]
+    fn discover_sessions_v0171_state_database_session_discovers_like_any_other() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/11/20");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-11-20T09-00-00-v0171-state-db.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-11-20T09:00:00Z","type":"session_meta","payload":{"id":"v0171-state-db-session","timestamp":"2026-11-20T09:00:00Z","cwd":"/project","cli_version":"0.171.0","originator":"codex_cli_rs","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-11-20T09:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-11-20T09:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1795244402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0171-state-db-session")
+            .expect("a v0.171.0 session must still be discovered by scanning sessions_dir alone");
+
+        assert_eq!(session.date_group, "2026/11/20");
+        assert_eq!(session.turn_count, 1);
+        assert!(
+            !session.is_headless,
+            "an ordinary codex_cli_rs session must not be flagged headless"
+        );
+        assert!(
+            session.parent_session_id.is_none(),
+            "a standalone session has no parent regardless of any state-database linkage"
         );
     }
 

@@ -8,6 +8,7 @@ interface SessionState {
   summaries: TurnSummary[];
   loading: boolean;
   sessionPath: string;
+  error: string | null;
 }
 
 /** How many opened turns keep their bodies. A turn's tool output can be
@@ -20,6 +21,7 @@ const emptyState: SessionState = {
   summaries: [],
   loading: false,
   sessionPath: "",
+  error: null,
 };
 
 /**
@@ -57,7 +59,7 @@ export function useSession() {
       const loadId = ++loadIdRef.current;
       pathRef.current = path;
       resetTurns();
-      setState((prev) => ({ ...prev, loading: true }));
+      setState((prev) => ({ ...prev, loading: true, error: null }));
       try {
         try {
           await invoke<void>("unwatch_session");
@@ -71,6 +73,7 @@ export function useSession() {
           summaries: index.summaries,
           loading: false,
           sessionPath: path,
+          error: null,
         });
         try {
           await invoke<void>("watch_session", { path });
@@ -80,7 +83,8 @@ export function useSession() {
       } catch (err) {
         console.error("Failed to load session:", err);
         if (loadIdRef.current !== loadId) return;
-        setState((prev) => ({ ...prev, loading: false }));
+        const message = err instanceof Error ? err.message : String(err);
+        setState((prev) => ({ ...prev, loading: false, error: message }));
       }
     },
     [resetTurns],

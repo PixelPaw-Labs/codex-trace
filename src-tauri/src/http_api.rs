@@ -245,6 +245,12 @@ fn session_load_error_status(msg: &str) -> axum::http::StatusCode {
         // parse failure: a stale index in the frontend must not read as the
         // session being broken.
         axum::http::StatusCode::NOT_FOUND
+    } else if msg.starts_with(crate::commands::session::NO_LOCAL_SESSION_DATA) {
+        // No rollout file exists locally for this path (plain or compressed) —
+        // e.g. the session ran against a remote app server (`codex exec
+        // --remote`), which never writes one. Report as not-found rather than
+        // a 500 with a raw IO error.
+        axum::http::StatusCode::NOT_FOUND
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -617,6 +623,26 @@ mod tests {
     #[test]
     fn pick_port_uses_parsed_value() {
         assert_eq!(pick_port(Some("8080".to_string())), 8080);
+    }
+
+    #[test]
+    fn session_load_error_status_maps_no_local_session_data_to_not_found() {
+        let msg = format!(
+            "{} at /tmp/rollout-remote.jsonl",
+            crate::commands::session::NO_LOCAL_SESSION_DATA
+        );
+        assert_eq!(
+            session_load_error_status(&msg),
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn session_load_error_status_defaults_to_internal_server_error() {
+        assert_eq!(
+            session_load_error_status("some other parse failure"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     // -----------------------------------------------------------------------

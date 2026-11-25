@@ -2512,6 +2512,10 @@ body {
   padding: 1rem;
   color: var(--text-dim);
 }
+.app__error {
+  padding: 1rem;
+  color: var(--error);
+}
 
 /* Sidebar tree */
 /* Indexing progress — shown in the strip along the bottom while the backend is still

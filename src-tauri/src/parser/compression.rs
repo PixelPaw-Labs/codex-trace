@@ -212,6 +212,43 @@ mod tests {
         assert_eq!(resolve_rollout_path(&plain_path), Some(compressed_path));
     }
 
+    // Codex v0.171.0 (issue #407) cites four upstream PRs — #61222 (store rollout trace
+    // payloads in compressed shards), #61253 (move rollout trace recording to a background
+    // worker), #61896 (bound rollout trace capture with configurable storage limits), #62092
+    // (skip recent rollouts before reading headers during compression) — as changing how
+    // Codex persists "rollout/session trace data" into compressed shards.
+    //
+    // Diffing each PR's changed files against openai/codex shows the first three (#61222,
+    // #61253, #61896) touch only the `codex-rs/rollout-trace` crate: the same opt-in,
+    // same-binary-replay-only diagnostic bundle feature already audited for issue #356 (see
+    // `v0166_rollout_trace_crate_changes_do_not_affect_session_jsonl_parsing` in `turn.rs`).
+    // It is inactive unless `CODEX_ROLLOUT_TRACE_ROOT` is set and writes its own separate
+    // bundle (`manifest.json`/`trace.jsonl`/`payloads/*.zst`/`state.json`), not the
+    // `~/.codex/sessions/*.jsonl` file codex-trace reads.
+    //
+    // The fourth PR, #62092, does touch the real `codex-rs/rollout/src/compression.rs` that
+    // backs this file's `resolve_rollout_path`/`open_session_reader`. Reading its diff shows
+    // the change only skips reading a rollout's header during the background compression scan
+    // when the file is younger than seven days, to avoid bumping its access time on relatime
+    // mounts — it does not alter the on-disk format, file naming, or directory layout. Rollout
+    // files are still either plain `.jsonl` or single-file `.jsonl.zst`, exactly as already
+    // handled here (see `resolve_rollout_path_falls_back_to_compressed_sibling`, added for
+    // issue #209).
+    //
+    // codex-trace is unaffected. This test documents that a plain-text rollout file — standing
+    // in for one younger than seven days, which #62092 now leaves unscanned for longer — still
+    // resolves and reads correctly.
+    #[test]
+    fn v0171_compression_skip_recent_rollouts_does_not_affect_resolution() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-recent.jsonl");
+        let content = r#"{"type":"session_meta","payload":{"id":"recent-session"}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        assert_eq!(resolve_rollout_path(&path), Some(path.clone()));
+        assert_eq!(read_session_file(&path).unwrap(), content);
+    }
+
     #[test]
     fn resolve_rollout_path_returns_none_when_neither_representation_exists() {
         let tmp = tempdir().unwrap();

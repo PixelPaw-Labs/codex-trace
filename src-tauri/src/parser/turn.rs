@@ -6050,4 +6050,74 @@ mod tests {
         );
         assert_eq!(turns[0].tool_calls.len(), 1);
     }
+
+    // Codex v0.171.0 (issue #410) cites four upstream PRs against the app-server protocol —
+    // #61358 (new structured error-kind variants for exec-server process-start failures),
+    // #62096 (centralizes how a turn error is converted into its app-server RPC error
+    // payload), #62093 (the v2 `send_message` JSON-RPC method now returns an empty success
+    // payload instead of content), and #62176 (adds a `bioPolicy` error field to the
+    // app-server v2 protocol) — as a risk that new error kinds get mis-classified or that
+    // logic reading content out of a `send_message` v2 response breaks.
+    //
+    // All four PRs are scoped to the live app-server wire protocol that external callers
+    // (IDE extensions, SDKs) use to drive a session over JSON-RPC: the error-kind enum and
+    // its RPC conversion shape how a failure is reported back to *that* caller, `send_message`
+    // is itself an RPC method those callers invoke, and `bioPolicy` is a field on that same
+    // RPC's error response. None of them touch `codex-rs/rollout` (the recorder that writes
+    // `~/.codex/sessions/*.jsonl`) or the `SessionMeta`/`EventMsg`/`ResponseItem` rollout
+    // types codex-trace actually reads.
+    //
+    // codex-trace never connects to the Codex app-server and has no `send_message` caller of
+    // its own — it only reads the on-disk rollout JSONL. A process-start failure that does
+    // reach the rollout file still arrives as the same free-text `EventMsg::Error` shape
+    // codex-trace has always handled (see the v0.163.0 `ResponseIncomplete` test above),
+    // regardless of which internal error-kind variant produced it, because this parser's
+    // `"error"` arm reads only the `message` string and never matches against a closed set of
+    // kind values. The tests below lock this in and confirm an unrecognized kind-like field
+    // on that event is tolerated like any other unknown field, per `RawEntry`'s loosely-typed
+    // `serde_json::Value` parsing.
+    #[test]
+    fn v0171_process_start_error_kind_surfaces_as_ordinary_turn_error() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-20T10:00:00Z","type":"session_meta","payload":{"id":"v0171-process-start","timestamp":"2026-11-20T10:00:00Z","cli_version":"0.171.0"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            // A brand-new structured error-kind variant for an exec-server process-start
+            // failure (#61358) still lands in the rollout JSONL as the same generic `error`
+            // event_msg shape, with the kind embedded only in a field this parser ignores.
+            // Like the v0.163.0 `ResponseIncomplete` case above, this terminal error has no
+            // dedicated wire event and no following task_complete.
+            r#"{"timestamp":"2026-11-20T10:00:03Z","type":"event_msg","payload":{"type":"error","message":"Failed to start exec-server process: spawn ENOENT","kind":"exec_server_process_start_failed"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Error);
+        assert_eq!(
+            turns[0].error.as_deref(),
+            Some("Failed to start exec-server process: spawn ENOENT")
+        );
+    }
+
+    #[test]
+    fn v0171_send_message_v2_and_bio_policy_changes_do_not_affect_session_parsing() {
+        // #62093 and #62176 only change what a `send_message` v2 RPC caller receives back
+        // over JSON-RPC — codex-trace has no such caller and never reads that response. A
+        // session recorded by a v0.171.0 CLI still parses exactly like any other.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-11-20T10:00:00Z","type":"session_meta","payload":{"id":"v0171-send-message","timestamp":"2026-11-20T10:00:00Z","cli_version":"0.171.0"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Hello"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Hi there.","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-11-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1795431604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Hello"));
+        assert_eq!(turns[0].final_answer.as_deref(), Some("Hi there."));
+    }
 }

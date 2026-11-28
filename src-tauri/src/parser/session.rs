@@ -398,7 +398,9 @@ pub fn resolve_sessions_dir(configured: Option<&str>) -> Result<std::path::PathB
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::turn::{VoiceEvent, VoiceSessionOutcome, VoiceSpeaker};
+    use crate::parser::turn::{
+        VoiceEvent, VoiceHandoffMode, VoiceSessionInputReason, VoiceSessionOutcome, VoiceSpeaker,
+    };
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -1996,6 +1998,61 @@ mod tests {
             ],
             "an item_promoted event and a trailing realtime_item with an explicit turn_id \
              must both be attributed to the turn they name, not silently dropped"
+        );
+    }
+
+    // Codex v0.172.0 (realtime handoff/history refactor, PRs openai/codex#62245, #62251,
+    // #62271, #62288, #62299, issue #427): the `realtime_item` payload grew new/renamed
+    // `type`s. `frame` replaces `transcript_segment` as the default spelling for a
+    // speaker-attributed segment (nested under `channels.voice_transcript` instead of flat
+    // fields), `bem_item_promoted` replaces `item_promoted`, and `turn_input_accepted` /
+    // `session_input_saved` are genuinely new handoff-lifecycle items. None of these may fall
+    // through the match and be silently dropped.
+    #[test]
+    fn v0172_realtime_handoff_refactor_subtypes_are_captured() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-11-29T10-00-00-v0172voice.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-11-29T10:00:00Z","type":"session_meta","payload":{"id":"v0172-voice-session","timestamp":"2026-11-29T10:00:00Z","cwd":"/project","cli_version":"0.172.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:02Z","type":"realtime_item","payload":{"id":"item-1","realtime_session_id":"rt-1","type":"frame","channels":{"voice_transcript":{"role":"user","text":"Hey Codex, run the tests"}},"turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:03Z","type":"realtime_item","payload":{"id":"item-2","realtime_session_id":"rt-1","type":"turn_input_accepted","handoff_id":"handoff-1","turn_id":"turn-v1","mode":"start","source_event_ids":["item-1"],"input_item_id":"input-1","input":"Hey Codex, run the tests"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:04Z","type":"realtime_item","payload":{"id":"item-3","realtime_session_id":"rt-1","type":"bem_item_promoted","turn_id":"turn-v1","item_id":"msg-42","presentation":{"type":"whole_item"}}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"Running the tests now.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-v1","completed_at":1753520406.0}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:07Z","type":"realtime_item","payload":{"id":"item-4","realtime_session_id":"rt-1","type":"session_input_saved","reason":"session_end","source_event_ids":[],"input_item_id":"input-2","input":"","turn_id":"turn-v1"}}"#,
+                r#"{"timestamp":"2026-11-29T10:00:08Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0172-voice-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].voice_events,
+            vec![
+                VoiceEvent::TranscriptSegment {
+                    speaker: VoiceSpeaker::User,
+                    text: "Hey Codex, run the tests".to_string(),
+                },
+                VoiceEvent::TurnInputAccepted {
+                    mode: VoiceHandoffMode::Start,
+                },
+                VoiceEvent::ItemPromoted {
+                    item_id: "msg-42".to_string(),
+                },
+                VoiceEvent::SessionInputSaved {
+                    reason: VoiceSessionInputReason::SessionEnd,
+                },
+            ],
+            "v0.172.0's frame/turn_input_accepted/bem_item_promoted/session_input_saved \
+             realtime_item subtypes must be captured, not silently dropped"
         );
     }
 

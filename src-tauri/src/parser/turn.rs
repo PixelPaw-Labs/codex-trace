@@ -116,6 +116,24 @@ pub enum VoiceSessionOutcome {
     Failed,
 }
 
+/// Whether a realtime handoff started a new turn or steered an already-running one (Codex
+/// v0.172.0+, PR openai/codex#62288, part of the realtime handoff/history refactor).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceHandoffMode {
+    Start,
+    Steer,
+}
+
+/// Why pending realtime speech was saved without starting or steering a turn (Codex v0.172.0+,
+/// PR openai/codex#62299, part of the realtime handoff/history refactor).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionInputReason {
+    Chunk,
+    SessionEnd,
+}
+
 /// One item from Codex's realtime voice conversation stream, persisted as a top-level
 /// `realtime_item` rollout entry (Codex v0.150.0+; voice conversations enabled by default in
 /// v0.156.0, PRs #44921/#46071). This is the successor to the flat `audio_transcript` list
@@ -136,6 +154,18 @@ pub enum VoiceEvent {
     /// conversation for presentation (e.g. read aloud). Carries no text of its own.
     ItemPromoted {
         item_id: String,
+    },
+    /// Codex v0.172.0+ (PR openai/codex#62288): realtime speech was durably accepted as input
+    /// for a turn, either starting it or steering an already-running one, before being
+    /// exposed to the model. This is the "handoff" the v0.172.0 refactor now persists.
+    TurnInputAccepted {
+        mode: VoiceHandoffMode,
+    },
+    /// Codex v0.172.0+ (PR openai/codex#62299): pending realtime speech was preserved in
+    /// history without starting or steering a turn, e.g. because the call ended before a
+    /// handoff could take place.
+    SessionInputSaved {
+        reason: VoiceSessionInputReason,
     },
 }
 
@@ -1602,6 +1632,17 @@ fn handle_turn_context(
 /// live voice conversation. Like the older `realtime_transcript_text` event_msg it supersedes,
 /// it may carry an explicit `turn_id`; when absent, the item is attributed to whichever turn
 /// is currently open.
+///
+/// Codex v0.172.0 (realtime handoff/history refactor, PRs openai/codex#62245, #62251, #62271,
+/// #62288, #62299) renamed or added several payload `type`s on top of the v0.150.0/v0.156.0
+/// ones above:
+/// - `frame` carries the same role/text as `transcript_segment`, nested under
+///   `channels.voice_transcript` instead of flat fields; `transcript_segment` itself is kept
+///   only "for older histories and unenrolled writers" per the upstream source.
+/// - `bem_item_promoted` is the renamed successor to `item_promoted` (same `item_id`).
+/// - `turn_input_accepted` and `session_input_saved` are genuinely new: they persist a
+///   realtime handoff's acceptance into a turn, and the preservation of pending speech when a
+///   call ends without a handoff, respectively.
 fn handle_realtime_item(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
@@ -1635,7 +1676,7 @@ fn handle_realtime_item(
             };
             VoiceEvent::SessionClosed { outcome }
         }
-        "item_promoted" => {
+        "item_promoted" | "bem_item_promoted" => {
             let item_id = payload
                 .get("item_id")
                 .and_then(|v| v.as_str())
@@ -1645,6 +1686,41 @@ fn handle_realtime_item(
                 return;
             }
             VoiceEvent::ItemPromoted { item_id }
+        }
+        "frame" => {
+            let voice_transcript = payload
+                .get("channels")
+                .and_then(|c| c.get("voice_transcript"));
+            let text = voice_transcript
+                .and_then(|vt| vt.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() {
+                return;
+            }
+            let speaker = match voice_transcript
+                .and_then(|vt| vt.get("role"))
+                .and_then(|v| v.as_str())
+            {
+                Some("assistant") => VoiceSpeaker::Assistant,
+                _ => VoiceSpeaker::User,
+            };
+            VoiceEvent::TranscriptSegment { speaker, text }
+        }
+        "turn_input_accepted" => {
+            let mode = match payload.get("mode").and_then(|v| v.as_str()) {
+                Some("steer") => VoiceHandoffMode::Steer,
+                _ => VoiceHandoffMode::Start,
+            };
+            VoiceEvent::TurnInputAccepted { mode }
+        }
+        "session_input_saved" => {
+            let reason = match payload.get("reason").and_then(|v| v.as_str()) {
+                Some("session_end") => VoiceSessionInputReason::SessionEnd,
+                _ => VoiceSessionInputReason::Chunk,
+            };
+            VoiceEvent::SessionInputSaved { reason }
         }
         _ => return,
     };

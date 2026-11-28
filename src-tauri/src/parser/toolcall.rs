@@ -3221,6 +3221,82 @@ mod tests {
         assert!(builder.finalized[0].output_truncated.is_none());
     }
 
+    // Codex v0.172.0 (issue #426) cites upstream PR #62407 ("Deduplicate large tool
+    // output strings in rollout traces") as changing how Codex persists exec tool-call
+    // output, risking a reference/pointer field in place of the literal `aggregated_output`
+    // text this parser reads, or a miscounted `output_truncated`.
+    //
+    // Diffing PR #62407 against openai/codex shows all 18 changed files sit under
+    // `codex-rs/rollout-trace/` (README.md, writer.rs, shard.rs, payload.rs, the reducer,
+    // and their test files) — the same opt-in, same-binary-replay-only diagnostic bundle
+    // feature already audited for issue #356 (`v0166_rollout_trace_crate_changes_do_not_affect_session_jsonl_parsing`
+    // in `turn.rs`) and issue #407 (`compression.rs`). It is inactive unless
+    // `CODEX_ROLLOUT_TRACE_ROOT` is set and writes its own separate bundle
+    // (`manifest.json`/`trace.jsonl`/`payloads/*.zst`/`state.json`), not the
+    // `~/.codex/sessions/*.jsonl` file this parser reads. The string dedup PR #62407
+    // describes shares identical values across *that* bundle's own records via an internal
+    // `parts`/shard reference scheme — it never touches `aggregated_output` or any other
+    // field on the real `exec_command_end` event.
+    //
+    // Comparing the `rust-v0.171.0` and `rust-v0.172.0` tags directly confirms neither
+    // `codex-rs/rollout/` (the unrelated crate that actually writes the session JSONL,
+    // `recorder.rs`) nor `codex-rs/protocol/src/protocol.rs` (where `ExecCommandEndEvent`
+    // and its `aggregated_output`/`truncated`/`output_truncated`/`bytes_truncated` fields
+    // are defined) changed between those releases.
+    //
+    // codex-trace is unaffected. `aggregated_output` still carries the literal output text,
+    // never a reference/pointer, and the existing truncation-marker logic above needs no
+    // change. The test below guards against a future regression: a repeated large output
+    // string across two exec calls in the same session must still parse as two full literal
+    // values, not a dedup reference.
+    #[test]
+    fn v0172_rollout_trace_dedup_does_not_affect_aggregated_output_parsing() {
+        let mut builder = ToolCallBuilder::new();
+        let repeated_output = "x".repeat(70 * 1024);
+
+        builder.add_function_call(
+            "call_dedup_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat big.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.finalize_exec(
+            "exec_command_end",
+            &json!({
+                "call_id": "call_dedup_1",
+                "aggregated_output": repeated_output,
+                "exit_code": 0,
+                "status": "completed"
+            }),
+        );
+
+        builder.add_function_call(
+            "call_dedup_2".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat big.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.finalize_exec(
+            "exec_command_end",
+            &json!({
+                "call_id": "call_dedup_2",
+                "aggregated_output": repeated_output,
+                "exit_code": 0,
+                "status": "completed"
+            }),
+        );
+
+        assert_eq!(builder.finalized.len(), 2);
+        for tool in &builder.finalized {
+            assert_eq!(tool.output.as_deref(), Some(repeated_output.as_str()));
+            assert!(tool.output_truncated.is_none());
+        }
+    }
+
     #[test]
     fn v0145_truncation_propagated_to_backfill_exec_entry() {
         // When function_call_output arrives before exec_command_end (v0.132.0+ sessions),
